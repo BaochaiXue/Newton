@@ -1,0 +1,15 @@
+{
+  "case_name": "zebra_around_easy",
+  "output": "/home/xinjie/Newton/phystwin_bridge/ir/zebra_around_easy/phystwin_ir_v1.npz",
+  "topology_method": "open3d",
+  "num_particles": 4276,
+  "num_object_points": 4246,
+  "num_control_points": 30,
+  "num_springs": 118243,
+  "num_object_springs": 117541,
+  "trajectory_frames": 296,
+  "controller_points_per_frame": 30,
+  "sim_dt": 5e-05,
+  "sim_substeps": 667,
+  "sim_fps": 30.0
+}

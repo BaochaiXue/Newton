@@ -1,0 +1,18 @@
+{
+  "ir_path": "/home/xinjie/Newton/phystwin_bridge/ir/zebra_around_easy/phystwin_ir_v1.npz",
+  "output_npz": "/home/xinjie/Newton/phystwin_bridge/outputs/zebra_around_easy/newton_rollout_short.npz",
+  "device_requested": "cuda:0",
+  "device_used": "cuda:0",
+  "solver": "xpbd",
+  "solver_iterations": 10,
+  "frames_run": 5,
+  "substeps_per_frame": 20,
+  "sim_dt": 4.999999873689376e-05,
+  "wall_time_sec": 9.508619274000012,
+  "particles_total": 4276,
+  "particles_object": 4246,
+  "inference_used": "/home/xinjie/Newton/phystwin_bridge/inputs/cases/zebra_around_easy/inference.pkl",
+  "compared_frames": 5,
+  "rmse_mean": 17.501453399658203,
+  "rmse_max": 19.574989318847656
+}
