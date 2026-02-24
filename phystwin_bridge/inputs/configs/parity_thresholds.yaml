@@ -1,0 +1,11 @@
+defaults:
+  max_x0_rmse: 1.0e-6
+  max_rmse_mean: 5.0e-2
+  max_rmse_max: 1.0e-1
+  max_first30_rmse: 1.0e-1
+  max_last30_rmse: 1.0e-1
+
+cases:
+  zebra_around_easy:
+    max_rmse_mean: 5.0e-2
+    max_rmse_max: 1.0e-1

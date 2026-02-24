@@ -232,16 +232,6 @@ def build_springs(
         return points, edges, rest, num_object_springs, "bruteforce"
 
     try:
-        points, edges, rest, num_object_springs = build_springs_open3d(
-            structure_points=structure_points,
-            controller_points_0=controller_points_0,
-            object_radius=object_radius,
-            object_max_neighbours=object_max_neighbours,
-            controller_radius=controller_radius,
-            controller_max_neighbours=controller_max_neighbours,
-        )
-        return points, edges, rest, num_object_springs, "open3d"
-    except Exception:
         points, edges, rest, num_object_springs = build_springs_bruteforce(
             structure_points=structure_points,
             controller_points_0=controller_points_0,
@@ -251,11 +241,21 @@ def build_springs(
             controller_max_neighbours=controller_max_neighbours,
         )
         return points, edges, rest, num_object_springs, "bruteforce"
+    except Exception:
+        points, edges, rest, num_object_springs = build_springs_open3d(
+            structure_points=structure_points,
+            controller_points_0=controller_points_0,
+            object_radius=object_radius,
+            object_max_neighbours=object_max_neighbours,
+            controller_radius=controller_radius,
+            controller_max_neighbours=controller_max_neighbours,
+        )
+        return points, edges, rest, num_object_springs, "open3d"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export a PhysTwin case to a Newton-oriented IR v1 .npz bundle."
+        description="Export a PhysTwin case to a Newton-oriented IR v2 .npz bundle."
     )
     parser.add_argument("--case-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
@@ -263,7 +263,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--topology-method",
         choices=["auto", "open3d", "bruteforce"],
-        default="auto",
+        default="bruteforce",
+        help=(
+            "Spring topology reconstruction method. "
+            "Use 'bruteforce' for determinism (recommended for matching checkpoint spring_Y ordering)."
+        ),
+    )
+    parser.add_argument(
+        "--strict-phystwin",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable strict PhysTwin-aligned defaults and checks. "
+            "When enabled, spring_ke defaults to spring_Y/rest_length."
+        ),
+    )
+    parser.add_argument(
+        "--spring-ke-mode",
+        choices=["raw", "y_over_rest"],
+        default=None,
+        help=(
+            "Mapping from checkpoint spring_Y to Newton spring_ke. "
+            "If unset, defaults to y_over_rest in strict mode, otherwise raw."
+        ),
+    )
+    parser.add_argument(
+        "--rest-length-eps",
+        type=float,
+        default=1e-8,
+        help="Numerical floor used when mapping spring_ke from spring_Y/rest_length.",
     )
     return parser.parse_args()
 
@@ -296,10 +324,17 @@ def main() -> int:
         optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")
     config.update(optimal_params)
 
-    object_radius = float(config.get("object_radius", 0.02))
+    topology_object_radius = float(config.get("object_radius", 0.02))
     object_max_neighbours = int(config.get("object_max_neighbours", 30))
-    controller_radius = float(config.get("controller_radius", 0.04))
+    topology_controller_radius = float(config.get("controller_radius", 0.04))
     controller_max_neighbours = int(config.get("controller_max_neighbours", 50))
+    collision_dist = float(config.get("collision_dist", topology_object_radius))
+    collision_object_radius = float(
+        config.get("collision_object_radius", collision_dist)
+    )
+    collision_controller_radius = float(
+        config.get("collision_controller_radius", collision_dist)
+    )
 
     structure_points, controller_traj = build_structure_points(final_data)
     controller_points_0 = controller_traj[0] if controller_traj.shape[1] > 0 else None
@@ -307,9 +342,9 @@ def main() -> int:
     points_all, edges, rest_lengths, num_object_springs, used_topology_method = build_springs(
         structure_points=structure_points,
         controller_points_0=controller_points_0,
-        object_radius=object_radius,
+        object_radius=topology_object_radius,
         object_max_neighbours=object_max_neighbours,
-        controller_radius=controller_radius,
+        controller_radius=topology_controller_radius,
         controller_max_neighbours=controller_max_neighbours,
         topology_method=args.topology_method,
     )
@@ -317,11 +352,36 @@ def main() -> int:
     spring_y = checkpoint["spring_Y"]
     if isinstance(spring_y, torch.Tensor):
         spring_y = spring_y.detach().cpu().numpy()
-    spring_ke = np.asarray(spring_y, dtype=np.float32).reshape(-1)
-    if spring_ke.shape[0] != edges.shape[0]:
+    spring_y = np.asarray(spring_y, dtype=np.float32).reshape(-1)
+    if spring_y.shape[0] != edges.shape[0]:
         raise ValueError(
-            f"Spring count mismatch: checkpoint={spring_ke.shape[0]}, reconstructed={edges.shape[0]}"
+            f"Spring count mismatch: checkpoint={spring_y.shape[0]}, reconstructed={edges.shape[0]}"
         )
+    if rest_lengths.shape[0] != edges.shape[0]:
+        raise ValueError(
+            "Rest-length count mismatch: "
+            f"rest_lengths={rest_lengths.shape[0]}, reconstructed={edges.shape[0]}"
+        )
+    if not np.all(np.isfinite(rest_lengths)):
+        raise ValueError("Non-finite spring rest lengths detected.")
+    if np.any(rest_lengths <= 0.0):
+        min_rest = float(np.min(rest_lengths))
+        raise ValueError(f"Non-positive rest lengths detected (min={min_rest}).")
+
+    spring_ke_mode = args.spring_ke_mode
+    if spring_ke_mode is None:
+        spring_ke_mode = "y_over_rest" if args.strict_phystwin else "raw"
+
+    if spring_ke_mode == "raw":
+        spring_ke = spring_y.copy()
+    elif spring_ke_mode == "y_over_rest":
+        safe_rest = np.maximum(rest_lengths, float(args.rest_length_eps))
+        spring_ke = spring_y / safe_rest
+    else:
+        raise ValueError(f"Unsupported spring_ke mode: {spring_ke_mode}")
+
+    if not np.all(np.isfinite(spring_ke)):
+        raise ValueError("Non-finite spring_ke values generated.")
 
     checkpoint_num_object_springs = int(checkpoint.get("num_object_springs", num_object_springs))
     if checkpoint_num_object_springs != num_object_springs:
@@ -342,15 +402,24 @@ def main() -> int:
     mass = np.ones((num_particles,), dtype=np.float32)
     mass[is_controller] = 0.0
 
-    radius = np.full((num_particles,), object_radius, dtype=np.float32)
+    topology_radius = np.full((num_particles,), topology_object_radius, dtype=np.float32)
     if num_control_points > 0:
-        radius[num_object_points:] = controller_radius
+        topology_radius[num_object_points:] = topology_controller_radius
+
+    collision_radius = np.full(
+        (num_particles,), collision_object_radius, dtype=np.float32
+    )
+    if num_control_points > 0:
+        collision_radius[num_object_points:] = collision_controller_radius
 
     spring_kd = np.full(
         (edges.shape[0],),
         float(config.get("dashpot_damping", 0.0)),
         dtype=np.float32,
     )
+    spring_y_min = float(config.get("spring_Y_min", 0.0))
+    spring_y_max = float(config.get("spring_Y_max", 1.0e5))
+    drag_damping = float(config.get("drag_damping", 0.0))
     spring_is_object = np.zeros((edges.shape[0],), dtype=np.bool_)
     spring_is_object[:num_object_springs] = True
 
@@ -358,6 +427,7 @@ def main() -> int:
     sim_substeps = int(config.get("num_substeps", 1))
     sim_fps = float(config.get("FPS", 30))
     frame_dt = float(1.0 / sim_fps) if sim_fps > 0 else float(sim_dt * sim_substeps)
+    self_collision = bool(config.get("self_collision", False))
 
     collide_elas = to_scalar(
         checkpoint.get("collide_elas"), config.get("collide_elas", 0.5)
@@ -375,44 +445,59 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        ir_version=np.asarray(1, dtype=np.int32),
+        ir_version=np.asarray(2, dtype=np.int32),
         case_name=np.asarray(case_dir.name),
         created_at_utc=np.asarray(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        strict_phystwin_export=np.asarray(bool(args.strict_phystwin)),
+        spring_ke_mode=np.asarray(spring_ke_mode),
+        rest_length_eps=np.asarray(float(args.rest_length_eps), dtype=np.float32),
         topology_method=np.asarray(used_topology_method),
         x0=points_all.astype(np.float32),
         v0=np.zeros_like(points_all, dtype=np.float32),
         mass=mass,
-        radius=radius,
+        # Backward-compat alias: legacy readers treat `radius` as particle contact radius.
+        radius=collision_radius,
+        topology_radius=topology_radius,
+        collision_radius=collision_radius,
         is_controller=is_controller,
         controller_idx=controller_idx,
         controller_traj=controller_traj.astype(np.float32),
         spring_edges=edges.astype(np.int32),
         spring_rest_length=rest_lengths.astype(np.float32),
+        spring_y=spring_y.astype(np.float32),
+        spring_y_min=np.asarray(spring_y_min, dtype=np.float32),
+        spring_y_max=np.asarray(spring_y_max, dtype=np.float32),
         spring_ke=spring_ke.astype(np.float32),
         spring_kd=spring_kd,
+        drag_damping=np.asarray(drag_damping, dtype=np.float32),
         spring_is_object=spring_is_object,
         num_object_points=np.asarray(num_object_points, dtype=np.int32),
         num_control_points=np.asarray(num_control_points, dtype=np.int32),
         num_object_springs=np.asarray(num_object_springs, dtype=np.int32),
-        object_radius=np.asarray(object_radius, dtype=np.float32),
+        # Legacy scalar names preserved for topology reconstruction compatibility.
+        object_radius=np.asarray(topology_object_radius, dtype=np.float32),
         object_max_neighbours=np.asarray(object_max_neighbours, dtype=np.int32),
-        controller_radius=np.asarray(controller_radius, dtype=np.float32),
+        controller_radius=np.asarray(topology_controller_radius, dtype=np.float32),
         controller_max_neighbours=np.asarray(controller_max_neighbours, dtype=np.int32),
+        topology_object_radius=np.asarray(topology_object_radius, dtype=np.float32),
+        topology_controller_radius=np.asarray(topology_controller_radius, dtype=np.float32),
+        collision_object_radius=np.asarray(collision_object_radius, dtype=np.float32),
+        collision_controller_radius=np.asarray(collision_controller_radius, dtype=np.float32),
         sim_dt=np.asarray(sim_dt, dtype=np.float32),
         sim_substeps=np.asarray(sim_substeps, dtype=np.int32),
         sim_fps=np.asarray(sim_fps, dtype=np.float32),
         frame_dt=np.asarray(frame_dt, dtype=np.float32),
         reverse_z=np.asarray(bool(config.get("reverse_z", True))),
+        self_collision=np.asarray(self_collision),
         contact_collide_elas=np.asarray(collide_elas, dtype=np.float32),
         contact_collide_fric=np.asarray(collide_fric, dtype=np.float32),
         contact_collide_object_elas=np.asarray(collide_object_elas, dtype=np.float32),
         contact_collide_object_fric=np.asarray(collide_object_fric, dtype=np.float32),
-        contact_collision_dist=np.asarray(
-            float(config.get("collision_dist", 0.02)), dtype=np.float32
-        ),
+        contact_collision_dist=np.asarray(collision_dist, dtype=np.float32),
     )
 
     summary = {
+        "ir_version": 2,
         "case_name": case_dir.name,
         "output": str(output_path),
         "topology_method": used_topology_method,
@@ -423,9 +508,22 @@ def main() -> int:
         "num_object_springs": int(num_object_springs),
         "trajectory_frames": int(controller_traj.shape[0]),
         "controller_points_per_frame": int(controller_traj.shape[1]),
+        "strict_phystwin_export": bool(args.strict_phystwin),
+        "spring_ke_mode": spring_ke_mode,
+        "spring_ke_min": float(np.min(spring_ke)),
+        "spring_ke_max": float(np.max(spring_ke)),
+        "spring_ke_mean": float(np.mean(spring_ke)),
+        "spring_y_min": float(spring_y_min),
+        "spring_y_max": float(spring_y_max),
+        "drag_damping": float(drag_damping),
+        "topology_object_radius": float(topology_object_radius),
+        "topology_controller_radius": float(topology_controller_radius),
+        "collision_object_radius": float(collision_object_radius),
+        "collision_controller_radius": float(collision_controller_radius),
         "sim_dt": sim_dt,
         "sim_substeps": sim_substeps,
         "sim_fps": sim_fps,
+        "self_collision": bool(self_collision),
     }
     summary_path = output_path.with_suffix(".json")
     with summary_path.open("w", encoding="utf-8") as handle:
