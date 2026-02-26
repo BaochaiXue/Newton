@@ -374,6 +374,75 @@ def parse_args() -> argparse.Namespace:
         help="Solver backend. If unset, defaults to semi_implicit in parity mode, xpbd otherwise.",
     )
     parser.add_argument("--solver-iterations", type=int, default=10)
+    parser.add_argument(
+        "--xpbd-soft-body-relaxation",
+        type=float,
+        default=0.9,
+        help="XPBD soft-body relaxation.",
+    )
+    parser.add_argument(
+        "--xpbd-soft-contact-relaxation",
+        type=float,
+        default=0.9,
+        help="XPBD soft-contact relaxation.",
+    )
+    parser.add_argument(
+        "--xpbd-rigid-contact-relaxation",
+        type=float,
+        default=0.8,
+        help="XPBD rigid-contact relaxation.",
+    )
+    parser.add_argument(
+        "--xpbd-angular-damping",
+        type=float,
+        default=0.0,
+        help="XPBD rigid-body angular damping.",
+    )
+    parser.add_argument(
+        "--xpbd-enable-restitution",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable XPBD restitution.",
+    )
+    parser.add_argument(
+        "--semi-spring-ke-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to spring_ke when --solver semi_implicit.",
+    )
+    parser.add_argument(
+        "--semi-spring-kd-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to spring_kd when --solver semi_implicit.",
+    )
+    parser.add_argument(
+        "--semi-disable-particle-contact-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When --solver semi_implicit, disable Newton particle contact kernel by setting "
+            "model.particle_grid=None."
+        ),
+    )
+    parser.add_argument(
+        "--semi-enable-tri-contact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --solver semi_implicit, enable/disable triangle contact kernel.",
+    )
+    parser.add_argument(
+        "--semi-angular-damping",
+        type=float,
+        default=0.05,
+        help="Semi-implicit rigid-body angular damping.",
+    )
+    parser.add_argument(
+        "--semi-friction-smoothing",
+        type=float,
+        default=1.0,
+        help="Semi-implicit friction smoothing.",
+    )
     parser.add_argument("--num-frames", type=int, default=20)
     parser.add_argument(
         "--substeps-per-frame",
@@ -610,6 +679,39 @@ def _validate_phystwin_semantics(
 ) -> dict[str, float | str | bool]:
     checks: dict[str, float | str | bool] = {}
     strict = bool(args.strict_phystwin)
+
+    if args.semi_spring_ke_scale <= 0.0:
+        raise ValueError(
+            f"--semi-spring-ke-scale must be > 0, got {args.semi_spring_ke_scale}."
+        )
+    if args.semi_spring_kd_scale < 0.0:
+        raise ValueError(
+            f"--semi-spring-kd-scale must be >= 0, got {args.semi_spring_kd_scale}."
+        )
+    if args.semi_angular_damping < 0.0:
+        raise ValueError(
+            f"--semi-angular-damping must be >= 0, got {args.semi_angular_damping}."
+        )
+    if args.semi_friction_smoothing <= 0.0:
+        raise ValueError(
+            f"--semi-friction-smoothing must be > 0, got {args.semi_friction_smoothing}."
+        )
+    if args.xpbd_soft_body_relaxation <= 0.0:
+        raise ValueError(
+            f"--xpbd-soft-body-relaxation must be > 0, got {args.xpbd_soft_body_relaxation}."
+        )
+    if args.xpbd_soft_contact_relaxation <= 0.0:
+        raise ValueError(
+            f"--xpbd-soft-contact-relaxation must be > 0, got {args.xpbd_soft_contact_relaxation}."
+        )
+    if args.xpbd_rigid_contact_relaxation <= 0.0:
+        raise ValueError(
+            f"--xpbd-rigid-contact-relaxation must be > 0, got {args.xpbd_rigid_contact_relaxation}."
+        )
+    if args.xpbd_angular_damping < 0.0:
+        raise ValueError(
+            f"--xpbd-angular-damping must be >= 0, got {args.xpbd_angular_damping}."
+        )
 
     if strict and args.mode == "parity" and solver_name not in {"semi_implicit", "phystwin_compat"}:
         raise ValueError(
@@ -937,6 +1039,11 @@ def _build_model(
                 f"count: rest={rest.shape[0]}, edges={spring_count}.",
                 RuntimeWarning,
             )
+    if solver_name == "semi_implicit":
+        spring_ke = spring_ke * float(args.semi_spring_ke_scale)
+        spring_kd = spring_kd * float(args.semi_spring_kd_scale)
+        semantic_checks["semi_spring_ke_scale"] = float(args.semi_spring_ke_scale)
+        semantic_checks["semi_spring_kd_scale"] = float(args.semi_spring_kd_scale)
     for spring_idx in range(spring_count):
         i = int(spring_edges[spring_idx, 0])
         j = int(spring_edges[spring_idx, 1])
@@ -951,6 +1058,11 @@ def _build_model(
             builder.spring_rest_length[-1] = float(spring_rest_length[spring_idx])
 
     model = builder.finalize(device=device)
+    if solver_name == "semi_implicit" and args.semi_disable_particle_contact_kernel:
+        model.particle_grid = None
+        semantic_checks["semi_particle_contact_kernel_disabled"] = True
+    else:
+        semantic_checks["semi_particle_contact_kernel_disabled"] = False
     gravity_scalar, gravity_vector = _resolve_gravity(args=args, ir=ir)
     model.set_gravity(gravity_vector)
     if "contact_collide_fric" in ir:
@@ -972,12 +1084,30 @@ def _build_model(
     )
 
 
-def _make_solver(model: newton.Model, solver_name: str, iterations: int):
+def _make_solver(
+    model: newton.Model,
+    solver_name: str,
+    iterations: int,
+    args: argparse.Namespace,
+):
     if solver_name == "phystwin_compat":
         return None
     if solver_name == "semi_implicit":
-        return newton.solvers.SolverSemiImplicit(model)
-    return newton.solvers.SolverXPBD(model, iterations=iterations)
+        return newton.solvers.SolverSemiImplicit(
+            model,
+            angular_damping=float(args.semi_angular_damping),
+            friction_smoothing=float(args.semi_friction_smoothing),
+            enable_tri_contact=bool(args.semi_enable_tri_contact),
+        )
+    return newton.solvers.SolverXPBD(
+        model,
+        iterations=iterations,
+        soft_body_relaxation=float(args.xpbd_soft_body_relaxation),
+        soft_contact_relaxation=float(args.xpbd_soft_contact_relaxation),
+        rigid_contact_relaxation=float(args.xpbd_rigid_contact_relaxation),
+        angular_damping=float(args.xpbd_angular_damping),
+        enable_restitution=bool(args.xpbd_enable_restitution),
+    )
 
 
 def _load_inference(path: Path | None):
@@ -1017,6 +1147,13 @@ def main() -> int:
     resolved_device = _resolve_device(args.device)
     wp.init()
     solver_name = _resolve_solver_name(args)
+    if solver_name == "phystwin_compat":
+        warnings.warn(
+            "Using phystwin_compat: this emulates PhysTwin update kernels and bypasses Newton native "
+            "semi_implicit spring/contact integration. Use --solver semi_implicit for native two-way coupling "
+            "with other Newton objects/materials.",
+            RuntimeWarning,
+        )
 
     (
         model,
@@ -1036,7 +1173,13 @@ def main() -> int:
         device=resolved_device,
         solver_name=solver_name,
     )
-    solver = _make_solver(model, solver_name, args.solver_iterations)
+    if solver_name == "phystwin_compat" and shape_contacts_enabled:
+        warnings.warn(
+            "shape-contacts are not consumed by phystwin_compat custom stepping path. "
+            "For Newton native contact coupling, use --solver semi_implicit.",
+            RuntimeWarning,
+        )
+    solver = _make_solver(model, solver_name, args.solver_iterations, args)
 
     state_in = model.state()
     state_out = model.state()
@@ -1482,6 +1625,17 @@ def main() -> int:
         "ir_version": int(ir_version),
         "solver": solver_name,
         "solver_iterations": int(args.solver_iterations),
+        "xpbd_soft_body_relaxation": float(args.xpbd_soft_body_relaxation),
+        "xpbd_soft_contact_relaxation": float(args.xpbd_soft_contact_relaxation),
+        "xpbd_rigid_contact_relaxation": float(args.xpbd_rigid_contact_relaxation),
+        "xpbd_angular_damping": float(args.xpbd_angular_damping),
+        "xpbd_enable_restitution": bool(args.xpbd_enable_restitution),
+        "semi_spring_ke_scale": float(args.semi_spring_ke_scale),
+        "semi_spring_kd_scale": float(args.semi_spring_kd_scale),
+        "semi_disable_particle_contact_kernel": bool(args.semi_disable_particle_contact_kernel),
+        "semi_enable_tri_contact": bool(args.semi_enable_tri_contact),
+        "semi_angular_damping": float(args.semi_angular_damping),
+        "semi_friction_smoothing": float(args.semi_friction_smoothing),
         "frames_run": int(frames_to_run),
         "substeps_per_frame": int(substeps_per_frame),
         "sim_dt": float(sim_dt),

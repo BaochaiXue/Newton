@@ -47,6 +47,29 @@ def parse_args() -> argparse.Namespace:
         default="semi_implicit",
     )
     parser.add_argument("--solver-iterations", type=int, default=10)
+    parser.add_argument("--xpbd-soft-body-relaxation", type=float, default=0.9)
+    parser.add_argument("--xpbd-soft-contact-relaxation", type=float, default=0.9)
+    parser.add_argument("--xpbd-rigid-contact-relaxation", type=float, default=0.8)
+    parser.add_argument("--xpbd-angular-damping", type=float, default=0.0)
+    parser.add_argument(
+        "--xpbd-enable-restitution",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--semi-spring-ke-scale", type=float, default=1.0)
+    parser.add_argument("--semi-spring-kd-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--semi-disable-particle-contact-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--semi-enable-tri-contact",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--semi-angular-damping", type=float, default=0.05)
+    parser.add_argument("--semi-friction-smoothing", type=float, default=1.0)
     parser.add_argument("--num-frames", type=int, default=296)
     parser.add_argument("--substeps-per-frame", type=int, default=None)
     parser.add_argument("--sim-dt", type=float, default=None)
@@ -393,6 +416,22 @@ def _build_importer_cmd(
         args.solver,
         "--solver-iterations",
         str(args.solver_iterations),
+        "--xpbd-soft-body-relaxation",
+        str(args.xpbd_soft_body_relaxation),
+        "--xpbd-soft-contact-relaxation",
+        str(args.xpbd_soft_contact_relaxation),
+        "--xpbd-rigid-contact-relaxation",
+        str(args.xpbd_rigid_contact_relaxation),
+        "--xpbd-angular-damping",
+        str(args.xpbd_angular_damping),
+        "--semi-spring-ke-scale",
+        str(args.semi_spring_ke_scale),
+        "--semi-spring-kd-scale",
+        str(args.semi_spring_kd_scale),
+        "--semi-angular-damping",
+        str(args.semi_angular_damping),
+        "--semi-friction-smoothing",
+        str(args.semi_friction_smoothing),
         "--num-frames",
         str(args.num_frames),
         "--device",
@@ -446,6 +485,21 @@ def _build_importer_cmd(
     )
     _append_bool_flag(cmd, "parity-gravity-from-reverse-z", args.parity_gravity_from_reverse_z)
     _append_bool_flag(cmd, "strict-phystwin", args.strict_phystwin)
+    _append_bool_flag(
+        cmd,
+        "semi-disable-particle-contact-kernel",
+        args.semi_disable_particle_contact_kernel,
+    )
+    _append_bool_flag(
+        cmd,
+        "semi-enable-tri-contact",
+        args.semi_enable_tri_contact,
+    )
+    _append_bool_flag(
+        cmd,
+        "xpbd-enable-restitution",
+        args.xpbd_enable_restitution,
+    )
     return cmd
 
 
