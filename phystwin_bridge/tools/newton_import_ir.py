@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from path_defaults import default_device
 
 PHYSTWIN_MAX_COLLISIONS = 500
 
@@ -393,7 +394,11 @@ def parse_args() -> argparse.Namespace:
         help="Gravity value along up-axis. If unset and mode=parity, derive from reverse_z.",
     )
     parser.add_argument("--up-axis", choices=["X", "Y", "Z"], default="Z")
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--device",
+        default=default_device(),
+        help="Warp device string. Defaults to NEWTON_DEVICE env var or cuda:0.",
+    )
     parser.add_argument(
         "--shape-contacts",
         action=argparse.BooleanOptionalAction,

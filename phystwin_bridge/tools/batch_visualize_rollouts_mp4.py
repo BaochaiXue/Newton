@@ -5,8 +5,9 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
+
+from path_defaults import default_python, resolve_overlay_base
 
 
 def _load_json(path: Path) -> dict:
@@ -15,13 +16,6 @@ def _load_json(path: Path) -> dict:
     if not isinstance(loaded, dict):
         raise ValueError(f"Expected JSON mapping at {path}")
     return loaded
-
-
-def _default_python(repo_root: Path) -> str:
-    candidate = repo_root / "newton/.venv/bin/python"
-    if candidate.exists():
-        return str(candidate)
-    return sys.executable
 
 
 def _select_best_parity_report(case_out_dir: Path) -> Path:
@@ -77,8 +71,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overlay-base",
         type=Path,
-        default=Path("/home/xinjie/PhysTwin/data/different_types"),
-        help="Base directory containing <case_name>/color/<cam>/<frame>.png overlay frames.",
+        default=None,
+        help=(
+            "Base directory containing <case_name>/color/<cam>/<frame>.png overlay frames. "
+            "If unset, auto-resolve via PHYSTWIN_OVERLAY_BASE and common local paths."
+        ),
     )
     parser.add_argument("--camera-idx", type=int, default=0)
     return parser.parse_args()
@@ -97,11 +94,11 @@ def main() -> int:
         if not args.cases_root.is_absolute()
         else args.cases_root.resolve()
     )
-    overlay_base = args.overlay_base.resolve()
+    overlay_base = resolve_overlay_base(args.overlay_base)
     camera_idx = int(args.camera_idx)
 
     visualizer = Path(__file__).resolve().with_name("visualize_rollout_mp4.py")
-    python = _default_python(repo_root)
+    python = default_python()
 
     if not outputs_root.exists():
         raise FileNotFoundError(f"outputs-root does not exist: {outputs_root}")

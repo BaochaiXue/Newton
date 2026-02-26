@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from path_defaults import resolve_overlay_base
+
 
 def _load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as handle:
@@ -263,8 +265,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overlay-base",
         type=Path,
-        default=Path("/home/xinjie/PhysTwin/data/different_types"),
-        help="Base directory containing <case_name>/color/<cam>/<frame>.png overlay frames.",
+        default=None,
+        help=(
+            "Base directory containing <case_name>/color/<cam>/<frame>.png overlay frames. "
+            "If unset, auto-resolve via PHYSTWIN_OVERLAY_BASE and common local paths."
+        ),
     )
     parser.add_argument("--camera-idx", type=int, default=0)
     parser.add_argument(
@@ -301,7 +306,7 @@ def main() -> int:
     args = parse_args()
     case_dir = args.case_dir.resolve()
     rollout_npz = args.rollout_npz.resolve()
-    overlay_base = args.overlay_base.resolve()
+    overlay_base = resolve_overlay_base(args.overlay_base)
     camera_idx = int(args.camera_idx)
 
     metadata = _load_metadata(case_dir)

@@ -1,0 +1,12 @@
+# PhysTwin bridge generated artifacts
+phystwin_bridge/inputs/cases/
+phystwin_bridge/ir/
+phystwin_bridge/outputs/
+
+# Temporary render artifacts
+phystwin_bridge/**/._tmp_cmp2x3_*/
+phystwin_bridge/**/._frames_*/
+
+# Python cache
+**/__pycache__/
+*.py[cod]

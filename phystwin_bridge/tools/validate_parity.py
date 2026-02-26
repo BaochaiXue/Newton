@@ -5,10 +5,10 @@ import argparse
 import json
 import pickle
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
+from path_defaults import default_device, default_python
 
 
 DEFAULT_THRESHOLDS = {
@@ -22,14 +22,6 @@ DEFAULT_THRESHOLDS = {
 
 def _default_importer() -> Path:
     return Path(__file__).resolve().with_name("newton_import_ir.py")
-
-
-def _default_python() -> str:
-    repo_root = Path(__file__).resolve().parents[2]
-    candidate = repo_root / "newton/.venv/bin/python"
-    if candidate.exists():
-        return str(candidate)
-    return sys.executable
 
 
 def _default_threshold_config() -> Path | None:
@@ -46,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-prefix", default="parity_validate")
 
     parser.add_argument("--importer", type=Path, default=_default_importer())
-    parser.add_argument("--python", default=_default_python())
+    parser.add_argument("--python", default=default_python())
 
     parser.add_argument("--mode", choices=["standard", "parity"], default="parity")
     parser.add_argument(
@@ -65,7 +57,11 @@ def parse_args() -> argparse.Namespace:
         choices=["legacy", "phystwin"],
         default="phystwin",
     )
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--device",
+        default=default_device(),
+        help="Warp device string. Defaults to NEWTON_DEVICE env var or cuda:0.",
+    )
     parser.add_argument(
         "--shape-contacts",
         action=argparse.BooleanOptionalAction,
