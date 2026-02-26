@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["standard", "parity"], default="parity")
     parser.add_argument(
         "--solver",
-        choices=["xpbd", "semi_implicit", "phystwin_compat"],
+        choices=["xpbd", "semi_implicit"],
         default="semi_implicit",
     )
     parser.add_argument("--solver-iterations", type=int, default=10)

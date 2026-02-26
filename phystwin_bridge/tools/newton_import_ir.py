@@ -13,8 +13,6 @@ import warp as wp
 import newton
 from path_defaults import default_device
 
-PHYSTWIN_MAX_COLLISIONS = 500
-
 
 @wp.kernel
 def _set_indexed_particle_state(
@@ -90,276 +88,6 @@ def _apply_parity_post_correction(
     particle_qd[tid] = v0
 
 
-@wp.kernel
-def _eval_phystwin_springs(
-    particle_q: wp.array(dtype=wp.vec3),
-    particle_qd: wp.array(dtype=wp.vec3),
-    num_object_points: int,
-    spring_edges: wp.array2d(dtype=wp.int32),
-    spring_rest_length: wp.array(dtype=wp.float32),
-    spring_y: wp.array(dtype=wp.float32),
-    spring_kd: wp.array(dtype=wp.float32),
-    spring_y_min: float,
-    spring_y_max: float,
-    forces: wp.array(dtype=wp.vec3),
-):
-    tid = wp.tid()
-
-    if spring_y[tid] <= spring_y_min:
-        return
-
-    idx1 = spring_edges[tid, 0]
-    idx2 = spring_edges[tid, 1]
-
-    x1 = particle_q[idx1]
-    x2 = particle_q[idx2]
-    v1 = particle_qd[idx1]
-    v2 = particle_qd[idx2]
-
-    rest = spring_rest_length[tid]
-    dis = x2 - x1
-    dis_len = wp.length(dis)
-    d = dis / wp.max(dis_len, 1e-6)
-
-    y_clamped = wp.clamp(spring_y[tid], low=spring_y_min, high=spring_y_max)
-    spring_force = y_clamped * (dis_len / rest - 1.0) * d
-
-    v_rel = wp.dot(v2 - v1, d)
-    dashpot_force = spring_kd[tid] * v_rel * d
-    overall_force = spring_force + dashpot_force
-
-    if idx1 < num_object_points:
-        wp.atomic_add(forces, idx1, overall_force)
-    if idx2 < num_object_points:
-        wp.atomic_sub(forces, idx2, overall_force)
-
-
-@wp.kernel
-def _update_vel_from_force_phystwin(
-    particle_qd: wp.array(dtype=wp.vec3),
-    mass: wp.array(dtype=wp.float32),
-    forces: wp.array(dtype=wp.vec3),
-    num_object_points: int,
-    dt: float,
-    drag_damping: float,
-    reverse_factor: float,
-    gravity_mag: float,
-    out_particle_qd: wp.array(dtype=wp.vec3),
-):
-    tid = wp.tid()
-    if tid >= num_object_points:
-        return
-
-    v0 = particle_qd[tid]
-    f0 = forces[tid]
-    m0 = mass[tid]
-
-    drag_damping_factor = wp.exp(-dt * drag_damping)
-    all_force = f0 + m0 * wp.vec3(0.0, 0.0, -gravity_mag) * reverse_factor
-    a = all_force / m0
-    v1 = v0 + a * dt
-    v2 = v1 * drag_damping_factor
-
-    out_particle_qd[tid] = v2
-
-
-@wp.kernel
-def _integrate_ground_collision_phystwin(
-    particle_q_in: wp.array(dtype=wp.vec3),
-    particle_qd_in: wp.array(dtype=wp.vec3),
-    num_object_points: int,
-    collide_elas: float,
-    collide_fric: float,
-    dt: float,
-    reverse_factor: float,
-    particle_q_out: wp.array(dtype=wp.vec3),
-    particle_qd_out: wp.array(dtype=wp.vec3),
-):
-    tid = wp.tid()
-    if tid >= num_object_points:
-        return
-
-    x0 = particle_q_in[tid]
-    v0 = particle_qd_in[tid]
-
-    normal = wp.vec3(0.0, 0.0, 1.0) * reverse_factor
-
-    x_z = x0[2]
-    v_z = v0[2]
-    next_x_z = (x_z + v_z * dt) * reverse_factor
-
-    if next_x_z < 0.0 and v_z * reverse_factor < -1e-4:
-        v_normal = wp.dot(v0, normal) * normal
-        v_tangent = v0 - v_normal
-        v_normal_length = wp.length(v_normal)
-        v_tangent_length = wp.max(wp.length(v_tangent), 1e-6)
-
-        clamp_collide_elas = wp.clamp(collide_elas, low=0.0, high=1.0)
-        clamp_collide_fric = wp.clamp(collide_fric, low=0.0, high=2.0)
-
-        v_normal_new = -clamp_collide_elas * v_normal
-        tangent_scale = wp.max(
-            0.0,
-            1.0
-            - clamp_collide_fric
-            * (1.0 + clamp_collide_elas)
-            * v_normal_length
-            / v_tangent_length,
-        )
-        v_tangent_new = tangent_scale * v_tangent
-
-        v1 = v_normal_new + v_tangent_new
-        toi = -x_z / v_z
-    else:
-        v1 = v0
-        toi = 0.0
-
-    particle_q_out[tid] = x0 + v0 * toi + v1 * (dt - toi)
-    particle_qd_out[tid] = v1
-
-
-@wp.kernel
-def _copy_object_positions(
-    particle_q: wp.array(dtype=wp.vec3),
-    num_object_points: int,
-    object_q: wp.array(dtype=wp.vec3),
-):
-    tid = wp.tid()
-    if tid >= num_object_points:
-        return
-    object_q[tid] = particle_q[tid]
-
-
-@wp.func
-def _collision_loop_phystwin(
-    i: int,
-    collision_indices: wp.array2d(dtype=wp.int32),
-    collision_number: wp.array(dtype=wp.int32),
-    x: wp.array(dtype=wp.vec3),
-    v: wp.array(dtype=wp.vec3),
-    masses: wp.array(dtype=wp.float32),
-    masks: wp.array(dtype=wp.int32),
-    collision_dist: float,
-    clamp_collide_object_elas: float,
-    clamp_collide_object_fric: float,
-):
-    x1 = x[i]
-    v1 = v[i]
-    m1 = masses[i]
-    mask1 = masks[i]
-
-    valid_count = float(0.0)
-    impulse_sum = wp.vec3(0.0, 0.0, 0.0)
-    for k in range(collision_number[i]):
-        index = collision_indices[i][k]
-        x2 = x[index]
-        v2 = v[index]
-        m2 = masses[index]
-        mask2 = masks[index]
-
-        dis = x2 - x1
-        dis_len = wp.length(dis)
-        relative_v = v2 - v1
-        if (
-            mask1 != mask2
-            and dis_len < collision_dist
-            and wp.dot(dis, relative_v) < -1e-4
-        ):
-            valid_count += 1.0
-
-            collision_normal = dis / wp.max(dis_len, 1e-6)
-            v_rel_n = wp.dot(relative_v, collision_normal) * collision_normal
-            impulse_n = (-(1.0 + clamp_collide_object_elas) * v_rel_n) / (
-                1.0 / m1 + 1.0 / m2
-            )
-            v_rel_n_length = wp.length(v_rel_n)
-
-            v_rel_t = relative_v - v_rel_n
-            v_rel_t_length = wp.max(wp.length(v_rel_t), 1e-6)
-            tangent_scale = wp.max(
-                0.0,
-                1.0
-                - clamp_collide_object_fric
-                * (1.0 + clamp_collide_object_elas)
-                * v_rel_n_length
-                / v_rel_t_length,
-            )
-            impulse_t = (tangent_scale - 1.0) * v_rel_t / (1.0 / m1 + 1.0 / m2)
-
-            impulse_sum += impulse_n + impulse_t
-
-    return valid_count, impulse_sum
-
-
-@wp.kernel(enable_backward=False)
-def _update_potential_collision_phystwin(
-    x: wp.array(dtype=wp.vec3),
-    masks: wp.array(dtype=wp.int32),
-    collision_dist: float,
-    grid: wp.uint64,
-    max_collision_per_particle: int,
-    collision_indices: wp.array2d(dtype=wp.int32),
-    collision_number: wp.array(dtype=wp.int32),
-):
-    tid = wp.tid()
-    i = wp.hash_grid_point_id(grid, tid)
-    x1 = x[i]
-    mask1 = masks[i]
-
-    neighbors = wp.hash_grid_query(grid, x1, collision_dist * 5.0)
-    for index in neighbors:
-        if index != i:
-            x2 = x[index]
-            mask2 = masks[index]
-            dis = x2 - x1
-            dis_len = wp.length(dis)
-            if mask1 != mask2 and dis_len < collision_dist:
-                c = collision_number[i]
-                if c < max_collision_per_particle:
-                    collision_indices[i][c] = index
-                    collision_number[i] = c + 1
-
-
-@wp.kernel
-def _object_collision_phystwin(
-    x: wp.array(dtype=wp.vec3),
-    v_before_collision: wp.array(dtype=wp.vec3),
-    masses: wp.array(dtype=wp.float32),
-    masks: wp.array(dtype=wp.int32),
-    collide_object_elas: float,
-    collide_object_fric: float,
-    collision_dist: float,
-    collision_indices: wp.array2d(dtype=wp.int32),
-    collision_number: wp.array(dtype=wp.int32),
-    v_before_ground: wp.array(dtype=wp.vec3),
-):
-    tid = wp.tid()
-    v1 = v_before_collision[tid]
-    m1 = masses[tid]
-
-    clamp_collide_object_elas = wp.clamp(collide_object_elas, low=0.0, high=1.0)
-    clamp_collide_object_fric = wp.clamp(collide_object_fric, low=0.0, high=2.0)
-
-    valid_count, impulse_sum = _collision_loop_phystwin(
-        tid,
-        collision_indices,
-        collision_number,
-        x,
-        v_before_collision,
-        masses,
-        masks,
-        collision_dist,
-        clamp_collide_object_elas,
-        clamp_collide_object_fric,
-    )
-
-    if valid_count > 0.0:
-        impulse_avg = impulse_sum / valid_count
-        v_before_ground[tid] = v1 - impulse_avg / m1
-    else:
-        v_before_ground[tid] = v1
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Instantiate a PhysTwin IR in Newton and run a short rollout."
@@ -369,9 +97,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["standard", "parity"], default="standard")
     parser.add_argument(
         "--solver",
-        choices=["xpbd", "semi_implicit", "phystwin_compat"],
+        choices=["xpbd", "semi_implicit"],
         default=None,
-        help="Solver backend. If unset, defaults to semi_implicit in parity mode, xpbd otherwise.",
+        help=(
+            "Solver backend. If unset, defaults to semi_implicit in parity mode, xpbd otherwise."
+        ),
     )
     parser.add_argument("--solver-iterations", type=int, default=10)
     parser.add_argument(
@@ -713,10 +443,10 @@ def _validate_phystwin_semantics(
             f"--xpbd-angular-damping must be >= 0, got {args.xpbd_angular_damping}."
         )
 
-    if strict and args.mode == "parity" and solver_name not in {"semi_implicit", "phystwin_compat"}:
+    if strict and args.mode == "parity" and solver_name not in {"semi_implicit", "xpbd"}:
         raise ValueError(
-            "Strict PhysTwin mode requires semi_implicit or phystwin_compat solver in parity mode. "
-            f"Got solver={solver_name!r}. Re-run with --solver semi_implicit (or phystwin_compat) or --no-strict-phystwin."
+            "Strict PhysTwin mode requires semi_implicit or xpbd solver in parity mode. "
+            f"Got solver={solver_name!r}. Re-run with --solver semi_implicit (or xpbd) or --no-strict-phystwin."
         )
     if strict and args.frame_sync != "phystwin":
         raise ValueError(
@@ -1090,8 +820,6 @@ def _make_solver(
     iterations: int,
     args: argparse.Namespace,
 ):
-    if solver_name == "phystwin_compat":
-        return None
     if solver_name == "semi_implicit":
         return newton.solvers.SolverSemiImplicit(
             model,
@@ -1147,13 +875,6 @@ def main() -> int:
     resolved_device = _resolve_device(args.device)
     wp.init()
     solver_name = _resolve_solver_name(args)
-    if solver_name == "phystwin_compat":
-        warnings.warn(
-            "Using phystwin_compat: this emulates PhysTwin update kernels and bypasses Newton native "
-            "semi_implicit spring/contact integration. Use --solver semi_implicit for native two-way coupling "
-            "with other Newton objects/materials.",
-            RuntimeWarning,
-        )
 
     (
         model,
@@ -1173,12 +894,6 @@ def main() -> int:
         device=resolved_device,
         solver_name=solver_name,
     )
-    if solver_name == "phystwin_compat" and shape_contacts_enabled:
-        warnings.warn(
-            "shape-contacts are not consumed by phystwin_compat custom stepping path. "
-            "For Newton native contact coupling, use --solver semi_implicit.",
-            RuntimeWarning,
-        )
     solver = _make_solver(model, solver_name, args.solver_iterations, args)
 
     state_in = model.state()
@@ -1236,109 +951,6 @@ def main() -> int:
         # and feeding finite-difference velocities into spring damping changes the effective PhysTwin behavior.
         controller_vel_zero = np.zeros((controller_idx.size, 3), dtype=np.float32)
 
-    phystwin_spring_edges_wp = None
-    phystwin_spring_rest_wp = None
-    phystwin_spring_y_wp = None
-    phystwin_spring_kd_wp = None
-    phystwin_mass_wp = None
-    phystwin_forces_wp = None
-    phystwin_v_before_collision_wp = None
-    phystwin_v_before_ground_wp = None
-    phystwin_spring_y_min = 0.0
-    phystwin_spring_y_max = 1.0e5
-    phystwin_gravity_mag = abs(float(gravity_scalar))
-    phystwin_object_collision_enabled = False
-    phystwin_collision_dist = 0.0
-    phystwin_collision_grid = None
-    phystwin_collision_positions_wp = None
-    phystwin_collision_masks_wp = None
-    phystwin_collision_indices_wp = None
-    phystwin_collision_number_wp = None
-    phystwin_collide_object_elas = 0.7
-    phystwin_collide_object_fric = 0.3
-    if solver_name == "phystwin_compat":
-        spring_edges_np = np.asarray(ir["spring_edges"], dtype=np.int32)
-        spring_rest_np = np.asarray(ir["spring_rest_length"], dtype=np.float32).reshape(-1)
-        spring_y_np = (
-            np.asarray(ir["spring_y"], dtype=np.float32).reshape(-1)
-            if "spring_y" in ir
-            else np.asarray(ir["spring_ke"], dtype=np.float32).reshape(-1)
-        )
-        spring_kd_np = np.asarray(ir["spring_kd"], dtype=np.float32).reshape(-1)
-        object_mass_np = np.asarray(ir["mass"], dtype=np.float32).reshape(-1)[:num_object_points]
-
-        if spring_edges_np.ndim != 2 or spring_edges_np.shape[1] != 2:
-            raise ValueError(
-                f"Expected spring_edges shape [N,2], got {spring_edges_np.shape}"
-            )
-        if spring_rest_np.shape[0] != spring_edges_np.shape[0]:
-            raise ValueError("spring_rest_length length mismatch in phystwin_compat mode.")
-        if spring_y_np.shape[0] != spring_edges_np.shape[0]:
-            raise ValueError("spring_y length mismatch in phystwin_compat mode.")
-        if spring_kd_np.shape[0] != spring_edges_np.shape[0]:
-            raise ValueError("spring_kd length mismatch in phystwin_compat mode.")
-        if object_mass_np.shape[0] != num_object_points:
-            raise ValueError("object mass length mismatch in phystwin_compat mode.")
-        if np.any(object_mass_np <= 0.0):
-            raise ValueError(
-                "phystwin_compat expects strictly positive object masses."
-            )
-
-        phystwin_spring_edges_wp = wp.array(
-            spring_edges_np, dtype=wp.int32, device=model.device
-        )
-        phystwin_spring_rest_wp = wp.array(
-            spring_rest_np, dtype=wp.float32, device=model.device
-        )
-        phystwin_spring_y_wp = wp.array(
-            spring_y_np, dtype=wp.float32, device=model.device
-        )
-        phystwin_spring_kd_wp = wp.array(
-            spring_kd_np, dtype=wp.float32, device=model.device
-        )
-        phystwin_mass_wp = wp.array(
-            object_mass_np, dtype=wp.float32, device=model.device
-        )
-        phystwin_forces_wp = wp.zeros(
-            (num_object_points,), dtype=wp.vec3, device=model.device
-        )
-        phystwin_v_before_collision_wp = wp.zeros(
-            (num_object_points,), dtype=wp.vec3, device=model.device
-        )
-        phystwin_v_before_ground_wp = wp.zeros(
-            (num_object_points,), dtype=wp.vec3, device=model.device
-        )
-
-        phystwin_spring_y_min = float(
-            _as_scalar(ir.get("spring_y_min", np.asarray(0.0, dtype=np.float32)))
-        )
-        phystwin_spring_y_max = float(
-            _as_scalar(ir.get("spring_y_max", np.asarray(1.0e5, dtype=np.float32)))
-        )
-        phystwin_collide_object_elas, phystwin_collide_object_fric = _resolve_object_contact_params(ir)
-        phystwin_collision_dist = float(
-            _as_scalar(ir.get("contact_collision_dist", np.asarray(0.02, dtype=np.float32)))
-        )
-        if "self_collision" in ir and _as_bool(ir["self_collision"]):
-            phystwin_object_collision_enabled = True
-            phystwin_collision_grid = wp.HashGrid(128, 128, 128)
-            phystwin_collision_positions_wp = wp.zeros(
-                (num_object_points,), dtype=wp.vec3, device=model.device
-            )
-            phystwin_collision_masks_wp = wp.array(
-                np.arange(num_object_points, dtype=np.int32),
-                dtype=wp.int32,
-                device=model.device,
-            )
-            phystwin_collision_indices_wp = wp.zeros(
-                (num_object_points, PHYSTWIN_MAX_COLLISIONS),
-                dtype=wp.int32,
-                device=model.device,
-            )
-            phystwin_collision_number_wp = wp.zeros(
-                (num_object_points,), dtype=wp.int32, device=model.device
-            )
-
     if args.frame_sync == "phystwin":
         q0 = state_in.particle_q.numpy().astype(np.float32)
         rollout_all.append(q0)
@@ -1352,10 +964,7 @@ def main() -> int:
     parity_apply_ground_collision = bool(
         args.mode == "parity" and args.parity_apply_ground_collision
     )
-    parity_post_correction_enabled = bool(
-        solver_name != "phystwin_compat"
-        and (parity_apply_drag or parity_apply_ground_collision)
-    )
+    parity_post_correction_enabled = bool(parity_apply_drag or parity_apply_ground_collision)
     parity_drag_damping = _resolve_parity_drag_damping(ir)
     parity_reverse_factor = _resolve_reverse_factor(ir)
     parity_collide_elas, parity_collide_fric = _resolve_ground_contact_params(ir)
@@ -1368,53 +977,8 @@ def main() -> int:
     semantic_checks["parity_collide_fric"] = float(parity_collide_fric)
     semantic_checks["parity_collide_object_elas"] = float(parity_collide_object_elas)
     semantic_checks["parity_collide_object_fric"] = float(parity_collide_object_fric)
-    semantic_checks["phystwin_compat_solver"] = bool(solver_name == "phystwin_compat")
-    if solver_name == "phystwin_compat":
-        semantic_checks["phystwin_spring_y_min"] = float(phystwin_spring_y_min)
-        semantic_checks["phystwin_spring_y_max"] = float(phystwin_spring_y_max)
-        semantic_checks["phystwin_gravity_mag"] = float(phystwin_gravity_mag)
-        semantic_checks["phystwin_object_collision_enabled"] = bool(
-            phystwin_object_collision_enabled
-        )
 
     for frame_idx in frame_indices:
-        if solver_name == "phystwin_compat" and phystwin_object_collision_enabled:
-            assert phystwin_collision_grid is not None
-            assert phystwin_collision_positions_wp is not None
-            assert phystwin_collision_masks_wp is not None
-            assert phystwin_collision_indices_wp is not None
-            assert phystwin_collision_number_wp is not None
-            wp.launch(
-                kernel=_copy_object_positions,
-                dim=num_object_points,
-                inputs=[
-                    state_in.particle_q,
-                    num_object_points,
-                ],
-                outputs=[phystwin_collision_positions_wp],
-                device=model.device,
-            )
-            phystwin_collision_grid.build(
-                phystwin_collision_positions_wp, float(phystwin_collision_dist * 5.0)
-            )
-            phystwin_collision_number_wp.zero_()
-            wp.launch(
-                kernel=_update_potential_collision_phystwin,
-                dim=num_object_points,
-                inputs=[
-                    phystwin_collision_positions_wp,
-                    phystwin_collision_masks_wp,
-                    float(phystwin_collision_dist),
-                    phystwin_collision_grid.id,
-                    int(PHYSTWIN_MAX_COLLISIONS),
-                ],
-                outputs=[
-                    phystwin_collision_indices_wp,
-                    phystwin_collision_number_wp,
-                ],
-                device=model.device,
-            )
-
         for substep_idx in range(substeps_per_frame):
             if controller_idx.size > 0:
                 target_ctrl = _controller_target_for_substep(
@@ -1449,129 +1013,28 @@ def main() -> int:
             if contacts is not None:
                 model.collide(state_in, contacts)
 
-            if solver_name == "phystwin_compat":
-                assert phystwin_spring_edges_wp is not None
-                assert phystwin_spring_rest_wp is not None
-                assert phystwin_spring_y_wp is not None
-                assert phystwin_spring_kd_wp is not None
-                assert phystwin_mass_wp is not None
-                assert phystwin_forces_wp is not None
-                assert phystwin_v_before_collision_wp is not None
+            assert solver is not None
+            solver.step(state_in, state_out, control, contacts, sim_dt)
 
-                phystwin_forces_wp.zero_()
+            if parity_post_correction_enabled:
                 wp.launch(
-                    kernel=_eval_phystwin_springs,
-                    dim=phystwin_spring_rest_wp.shape[0],
-                    inputs=[
-                        state_in.particle_q,
-                        state_in.particle_qd,
-                        num_object_points,
-                        phystwin_spring_edges_wp,
-                        phystwin_spring_rest_wp,
-                        phystwin_spring_y_wp,
-                        phystwin_spring_kd_wp,
-                        float(phystwin_spring_y_min),
-                        float(phystwin_spring_y_max),
-                    ],
-                    outputs=[phystwin_forces_wp],
-                    device=model.device,
-                )
-                wp.launch(
-                    kernel=_update_vel_from_force_phystwin,
+                    kernel=_apply_parity_post_correction,
                     dim=num_object_points,
                     inputs=[
-                        state_in.particle_qd,
-                        phystwin_mass_wp,
-                        phystwin_forces_wp,
+                        state_in.particle_q,
+                        state_out.particle_q,
+                        state_out.particle_qd,
                         num_object_points,
                         float(sim_dt),
                         float(parity_drag_damping),
+                        int(parity_apply_drag),
+                        int(parity_apply_ground_collision),
                         float(parity_reverse_factor),
-                        float(phystwin_gravity_mag),
-                    ],
-                    outputs=[phystwin_v_before_collision_wp],
-                    device=model.device,
-                )
-                if phystwin_object_collision_enabled:
-                    assert phystwin_v_before_ground_wp is not None
-                    assert phystwin_collision_masks_wp is not None
-                    assert phystwin_collision_indices_wp is not None
-                    assert phystwin_collision_number_wp is not None
-                    wp.launch(
-                        kernel=_object_collision_phystwin,
-                        dim=num_object_points,
-                        inputs=[
-                            state_in.particle_q,
-                            phystwin_v_before_collision_wp,
-                            phystwin_mass_wp,
-                            phystwin_collision_masks_wp,
-                            float(phystwin_collide_object_elas),
-                            float(phystwin_collide_object_fric),
-                            float(phystwin_collision_dist),
-                            phystwin_collision_indices_wp,
-                            phystwin_collision_number_wp,
-                        ],
-                        outputs=[phystwin_v_before_ground_wp],
-                        device=model.device,
-                    )
-                    velocity_for_ground = phystwin_v_before_ground_wp
-                else:
-                    velocity_for_ground = phystwin_v_before_collision_wp
-                wp.launch(
-                    kernel=_integrate_ground_collision_phystwin,
-                    dim=num_object_points,
-                    inputs=[
-                        state_in.particle_q,
-                        velocity_for_ground,
-                        num_object_points,
                         float(parity_collide_elas),
                         float(parity_collide_fric),
-                        float(sim_dt),
-                        float(parity_reverse_factor),
                     ],
-                    outputs=[state_out.particle_q, state_out.particle_qd],
                     device=model.device,
                 )
-
-                if controller_idx.size > 0:
-                    assert controller_idx_wp is not None
-                    assert controller_target_wp is not None
-                    assert controller_vel_wp is not None
-                    wp.launch(
-                        kernel=_set_indexed_particle_state,
-                        dim=controller_idx.size,
-                        inputs=[
-                            state_out.particle_q,
-                            state_out.particle_qd,
-                            controller_idx_wp,
-                            controller_target_wp,
-                            controller_vel_wp,
-                        ],
-                        device=model.device,
-                    )
-            else:
-                assert solver is not None
-                solver.step(state_in, state_out, control, contacts, sim_dt)
-
-                if parity_post_correction_enabled:
-                    wp.launch(
-                        kernel=_apply_parity_post_correction,
-                        dim=num_object_points,
-                        inputs=[
-                            state_in.particle_q,
-                            state_out.particle_q,
-                            state_out.particle_qd,
-                            num_object_points,
-                            float(sim_dt),
-                            float(parity_drag_damping),
-                            int(parity_apply_drag),
-                            int(parity_apply_ground_collision),
-                            float(parity_reverse_factor),
-                            float(parity_collide_elas),
-                            float(parity_collide_fric),
-                        ],
-                        device=model.device,
-                    )
             state_in, state_out = state_out, state_in
 
         q_frame = state_in.particle_q.numpy().astype(np.float32)
