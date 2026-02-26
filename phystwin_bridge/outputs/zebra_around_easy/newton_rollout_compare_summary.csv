@@ -1,4 +1,0 @@
-run,frames_run,substeps_per_frame,wall_time_sec,rmse_mean,rmse_max
-newton_rollout_ir667,5,667,5.906902,2.13481522,7.22102928
-newton_rollout_ir667_contacts,5,667,13.687908,2.67026019,7.17569923
-newton_rollout_ir667_long296,296,667,413.429790,0.89109576,7.19836378
