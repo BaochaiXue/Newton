@@ -29,81 +29,59 @@ def _set_indexed_particle_state(
 
 
 @wp.kernel
-def _apply_parity_post_correction(
-    prev_particle_q: wp.array(dtype=wp.vec3),
+def _apply_phystwin_drag(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
     num_object_points: int,
     dt: float,
     drag_damping: float,
-    apply_drag: int,
-    apply_ground_collision: int,
-    reverse_factor: float,
-    collide_elas: float,
-    collide_fric: float,
 ):
+    """PhysTwin-style drag damping (v <- v*exp(-dt*k)) + matching position correction.
+
+    PhysTwin applies exponential velocity damping each substep before integrating x using
+    the damped velocity. Newton's semi-implicit integrator integrates x using the undamped
+    v1; we compensate by adjusting x by v1*dt*(1-exp(-dt*k)).
+    """
     tid = wp.tid()
     if tid >= num_object_points:
         return
 
-    x0 = prev_particle_q[tid]
-    v0 = particle_qd[tid]
-    if apply_drag != 0:
-        v0 = v0 * wp.exp(-dt * drag_damping)
-
-    if apply_ground_collision != 0:
-        normal = wp.vec3(0.0, 0.0, 1.0) * reverse_factor
-
-        x_z = x0[2]
-        v_z = v0[2]
-        next_x_z = (x_z + v_z * dt) * reverse_factor
-
-        if next_x_z < 0.0 and v_z * reverse_factor < -1e-4:
-            v_normal = wp.dot(v0, normal) * normal
-            v_tangent = v0 - v_normal
-            v_normal_length = wp.length(v_normal)
-            v_tangent_length = wp.max(wp.length(v_tangent), 1e-6)
-
-            clamp_collide_elas = wp.clamp(collide_elas, low=0.0, high=1.0)
-            clamp_collide_fric = wp.clamp(collide_fric, low=0.0, high=2.0)
-
-            v_normal_new = -clamp_collide_elas * v_normal
-            tangent_scale = wp.max(
-                0.0,
-                1.0
-                - clamp_collide_fric
-                * (1.0 + clamp_collide_elas)
-                * v_normal_length
-                / v_tangent_length,
-            )
-            v_tangent_new = tangent_scale * v_tangent
-            v1 = v_normal_new + v_tangent_new
-
-            toi = -x_z / v_z
-            particle_q[tid] = x0 + v0 * toi + v1 * (dt - toi)
-            particle_qd[tid] = v1
-            return
-
-    particle_q[tid] = x0 + v0 * dt
-    particle_qd[tid] = v0
+    v1 = particle_qd[tid]
+    drag = wp.exp(-dt * drag_damping)
+    particle_q[tid] = particle_q[tid] - v1 * dt * (1.0 - drag)
+    particle_qd[tid] = v1 * drag
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Instantiate a PhysTwin IR in Newton and run a short rollout."
+        description=(
+            "Instantiate a PhysTwin IR in Newton and run a native Newton rollout "
+            "(XPBD or semi_implicit)."
+        )
     )
     parser.add_argument("--ir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--mode", choices=["standard", "parity"], default="standard")
+    parser.add_argument("--output-prefix", default="newton_rollout")
+
     parser.add_argument(
         "--solver",
         choices=["xpbd", "semi_implicit"],
-        default=None,
-        help=(
-            "Solver backend. If unset, defaults to semi_implicit in parity mode, xpbd otherwise."
-        ),
+        default="xpbd",
+        help="Newton solver backend.",
     )
     parser.add_argument("--solver-iterations", type=int, default=10)
+    parser.add_argument(
+        "--spring-ke-scale",
+        type=float,
+        default=1.0,
+        help="Global scale factor applied to IR spring_ke for all solvers.",
+    )
+    parser.add_argument(
+        "--spring-kd-scale",
+        type=float,
+        default=1.0,
+        help="Global scale factor applied to IR spring_kd for all solvers.",
+    )
     parser.add_argument(
         "--xpbd-soft-body-relaxation",
         type=float,
@@ -134,6 +112,7 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable XPBD restitution.",
     )
+
     parser.add_argument(
         "--semi-spring-ke-scale",
         type=float,
@@ -173,12 +152,13 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Semi-implicit friction smoothing.",
     )
+
     parser.add_argument("--num-frames", type=int, default=20)
     parser.add_argument(
         "--substeps-per-frame",
         type=int,
         default=None,
-        help="Override IR substeps for faster short rollouts.",
+        help="Override IR substeps.",
     )
     parser.add_argument(
         "--sim-dt",
@@ -190,14 +170,36 @@ def parse_args() -> argparse.Namespace:
         "--gravity",
         type=float,
         default=None,
-        help="Gravity value along up-axis. If unset and mode=parity, derive from reverse_z.",
+        help="Gravity scalar along --up-axis. If unset and --gravity-from-reverse-z is true, derive from IR reverse_z.",
+    )
+    parser.add_argument(
+        "--gravity-mag",
+        type=float,
+        default=9.8,
+        help="Gravity magnitude when deriving gravity from reverse_z.",
+    )
+    parser.add_argument(
+        "--gravity-from-reverse-z",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --gravity is unset, derive gravity sign from IR reverse_z.",
     )
     parser.add_argument("--up-axis", choices=["X", "Y", "Z"], default="Z")
+    parser.add_argument(
+        "--frame-sync",
+        choices=["legacy", "phystwin"],
+        default="phystwin",
+        help=(
+            "Rollout frame indexing convention. "
+            "'phystwin' keeps frame 0 as initial state and simulates 0->1, 1->2, ..."
+        ),
+    )
     parser.add_argument(
         "--device",
         default=default_device(),
         help="Warp device string. Defaults to NEWTON_DEVICE env var or cuda:0.",
     )
+
     parser.add_argument(
         "--shape-contacts",
         action=argparse.BooleanOptionalAction,
@@ -205,12 +207,37 @@ def parse_args() -> argparse.Namespace:
         help="Enable shape contact generation via model.collide(...).",
     )
     parser.add_argument(
+        "--add-ground-plane",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add a static Newton ground plane at z=0 using contact params from IR.",
+    )
+    parser.add_argument(
         "--particle-contacts",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Enable particle-particle contacts. If unset, defaults to enabled in standard mode "
-            "and disabled in parity mode."
+            "Enable particle-particle contacts. If unset, follows IR self_collision when available, "
+            "otherwise disabled."
+        ),
+    )
+    parser.add_argument(
+        "--particle-contact-radius",
+        type=float,
+        default=1e-5,
+        help=(
+            "Effective collision radius used when --no-particle-contacts. "
+            "Keeps solver kernels active while strongly suppressing internal collisions."
+        ),
+    )
+    parser.add_argument(
+        "--object-contact-radius",
+        type=float,
+        default=None,
+        help=(
+            "Override contact radius for object particles (0..num_object_points-1). "
+            "Useful when disabling particle-particle contacts but still needing stable particle-shape contacts "
+            "without a large sphere offset."
         ),
     )
     parser.add_argument(
@@ -219,86 +246,67 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Allow shape-contacts with particle-contacts disabled. This is approximate because "
-            "the same particle radius controls both contact paths."
+            "particle radius affects both paths."
         ),
     )
     parser.add_argument(
-        "--enable-contacts",
-        dest="legacy_enable_contacts",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--parity-collision-radius",
-        type=float,
-        default=1e-5,
-        help="Collision radius used in parity mode when particle-particle collisions are disabled.",
-    )
-    parser.add_argument(
-        "--parity-disable-particle-collision",
+        "--controller-inactive",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="In parity mode, set all particle radii to parity-collision-radius to suppress internal particle collisions.",
-    )
-    parser.add_argument(
-        "--parity-controller-inactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="In parity mode, mark controller particles inactive for Newton contact kernels.",
-    )
-    parser.add_argument(
-        "--parity-interpolate-controls",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="In parity mode, linearly interpolate controller trajectory within each frame substep.",
-    )
-    parser.add_argument(
-        "--parity-apply-drag",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="In parity mode, apply PhysTwin drag damping after each Newton substep.",
-    )
-    parser.add_argument(
-        "--parity-apply-ground-collision",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="In parity mode, apply PhysTwin-style explicit ground collision after each Newton substep.",
-    )
-    parser.add_argument(
-        "--parity-gravity-from-reverse-z",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="In parity mode, derive gravity direction from reverse_z when --gravity is not specified.",
-    )
-    parser.add_argument(
-        "--parity-gravity-mag",
-        type=float,
-        default=9.8,
-        help="Gravity magnitude used by parity mode when deriving from reverse_z.",
-    )
-    parser.add_argument(
-        "--frame-sync",
-        choices=["legacy", "phystwin"],
-        default="phystwin",
+        default=False,
         help=(
-            "Rollout frame indexing convention. "
-            "'phystwin' keeps frame 0 as initial state and simulates transitions 0->1, 1->2, ... "
-            "to match PhysTwin."
+            "Deprecated: marking controllers inactive can break spring constraints in XPBD "
+            "(inactive particles are skipped by integration and delta application). "
+            "Prefer leaving controllers active with mass=0 and tiny radius."
         ),
     )
     parser.add_argument(
-        "--strict-phystwin",
+        "--interpolate-controls",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable strict PhysTwin semantic checks to avoid parameter-mapping mismatches.",
+        help="Linearly interpolate controller trajectories within each frame.",
+    )
+    parser.add_argument(
+        "--strict-physics-checks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require strict spring/parameter consistency checks when loading IR.",
+    )
+    parser.add_argument(
+        "--apply-drag",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply PhysTwin-style drag using IR drag_damping (applied after each Newton substep).",
+    )
+    parser.add_argument(
+        "--drag-damping-scale",
+        type=float,
+        default=1.0,
+        help="Optional scale applied to IR drag_damping when --apply-drag is enabled.",
+    )
+    parser.add_argument(
+        "--particle-mu-override",
+        type=float,
+        default=None,
+        help="Optional override for model.particle_mu.",
+    )
+    parser.add_argument(
+        "--ground-mu-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to ground-plane friction coefficient loaded from IR.",
+    )
+    parser.add_argument(
+        "--ground-restitution-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to ground-plane restitution loaded from IR.",
     )
     parser.add_argument(
         "--inference",
         type=Path,
         default=None,
-        help="Optional PhysTwin baseline inference.pkl for error metrics.",
+        help="Optional PhysTwin baseline inference.pkl for RMSE reporting.",
     )
-    parser.add_argument("--output-prefix", default="newton_rollout_short")
     return parser.parse_args()
 
 
@@ -327,88 +335,41 @@ def _resolve_device(device_str: str) -> str:
         return "cpu"
 
 
-def _gravity_vector(up_axis: str, gravity_scalar: float) -> tuple[float, float, float]:
-    vector = [0.0, 0.0, 0.0]
-    axis_to_index = {"X": 0, "Y": 1, "Z": 2}
-    vector[axis_to_index[up_axis]] = float(gravity_scalar)
-    return tuple(vector)
-
-
-def _resolve_gravity(args: argparse.Namespace, ir: dict[str, np.ndarray]) -> tuple[float, tuple[float, float, float]]:
-    if args.gravity is not None:
-        gravity_scalar = float(args.gravity)
-    elif args.mode == "parity" and args.parity_gravity_from_reverse_z:
-        reverse_z = _as_bool(ir["reverse_z"]) if "reverse_z" in ir else False
-        gravity_scalar = float(args.parity_gravity_mag) * (1.0 if reverse_z else -1.0)
-    else:
-        gravity_scalar = 0.0
-    return gravity_scalar, _gravity_vector(args.up_axis, gravity_scalar)
-
-
-def _resolve_reverse_factor(ir: dict[str, np.ndarray]) -> float:
-    reverse_z = _as_bool(ir["reverse_z"]) if "reverse_z" in ir else False
-    return -1.0 if reverse_z else 1.0
-
-
-def _resolve_parity_drag_damping(ir: dict[str, np.ndarray]) -> float:
-    if "drag_damping" in ir:
-        return _as_scalar(ir["drag_damping"])
-    return 0.0
-
-
-def _resolve_ground_contact_params(ir: dict[str, np.ndarray]) -> tuple[float, float]:
-    collide_elas = _as_scalar(ir.get("contact_collide_elas", np.asarray(0.5, dtype=np.float32)))
-    collide_fric = _as_scalar(ir.get("contact_collide_fric", np.asarray(0.3, dtype=np.float32)))
-    return float(collide_elas), float(collide_fric)
-
-
-def _resolve_object_contact_params(ir: dict[str, np.ndarray]) -> tuple[float, float]:
-    collide_object_elas = _as_scalar(
-        ir.get("contact_collide_object_elas", np.asarray(0.7, dtype=np.float32))
-    )
-    collide_object_fric = _as_scalar(
-        ir.get("contact_collide_object_fric", np.asarray(0.3, dtype=np.float32))
-    )
-    return float(collide_object_elas), float(collide_object_fric)
-
-
-def _resolve_solver_name(args: argparse.Namespace) -> str:
-    if args.solver is not None:
-        return str(args.solver)
-    if args.mode == "parity":
-        return "semi_implicit"
-    return "xpbd"
-
-
-def _resolve_shape_contacts_enabled(args: argparse.Namespace) -> bool:
-    return bool(args.shape_contacts or args.legacy_enable_contacts)
-
-
-def _resolve_particle_contacts_enabled(
-    args: argparse.Namespace, ir: dict[str, np.ndarray]
-) -> bool:
-    if args.particle_contacts is not None:
-        return bool(args.particle_contacts)
-    if args.mode == "parity":
-        if "self_collision" in ir:
-            return bool(_as_bool(ir["self_collision"]))
-        return not bool(args.parity_disable_particle_collision)
-    return True
-
-
 def _resolve_ir_version(ir: dict[str, np.ndarray]) -> int:
     if "ir_version" not in ir:
         return 1
     return int(np.asarray(ir["ir_version"]).reshape(-1)[0])
 
 
-def _validate_phystwin_semantics(
-    ir: dict[str, np.ndarray],
-    args: argparse.Namespace,
-    solver_name: str,
-) -> dict[str, float | str | bool]:
+def _gravity_vector(up_axis: str, gravity_scalar: float) -> tuple[float, float, float]:
+    vec = [0.0, 0.0, 0.0]
+    axis_to_index = {"X": 0, "Y": 1, "Z": 2}
+    vec[axis_to_index[up_axis]] = float(gravity_scalar)
+    return tuple(vec)
+
+
+def _resolve_gravity(args: argparse.Namespace, ir: dict[str, np.ndarray]) -> tuple[float, tuple[float, float, float]]:
+    if args.gravity is not None:
+        gravity_scalar = float(args.gravity)
+    elif bool(args.gravity_from_reverse_z):
+        reverse_z = _as_bool(ir["reverse_z"]) if "reverse_z" in ir else False
+        gravity_scalar = float(args.gravity_mag) * (1.0 if reverse_z else -1.0)
+    else:
+        gravity_scalar = 0.0
+    return gravity_scalar, _gravity_vector(args.up_axis, gravity_scalar)
+
+
+def _resolve_particle_contacts_enabled(args: argparse.Namespace, ir: dict[str, np.ndarray]) -> bool:
+    if args.particle_contacts is not None:
+        return bool(args.particle_contacts)
+    if "self_collision" in ir:
+        return bool(_as_bool(ir["self_collision"]))
+    return False
+
+
+def _validate_physics_semantics(ir: dict[str, np.ndarray], args: argparse.Namespace) -> dict[str, float | str | bool]:
     checks: dict[str, float | str | bool] = {}
-    strict = bool(args.strict_phystwin)
+    strict = bool(args.strict_physics_checks)
 
     if args.semi_spring_ke_scale <= 0.0:
         raise ValueError(
@@ -442,49 +403,21 @@ def _validate_phystwin_semantics(
         raise ValueError(
             f"--xpbd-angular-damping must be >= 0, got {args.xpbd_angular_damping}."
         )
-
-    if strict and args.mode == "parity" and solver_name not in {"semi_implicit", "xpbd"}:
+    if args.spring_ke_scale <= 0.0:
         raise ValueError(
-            "Strict PhysTwin mode requires semi_implicit or xpbd solver in parity mode. "
-            f"Got solver={solver_name!r}. Re-run with --solver semi_implicit (or xpbd) or --no-strict-phystwin."
+            f"--spring-ke-scale must be > 0, got {args.spring_ke_scale}."
         )
-    if strict and args.frame_sync != "phystwin":
+    if args.spring_kd_scale < 0.0:
         raise ValueError(
-            "Strict PhysTwin mode requires --frame-sync phystwin. "
-            f"Got frame_sync={args.frame_sync!r}."
+            f"--spring-kd-scale must be >= 0, got {args.spring_kd_scale}."
         )
-    if strict and args.mode == "parity" and args.gravity is None and not args.parity_gravity_from_reverse_z:
+    if args.ground_mu_scale < 0.0:
         raise ValueError(
-            "Strict PhysTwin mode requires gravity from reverse_z when --gravity is unset. "
-            "Re-run with --parity-gravity-from-reverse-z or set --gravity explicitly."
+            f"--ground-mu-scale must be >= 0, got {args.ground_mu_scale}."
         )
-    if strict and args.mode == "parity" and not args.parity_apply_drag:
+    if args.ground_restitution_scale < 0.0:
         raise ValueError(
-            "Strict PhysTwin mode requires --parity-apply-drag."
-        )
-    if strict and args.mode == "parity" and not args.parity_apply_ground_collision:
-        raise ValueError(
-            "Strict PhysTwin mode requires --parity-apply-ground-collision."
-        )
-    if (
-        strict
-        and args.mode == "parity"
-        and "self_collision" in ir
-        and _as_bool(ir["self_collision"])
-        and args.particle_contacts is False
-    ):
-        raise ValueError(
-            "Strict PhysTwin mode with self_collision=true requires --particle-contacts."
-        )
-    if (
-        strict
-        and args.mode == "parity"
-        and "self_collision" in ir
-        and _as_bool(ir["self_collision"])
-        and args.parity_disable_particle_collision
-    ):
-        raise ValueError(
-            "Strict PhysTwin mode with self_collision=true forbids --parity-disable-particle-collision."
+            f"--ground-restitution-scale must be >= 0, got {args.ground_restitution_scale}."
         )
 
     spring_edges = np.asarray(ir["spring_edges"])
@@ -513,7 +446,7 @@ def _validate_phystwin_semantics(
         checks["spring_rest_length_min"] = float(np.min(spring_rest))
         checks["spring_rest_length_max"] = float(np.max(spring_rest))
     elif strict:
-        raise ValueError("Strict PhysTwin mode requires spring_rest_length in IR.")
+        raise ValueError("Strict physics checks require spring_rest_length in IR.")
     else:
         warnings.warn(
             "IR missing spring_rest_length; spring semantic checks are limited.",
@@ -525,15 +458,7 @@ def _validate_phystwin_semantics(
         spring_ke_mode = _as_string(ir["spring_ke_mode"])
     checks["spring_ke_mode"] = spring_ke_mode
 
-    if spring_ke_mode == "y_over_rest":
-        if "spring_y" not in ir:
-            raise ValueError(
-                "IR says spring_ke_mode=y_over_rest but spring_y is missing."
-            )
-        if spring_rest is None:
-            raise ValueError(
-                "IR says spring_ke_mode=y_over_rest but spring_rest_length is missing."
-            )
+    if "spring_y" in ir and spring_rest is not None:
         spring_y = np.asarray(ir["spring_y"], dtype=np.float64).reshape(-1)
         if spring_y.shape[0] != spring_count:
             raise ValueError(
@@ -546,12 +471,15 @@ def _validate_phystwin_semantics(
         checks["spring_ke_rel_error_mean"] = float(np.mean(rel_err))
         if strict and float(np.max(rel_err)) > 1e-4:
             raise ValueError(
-                "spring_ke does not match spring_y/rest_length under strict PhysTwin mode "
+                "spring_ke does not match spring_y/rest_length under strict checks "
                 f"(max_rel_error={float(np.max(rel_err)):.6e})."
             )
     elif strict:
+        raise ValueError("Strict physics checks require spring_y and spring_rest_length in IR.")
+
+    if strict and spring_ke_mode != "y_over_rest":
         raise ValueError(
-            "Strict PhysTwin mode requires IR spring_ke_mode=y_over_rest. "
+            "Strict physics checks require IR spring_ke_mode=y_over_rest. "
             f"Got {spring_ke_mode!r}. Re-export IR with strict defaults."
         )
 
@@ -567,7 +495,7 @@ def _validate_phystwin_semantics(
         checks["controller_mass_abs_max"] = controller_mass_abs_max
         if strict and controller_mass_abs_max > 1e-8:
             raise ValueError(
-                "Controller particles must be kinematic (mass=0) in strict PhysTwin mode. "
+                "Controller particles must be kinematic (mass=0) under strict checks. "
                 f"Observed max |mass|={controller_mass_abs_max:.6e}."
             )
 
@@ -603,7 +531,6 @@ def _legacy_collision_radius_from_ir(
         collision_dist = _as_scalar(ir["contact_collision_dist"])
 
     if radius is not None and collision_dist is not None:
-        # Legacy v1 often stored topology radius in `radius`; detect and correct it.
         ratio = float(np.max(radius) / max(float(collision_dist), 1e-12))
         if ratio > 2.5:
             warnings.warn(
@@ -658,7 +585,7 @@ def _initial_collision_radius(
     if ir_version >= 2:
         if "radius" in ir:
             warnings.warn(
-                "IR v2 missing `collision_radius`; falling back to `radius` for compatibility.",
+                "IR v2 missing `collision_radius`; falling back to `radius`.",
                 RuntimeWarning,
             )
             return ir["radius"].astype(np.float32).copy(), ir_version, "v2_radius_fallback"
@@ -681,26 +608,28 @@ def _build_particle_data(
     )
     flags = np.full((x0.shape[0],), int(newton.ParticleFlags.ACTIVE), dtype=np.int32)
 
-    if not particle_contacts_enabled:
-        radius.fill(float(args.parity_collision_radius))
-    elif args.mode == "parity" and "self_collision" in ir and _as_bool(ir["self_collision"]):
-        # PhysTwin self-collision triggers when pair distance < collision_dist.
-        # Newton particle contact triggers around (radius_i + radius_j), so use half-distance radius.
-        collision_dist = _as_scalar(
-            ir.get("contact_collision_dist", np.asarray(0.02, dtype=np.float32))
-        )
-        object_contact_radius = float(max(collision_dist, 1e-8) * 0.5)
-        radius.fill(object_contact_radius)
+    # PhysTwin uses `contact_collision_dist` as a pairwise distance threshold (d < dist).
+    # Newton particle-particle contact triggers around (radius_i + radius_j), so we map
+    # to radius = dist/2. This radius also affects particle-shape contacts, so it must
+    # be set consistently even when particle-particle contacts are disabled.
+    if "contact_collision_dist" in ir:
+        collision_dist = float(_as_scalar(ir["contact_collision_dist"]))
+        object_radius = float(max(collision_dist * 0.5, 1e-8))
+        radius.fill(object_radius)
+        radius_source = "contact_collision_dist_half"
         if "controller_idx" in ir:
             controller_idx = ir["controller_idx"].astype(np.int64, copy=False)
             if controller_idx.size > 0:
-                radius[controller_idx] = float(args.parity_collision_radius)
+                # Controllers are typically inactive for contact kernels; keep them tiny.
+                radius[controller_idx] = float(args.particle_contact_radius)
 
-    if args.mode == "parity":
-        if args.parity_controller_inactive and "controller_idx" in ir:
-            controller_idx = ir["controller_idx"].astype(np.int64, copy=False)
-            if controller_idx.size > 0:
-                flags[controller_idx] = 0
+    if args.object_contact_radius is not None:
+        override = float(args.object_contact_radius)
+        if override <= 0.0:
+            raise ValueError(f"--object-contact-radius must be > 0, got {override}.")
+        num_object_points = int(np.asarray(ir["num_object_points"]).reshape(-1)[0])
+        radius[:num_object_points].fill(override)
+        radius_source = "object_contact_radius_override"
 
     return x0, v0, mass, radius, flags, ir_version, radius_source
 
@@ -709,29 +638,15 @@ def _build_model(
     ir: dict[str, np.ndarray],
     args: argparse.Namespace,
     device: str,
-    solver_name: str,
 ):
-    semantic_checks = _validate_phystwin_semantics(
-        ir=ir,
-        args=args,
-        solver_name=solver_name,
-    )
-    shape_contacts_enabled = _resolve_shape_contacts_enabled(args)
+    semantic_checks = _validate_physics_semantics(ir=ir, args=args)
+    shape_contacts_enabled = bool(args.shape_contacts)
     particle_contacts_enabled = _resolve_particle_contacts_enabled(args, ir)
+
+    # With the current importer, particle radii always follow IR contact semantics (when available),
+    # regardless of whether particle-particle contacts are enabled. Disabling particle contacts only
+    # disables the particle-particle kernel, so shape-contacts remain consistent.
     contact_semantics = "exact"
-    if shape_contacts_enabled and not particle_contacts_enabled:
-        contact_semantics = "approx_coupled_radius"
-        if not args.allow_coupled_contact_radius:
-            raise ValueError(
-                "Unsupported contact combination: --shape-contacts with --no-particle-contacts "
-                "shares particle radius semantics in Newton. Re-run with "
-                "--allow-coupled-contact-radius to accept this approximation."
-            )
-        warnings.warn(
-            "Using approximate contact semantics: shape contacts enabled while particle contacts are disabled. "
-            "Particle radius is coupled across contact paths.",
-            RuntimeWarning,
-        )
 
     axis = newton.Axis.from_any(args.up_axis)
     builder = newton.ModelBuilder(up_axis=axis, gravity=0.0)
@@ -747,33 +662,39 @@ def _build_model(
         flags=flags.astype(int).tolist(),
     )
 
-    spring_edges = ir["spring_edges"]
+    spring_edges = np.asarray(ir["spring_edges"])
     if spring_edges.ndim != 2 or spring_edges.shape[1] != 2:
-        raise ValueError(f"Expected `spring_edges` shape [spring_count, 2], got {spring_edges.shape}")
+        raise ValueError(f"Expected spring_edges shape [spring_count, 2], got {spring_edges.shape}")
     spring_count = int(spring_edges.shape[0])
 
-    spring_ke = np.asarray(ir["spring_ke"]).reshape(-1)
-    spring_kd = np.asarray(ir["spring_kd"]).reshape(-1)
+    spring_ke = np.asarray(ir["spring_ke"], dtype=np.float32).reshape(-1)
+    spring_kd = np.asarray(ir["spring_kd"], dtype=np.float32).reshape(-1)
     if spring_ke.shape[0] != spring_count:
-        raise ValueError(f"Expected `spring_ke` length {spring_count}, got {spring_ke.shape[0]}")
+        raise ValueError(f"Expected spring_ke length {spring_count}, got {spring_ke.shape[0]}")
     if spring_kd.shape[0] != spring_count:
-        raise ValueError(f"Expected `spring_kd` length {spring_count}, got {spring_kd.shape[0]}")
+        raise ValueError(f"Expected spring_kd length {spring_count}, got {spring_kd.shape[0]}")
+
     spring_rest_length = None
     if "spring_rest_length" in ir:
-        rest = ir["spring_rest_length"].astype(np.float32, copy=False).reshape(-1)
-        if rest.shape[0] == spring_count:
-            spring_rest_length = rest
-        else:
-            warnings.warn(
-                "Ignoring `spring_rest_length` because it does not match `spring_edges` "
-                f"count: rest={rest.shape[0]}, edges={spring_count}.",
-                RuntimeWarning,
+        rest = np.asarray(ir["spring_rest_length"], dtype=np.float32).reshape(-1)
+        if rest.shape[0] != spring_count:
+            raise ValueError(
+                "spring_rest_length count mismatch: "
+                f"rest={rest.shape[0]}, edges={spring_count}"
             )
-    if solver_name == "semi_implicit":
+        spring_rest_length = rest
+
+    spring_ke = spring_ke * float(args.spring_ke_scale)
+    spring_kd = spring_kd * float(args.spring_kd_scale)
+    semantic_checks["spring_ke_scale"] = float(args.spring_ke_scale)
+    semantic_checks["spring_kd_scale"] = float(args.spring_kd_scale)
+
+    if args.solver == "semi_implicit":
         spring_ke = spring_ke * float(args.semi_spring_ke_scale)
         spring_kd = spring_kd * float(args.semi_spring_kd_scale)
         semantic_checks["semi_spring_ke_scale"] = float(args.semi_spring_ke_scale)
         semantic_checks["semi_spring_kd_scale"] = float(args.semi_spring_kd_scale)
+
     for spring_idx in range(spring_count):
         i = int(spring_edges[spring_idx, 0])
         j = int(spring_edges[spring_idx, 1])
@@ -787,18 +708,81 @@ def _build_model(
         if spring_rest_length is not None:
             builder.spring_rest_length[-1] = float(spring_rest_length[spring_idx])
 
+    if bool(args.add_ground_plane):
+        ground_cfg = builder.default_shape_cfg.copy()
+        if "contact_collide_fric" in ir:
+            mu_value = _as_scalar(ir["contact_collide_fric"]) * float(args.ground_mu_scale)
+            ground_cfg.mu = float(np.clip(mu_value, 0.0, 2.0))
+        if "contact_collide_elas" in ir:
+            restitution_value = _as_scalar(ir["contact_collide_elas"]) * float(args.ground_restitution_scale)
+            ground_cfg.restitution = float(np.clip(restitution_value, 0.0, 1.0))
+        reverse_z = bool(_as_bool(ir["reverse_z"])) if "reverse_z" in ir else False
+        # Ground plane at 0 in Newton coordinates. Note particle-shape contacts are sphere-based:
+        # particle centers will rest at approximately -radius (or +radius depending on axis).
+        if args.up_axis != "Z":
+            builder.add_ground_plane(cfg=ground_cfg)
+            semantic_checks["ground_plane_reverse_z"] = False
+        elif reverse_z:
+            # Work around wp.quat_between_vectors ambiguity for opposite vectors (Z -> -Z) by
+            # explicitly supplying a transform whose local +Z points along world -Z.
+            xform = wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat(1.0, 0.0, 0.0, 0.0))
+            builder.add_shape_plane(
+                body=-1,
+                xform=xform,
+                width=0.0,
+                length=0.0,
+                cfg=ground_cfg,
+                label="ground_plane_reverse_z",
+            )
+            semantic_checks["ground_plane_reverse_z"] = True
+        else:
+            builder.add_ground_plane(cfg=ground_cfg)
+            semantic_checks["ground_plane_reverse_z"] = False
+        semantic_checks["ground_plane_added"] = True
+        semantic_checks["ground_mu"] = float(ground_cfg.mu)
+        semantic_checks["ground_restitution"] = float(ground_cfg.restitution)
+    else:
+        semantic_checks["ground_plane_added"] = False
+
     model = builder.finalize(device=device)
-    if solver_name == "semi_implicit" and args.semi_disable_particle_contact_kernel:
+
+    semantic_checks["particle_contacts_enabled"] = bool(particle_contacts_enabled)
+
+    # Disable particle-particle contact kernel while keeping particle radii for particle-shape contacts.
+    if not particle_contacts_enabled:
+        if args.solver == "xpbd":
+            model.particle_max_radius = 0.0
+            # Also disable hash-grid rebuilds in SolverXPBD (it rebuilds whenever particle_grid is not None).
+            model.particle_grid = None
+            semantic_checks["xpbd_particle_contacts_disabled"] = True
+        else:
+            model.particle_grid = None
+            semantic_checks["semi_particle_contacts_disabled"] = True
+    else:
+        semantic_checks["xpbd_particle_contacts_disabled"] = False
+        semantic_checks["semi_particle_contacts_disabled"] = False
+
+    # Optional extra guard: allow manually disabling semi-implicit particle contact kernel even if enabled.
+    if args.solver == "semi_implicit" and bool(args.semi_disable_particle_contact_kernel):
         model.particle_grid = None
         semantic_checks["semi_particle_contact_kernel_disabled"] = True
     else:
         semantic_checks["semi_particle_contact_kernel_disabled"] = False
+
     gravity_scalar, gravity_vector = _resolve_gravity(args=args, ir=ir)
     model.set_gravity(gravity_vector)
-    if "contact_collide_fric" in ir:
+
+    if args.particle_mu_override is not None:
+        particle_mu = float(np.clip(float(args.particle_mu_override), 0.0, 2.0))
+        model.particle_mu = particle_mu
+        semantic_checks["particle_mu"] = particle_mu
+        semantic_checks["particle_mu_source"] = "override"
+    elif "contact_collide_fric" in ir:
         particle_mu = float(np.clip(_as_scalar(ir["contact_collide_fric"]), 0.0, 2.0))
         model.particle_mu = particle_mu
         semantic_checks["particle_mu"] = particle_mu
+        semantic_checks["particle_mu_source"] = "ir"
+
     return (
         model,
         gravity_scalar,
@@ -816,11 +800,9 @@ def _build_model(
 
 def _make_solver(
     model: newton.Model,
-    solver_name: str,
-    iterations: int,
     args: argparse.Namespace,
 ):
-    if solver_name == "semi_implicit":
+    if args.solver == "semi_implicit":
         return newton.solvers.SolverSemiImplicit(
             model,
             angular_damping=float(args.semi_angular_damping),
@@ -829,7 +811,7 @@ def _make_solver(
         )
     return newton.solvers.SolverXPBD(
         model,
-        iterations=iterations,
+        iterations=int(args.solver_iterations),
         soft_body_relaxation=float(args.xpbd_soft_body_relaxation),
         soft_contact_relaxation=float(args.xpbd_soft_contact_relaxation),
         rigid_contact_relaxation=float(args.xpbd_rigid_contact_relaxation),
@@ -874,7 +856,6 @@ def main() -> int:
     ir = _load_ir(ir_path)
     resolved_device = _resolve_device(args.device)
     wp.init()
-    solver_name = _resolve_solver_name(args)
 
     (
         model,
@@ -892,37 +873,41 @@ def main() -> int:
         ir=ir,
         args=args,
         device=resolved_device,
-        solver_name=solver_name,
     )
-    solver = _make_solver(model, solver_name, args.solver_iterations, args)
+    solver = _make_solver(model, args=args)
 
     state_in = model.state()
     state_out = model.state()
     control = model.control()
-    contacts = model.contacts() if shape_contacts_enabled else None
+    shape_contacts_enabled = bool(shape_contacts_enabled)
+    particle_contacts_enabled = bool(particle_contacts_enabled)
+    contacts_enabled = bool(shape_contacts_enabled or particle_contacts_enabled)
+    # Keep a Contacts buffer allocated even when contacts are disabled. XPBD shape contact
+    # kernels expect a non-null Contacts object whenever the model has shapes.
+    contacts = model.contacts()
 
     controller_idx = ir["controller_idx"].astype(np.int64)
     controller_traj = ir["controller_traj"].astype(np.float32)
     num_object_points = int(ir["num_object_points"])
     if controller_idx.ndim != 1:
-        raise ValueError(f"Expected `controller_idx` 1D array, got {controller_idx.shape}")
+        raise ValueError(f"Expected controller_idx 1D array, got {controller_idx.shape}")
     if controller_traj.ndim != 3 or controller_traj.shape[-1] != 3:
-        raise ValueError(f"Expected `controller_traj` shape [frames, ctrl_count, 3], got {controller_traj.shape}")
+        raise ValueError(f"Expected controller_traj shape [frames, ctrl_count, 3], got {controller_traj.shape}")
     if controller_traj.shape[1] != controller_idx.size:
         raise ValueError(
-            "Controller count mismatch between `controller_traj` and `controller_idx`: "
+            "Controller count mismatch between controller_traj and controller_idx: "
             f"traj_ctrl={controller_traj.shape[1]}, idx_ctrl={controller_idx.size}."
         )
     if controller_idx.size > 0:
         particle_count = int(np.asarray(ir["x0"]).shape[0])
         if controller_idx.min() < 0 or controller_idx.max() >= particle_count:
             raise ValueError(
-                f"`controller_idx` out of bounds for particle_count={particle_count}: "
+                f"controller_idx out of bounds for particle_count={particle_count}: "
                 f"min={int(controller_idx.min())}, max={int(controller_idx.max())}."
             )
 
     ir_frames = controller_traj.shape[0]
-    frames_to_run = max(1, min(args.num_frames, ir_frames))
+    frames_to_run = max(1, min(int(args.num_frames), ir_frames))
 
     sim_dt = float(args.sim_dt) if args.sim_dt is not None else _as_scalar(ir["sim_dt"])
     substeps_per_frame = (
@@ -947,8 +932,7 @@ def main() -> int:
         )
         controller_target_wp = wp.empty((controller_idx.size,), dtype=wp.vec3, device=model.device)
         controller_vel_wp = wp.empty((controller_idx.size,), dtype=wp.vec3, device=model.device)
-        # Keep controller velocities at zero: parity assumes controllers are position-projected kinematics,
-        # and feeding finite-difference velocities into spring damping changes the effective PhysTwin behavior.
+        # PhysTwin keeps controller velocities at zero (control points are driven by position only).
         controller_vel_zero = np.zeros((controller_idx.size, 3), dtype=np.float32)
 
     if args.frame_sync == "phystwin":
@@ -960,33 +944,18 @@ def main() -> int:
         frame_indices = range(frames_to_run)
 
     wall_start = time.perf_counter()
-    parity_apply_drag = bool(args.mode == "parity" and args.parity_apply_drag)
-    parity_apply_ground_collision = bool(
-        args.mode == "parity" and args.parity_apply_ground_collision
-    )
-    parity_post_correction_enabled = bool(parity_apply_drag or parity_apply_ground_collision)
-    parity_drag_damping = _resolve_parity_drag_damping(ir)
-    parity_reverse_factor = _resolve_reverse_factor(ir)
-    parity_collide_elas, parity_collide_fric = _resolve_ground_contact_params(ir)
-    parity_collide_object_elas, parity_collide_object_fric = _resolve_object_contact_params(ir)
-    semantic_checks["parity_apply_drag"] = parity_apply_drag
-    semantic_checks["parity_apply_ground_collision"] = parity_apply_ground_collision
-    semantic_checks["parity_drag_damping"] = float(parity_drag_damping)
-    semantic_checks["parity_reverse_factor"] = float(parity_reverse_factor)
-    semantic_checks["parity_collide_elas"] = float(parity_collide_elas)
-    semantic_checks["parity_collide_fric"] = float(parity_collide_fric)
-    semantic_checks["parity_collide_object_elas"] = float(parity_collide_object_elas)
-    semantic_checks["parity_collide_object_fric"] = float(parity_collide_object_fric)
-
     for frame_idx in frame_indices:
         for substep_idx in range(substeps_per_frame):
+            # Newton solvers accumulate forces into state_in.{particle_f,body_f};
+            # these buffers must be cleared every substep to avoid force carry-over.
+            state_in.clear_forces()
             if controller_idx.size > 0:
                 target_ctrl = _controller_target_for_substep(
                     controller_traj=controller_traj,
                     frame_idx=frame_idx,
                     substep_idx=substep_idx,
                     substeps_per_frame=substeps_per_frame,
-                    interpolate_controls=(args.mode == "parity" and args.parity_interpolate_controls),
+                    interpolate_controls=bool(args.interpolate_controls),
                 )
                 target_ctrl_f32 = target_ctrl.astype(np.float32, copy=False)
                 assert controller_vel_zero is not None
@@ -1010,32 +979,29 @@ def main() -> int:
                     device=model.device,
                 )
 
-            if contacts is not None:
+            if contacts_enabled:
                 model.collide(state_in, contacts)
+            else:
+                contacts.clear()
 
-            assert solver is not None
             solver.step(state_in, state_out, control, contacts, sim_dt)
-
-            if parity_post_correction_enabled:
-                wp.launch(
-                    kernel=_apply_parity_post_correction,
-                    dim=num_object_points,
-                    inputs=[
-                        state_in.particle_q,
-                        state_out.particle_q,
-                        state_out.particle_qd,
-                        num_object_points,
-                        float(sim_dt),
-                        float(parity_drag_damping),
-                        int(parity_apply_drag),
-                        int(parity_apply_ground_collision),
-                        float(parity_reverse_factor),
-                        float(parity_collide_elas),
-                        float(parity_collide_fric),
-                    ],
-                    device=model.device,
-                )
             state_in, state_out = state_out, state_in
+
+            if bool(args.apply_drag) and "drag_damping" in ir:
+                drag_damping = float(_as_scalar(ir["drag_damping"])) * float(args.drag_damping_scale)
+                if drag_damping > 0.0:
+                    wp.launch(
+                        kernel=_apply_phystwin_drag,
+                        dim=num_object_points,
+                        inputs=[
+                            state_in.particle_q,
+                            state_in.particle_qd,
+                            num_object_points,
+                            sim_dt,
+                            drag_damping,
+                        ],
+                        device=model.device,
+                    )
 
         q_frame = state_in.particle_q.numpy().astype(np.float32)
         rollout_all.append(q_frame)
@@ -1084,10 +1050,11 @@ def main() -> int:
         "output_npz": str(npz_path),
         "device_requested": args.device,
         "device_used": resolved_device,
-        "mode": args.mode,
         "ir_version": int(ir_version),
-        "solver": solver_name,
+        "solver": args.solver,
         "solver_iterations": int(args.solver_iterations),
+        "spring_ke_scale": float(args.spring_ke_scale),
+        "spring_kd_scale": float(args.spring_kd_scale),
         "xpbd_soft_body_relaxation": float(args.xpbd_soft_body_relaxation),
         "xpbd_soft_contact_relaxation": float(args.xpbd_soft_contact_relaxation),
         "xpbd_rigid_contact_relaxation": float(args.xpbd_rigid_contact_relaxation),
@@ -1103,6 +1070,8 @@ def main() -> int:
         "substeps_per_frame": int(substeps_per_frame),
         "sim_dt": float(sim_dt),
         "gravity_scalar": float(gravity_scalar),
+        "gravity_mag": float(args.gravity_mag),
+        "gravity_from_reverse_z": bool(args.gravity_from_reverse_z),
         "gravity_vector": [float(v) for v in gravity_vector],
         "wall_time_sec": float(wall_elapsed),
         "particles_total": int(rollout_all_np.shape[1]),
@@ -1111,20 +1080,21 @@ def main() -> int:
         "particle_radius_max": float(np.max(radius_used)),
         "inactive_particle_count": int(np.sum(flags_used == 0)),
         "shape_contacts_enabled": bool(shape_contacts_enabled),
+        "add_ground_plane": bool(args.add_ground_plane),
         "particle_contacts_enabled": bool(particle_contacts_enabled),
         "allow_coupled_contact_radius": bool(args.allow_coupled_contact_radius),
+        "object_contact_radius": float(args.object_contact_radius)
+        if args.object_contact_radius is not None
+        else None,
         "contact_semantics": contact_semantics,
         "collision_radius_source": radius_source,
+        "controller_inactive": bool(args.controller_inactive),
+        "interpolate_controls": bool(args.interpolate_controls),
         "frame_sync": args.frame_sync,
-        "strict_phystwin": bool(args.strict_phystwin),
-        "parity_apply_drag": parity_apply_drag,
-        "parity_apply_ground_collision": parity_apply_ground_collision,
-        "parity_drag_damping": float(parity_drag_damping),
-        "parity_reverse_factor": float(parity_reverse_factor),
-        "parity_collide_elas": float(parity_collide_elas),
-        "parity_collide_fric": float(parity_collide_fric),
-        "parity_collide_object_elas": float(parity_collide_object_elas),
-        "parity_collide_object_fric": float(parity_collide_object_fric),
+        "strict_physics_checks": bool(args.strict_physics_checks),
+        "particle_mu_override": args.particle_mu_override,
+        "ground_mu_scale": float(args.ground_mu_scale),
+        "ground_restitution_scale": float(args.ground_restitution_scale),
         "semantic_checks": semantic_checks,
         "inference_used": str(inference_path) if inference is not None else None,
         "compared_frames": int(compared_frames),

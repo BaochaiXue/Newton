@@ -31,22 +31,26 @@ def _default_threshold_config() -> Path | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run parity-mode rollout and validate consistency against PhysTwin inference."
+        description=(
+            "Run a native Newton rollout (XPBD or semi_implicit) and validate "
+            "against PhysTwin inference/GT curves."
+        )
     )
     parser.add_argument("--ir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--output-prefix", default="parity_validate")
+    parser.add_argument("--output-prefix", default="rollout_eval")
 
     parser.add_argument("--importer", type=Path, default=_default_importer())
     parser.add_argument("--python", default=default_python())
 
-    parser.add_argument("--mode", choices=["standard", "parity"], default="parity")
     parser.add_argument(
         "--solver",
         choices=["xpbd", "semi_implicit"],
-        default="semi_implicit",
+        default="xpbd",
     )
     parser.add_argument("--solver-iterations", type=int, default=10)
+    parser.add_argument("--spring-ke-scale", type=float, default=1.0)
+    parser.add_argument("--spring-kd-scale", type=float, default=1.0)
     parser.add_argument("--xpbd-soft-body-relaxation", type=float, default=0.9)
     parser.add_argument("--xpbd-soft-contact-relaxation", type=float, default=0.9)
     parser.add_argument("--xpbd-rigid-contact-relaxation", type=float, default=0.8)
@@ -74,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--substeps-per-frame", type=int, default=None)
     parser.add_argument("--sim-dt", type=float, default=None)
     parser.add_argument("--gravity", type=float, default=None)
+    parser.add_argument("--gravity-mag", type=float, default=9.8)
+    parser.add_argument(
+        "--gravity-from-reverse-z",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--up-axis", choices=["X", "Y", "Z"], default="Z")
     parser.add_argument(
         "--frame-sync",
@@ -91,15 +101,61 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
+        "--add-ground-plane",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--particle-contacts",
         action=argparse.BooleanOptionalAction,
         default=None,
+    )
+    parser.add_argument(
+        "--particle-contact-radius",
+        type=float,
+        default=1e-5,
+    )
+    parser.add_argument(
+        "--object-contact-radius",
+        type=float,
+        default=None,
+        help="Pass-through to importer: override object particle contact radius.",
     )
     parser.add_argument(
         "--allow-coupled-contact-radius",
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--controller-inactive",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--interpolate-controls",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--strict-physics-checks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--apply-drag",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable PhysTwin-style drag in the importer (semi_implicit only).",
+    )
+    parser.add_argument(
+        "--drag-damping-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to IR drag_damping when --apply-drag is enabled.",
+    )
+    parser.add_argument("--particle-mu-override", type=float, default=None)
+    parser.add_argument("--ground-mu-scale", type=float, default=1.0)
+    parser.add_argument("--ground-restitution-scale", type=float, default=1.0)
     parser.add_argument("--inference", type=Path, default=None)
     parser.add_argument(
         "--gt-final-data",
@@ -118,44 +174,6 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use object_motions_valid and object_visibilities mask from final_data when available.",
-    )
-
-    parser.add_argument("--parity-collision-radius", type=float, default=1e-5)
-    parser.add_argument(
-        "--parity-disable-particle-collision",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--parity-controller-inactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--parity-interpolate-controls",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--parity-apply-drag",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--parity-apply-ground-collision",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--parity-gravity-from-reverse-z",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--parity-gravity-mag", type=float, default=9.8)
-    parser.add_argument(
-        "--strict-phystwin",
-        action=argparse.BooleanOptionalAction,
-        default=True,
     )
 
     parser.add_argument("--threshold-config", type=Path, default=_default_threshold_config())
@@ -203,8 +221,6 @@ def _resolve_final_data_path(
 def _load_inference(path: Path | None) -> np.ndarray | None:
     if path is None or not path.exists():
         return None
-    import pickle
-
     with path.open("rb") as handle:
         return np.asarray(pickle.load(handle), dtype=np.float32)
 
@@ -399,7 +415,6 @@ def _build_importer_cmd(
     args: argparse.Namespace,
     ir_path: Path,
     out_dir: Path,
-    ir: dict[str, np.ndarray],
 ) -> list[str]:
     cmd = [
         args.python,
@@ -410,12 +425,14 @@ def _build_importer_cmd(
         str(out_dir),
         "--output-prefix",
         args.output_prefix,
-        "--mode",
-        args.mode,
         "--solver",
         args.solver,
         "--solver-iterations",
         str(args.solver_iterations),
+        "--spring-ke-scale",
+        str(args.spring_ke_scale),
+        "--spring-kd-scale",
+        str(args.spring_kd_scale),
         "--xpbd-soft-body-relaxation",
         str(args.xpbd_soft_body_relaxation),
         "--xpbd-soft-contact-relaxation",
@@ -440,51 +457,43 @@ def _build_importer_cmd(
         args.up_axis,
         "--frame-sync",
         args.frame_sync,
-        "--parity-collision-radius",
-        str(args.parity_collision_radius),
-        "--parity-gravity-mag",
-        str(args.parity_gravity_mag),
+        "--particle-contact-radius",
+        str(args.particle_contact_radius),
+        "--gravity-mag",
+        str(args.gravity_mag),
+        "--ground-mu-scale",
+        str(args.ground_mu_scale),
+        "--ground-restitution-scale",
+        str(args.ground_restitution_scale),
+        "--drag-damping-scale",
+        str(args.drag_damping_scale),
     ]
+    if args.object_contact_radius is not None:
+        cmd.extend(["--object-contact-radius", str(args.object_contact_radius)])
     if args.substeps_per_frame is not None:
         cmd.extend(["--substeps-per-frame", str(args.substeps_per_frame)])
     if args.sim_dt is not None:
         cmd.extend(["--sim-dt", str(args.sim_dt)])
     if args.gravity is not None:
         cmd.extend(["--gravity", str(args.gravity)])
-    if args.shape_contacts:
-        cmd.append("--shape-contacts")
-    if args.particle_contacts is not None:
-        _append_bool_flag(cmd, "particle-contacts", bool(args.particle_contacts))
+    if args.inference is not None:
+        cmd.extend(["--inference", str(args.inference)])
+    if args.particle_mu_override is not None:
+        cmd.extend(["--particle-mu-override", str(args.particle_mu_override)])
+
+    _append_bool_flag(cmd, "shape-contacts", args.shape_contacts)
+    _append_bool_flag(cmd, "add-ground-plane", args.add_ground_plane)
+    _append_bool_flag(cmd, "particle-contacts", args.particle_contacts)
     _append_bool_flag(
         cmd,
         "allow-coupled-contact-radius",
         bool(args.allow_coupled_contact_radius),
     )
-    if args.inference is not None:
-        cmd.extend(["--inference", str(args.inference)])
-
-    parity_disable_particle_collision = args.parity_disable_particle_collision
-    if parity_disable_particle_collision is None:
-        if "self_collision" in ir and bool(np.asarray(ir["self_collision"]).reshape(-1)[0]):
-            parity_disable_particle_collision = False
-        else:
-            parity_disable_particle_collision = True
-
-    _append_bool_flag(
-        cmd,
-        "parity-disable-particle-collision",
-        parity_disable_particle_collision,
-    )
-    _append_bool_flag(cmd, "parity-controller-inactive", args.parity_controller_inactive)
-    _append_bool_flag(cmd, "parity-interpolate-controls", args.parity_interpolate_controls)
-    _append_bool_flag(cmd, "parity-apply-drag", args.parity_apply_drag)
-    _append_bool_flag(
-        cmd,
-        "parity-apply-ground-collision",
-        args.parity_apply_ground_collision,
-    )
-    _append_bool_flag(cmd, "parity-gravity-from-reverse-z", args.parity_gravity_from_reverse_z)
-    _append_bool_flag(cmd, "strict-phystwin", args.strict_phystwin)
+    _append_bool_flag(cmd, "controller-inactive", args.controller_inactive)
+    _append_bool_flag(cmd, "interpolate-controls", args.interpolate_controls)
+    _append_bool_flag(cmd, "strict-physics-checks", args.strict_physics_checks)
+    _append_bool_flag(cmd, "apply-drag", args.apply_drag)
+    _append_bool_flag(cmd, "gravity-from-reverse-z", args.gravity_from_reverse_z)
     _append_bool_flag(
         cmd,
         "semi-disable-particle-contact-kernel",
@@ -551,13 +560,13 @@ def main() -> int:
         case_name=case_name,
     )
 
-    importer_cmd = _build_importer_cmd(args=args, ir_path=ir_path, out_dir=out_dir, ir=ir)
+    importer_cmd = _build_importer_cmd(args=args, ir_path=ir_path, out_dir=out_dir)
     if not args.skip_run:
         subprocess.run(importer_cmd, check=True)
 
     rollout_json_path = out_dir / f"{args.output_prefix}.json"
     rollout_npz_path = out_dir / f"{args.output_prefix}.npz"
-    report_json_path = out_dir / f"{args.output_prefix}_parity_report.json"
+    report_json_path = out_dir / f"{args.output_prefix}_rollout_report.json"
     rmse_curve_csv_path = out_dir / f"{args.output_prefix}_rmse_curve.csv"
     gt_curve_csv_path = out_dir / f"{args.output_prefix}_gt_chamfer_curve.csv"
 
@@ -659,6 +668,7 @@ def main() -> int:
 
     passed = all(item["pass"] for item in checks.values())
     report = {
+        "report_type": "native_rollout",
         "passed": passed,
         "ir_path": str(ir_path),
         "case_name": case_name,

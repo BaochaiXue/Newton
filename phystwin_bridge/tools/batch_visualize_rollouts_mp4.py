@@ -18,10 +18,14 @@ def _load_json(path: Path) -> dict:
     return loaded
 
 
-def _select_best_parity_report(case_out_dir: Path) -> Path:
-    candidates = sorted(case_out_dir.glob("*_parity_report.json"))
+def _select_best_report(case_out_dir: Path) -> Path:
+    candidates = sorted(case_out_dir.glob("*_rollout_report.json"))
     if not candidates:
-        raise FileNotFoundError(f"No *_parity_report.json found under {case_out_dir}")
+        candidates = sorted(case_out_dir.glob("*_parity_report.json"))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No *_rollout_report.json or *_parity_report.json found under {case_out_dir}"
+        )
 
     best_path = None
     best_score = None
@@ -45,7 +49,7 @@ def _select_best_parity_report(case_out_dir: Path) -> Path:
             best_path = path
 
     if best_path is None:
-        raise RuntimeError(f"Failed to parse any parity report under {case_out_dir}")
+        raise RuntimeError(f"Failed to parse any rollout report under {case_out_dir}")
     return best_path
 
 
@@ -53,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Batch-render PhysTwin-style MP4 videos for Newton rollouts by selecting the "
-            "best/latest parity report per case."
+            "best/latest rollout report per case."
         )
     )
     parser.add_argument(
@@ -114,7 +118,7 @@ def main() -> int:
         if not case_dir.exists():
             raise FileNotFoundError(f"Missing case directory for {case_name}: {case_dir}")
 
-        report_path = _select_best_parity_report(case_out_dir)
+        report_path = _select_best_report(case_out_dir)
         report = _load_json(report_path)
         rollout_npz = report.get("rollout_npz")
         if not isinstance(rollout_npz, str) or not rollout_npz:
