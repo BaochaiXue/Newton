@@ -66,6 +66,16 @@ def to_scalar(value, default: float) -> float:
     return float(value)
 
 
+def to_array(value, dtype: np.dtype | type | None = None) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        array = value.detach().cpu().numpy()
+    else:
+        array = np.asarray(value)
+    if dtype is not None:
+        array = array.astype(dtype, copy=False)
+    return array
+
+
 def build_structure_points(final_data: dict) -> tuple[np.ndarray, np.ndarray]:
     object_points = np.asarray(final_data["object_points"], dtype=np.float32)
     surface_points = np.asarray(final_data["surface_points"], dtype=np.float32)
@@ -339,15 +349,50 @@ def main() -> int:
     structure_points, controller_traj = build_structure_points(final_data)
     controller_points_0 = controller_traj[0] if controller_traj.shape[1] > 0 else None
 
-    points_all, edges, rest_lengths, num_object_springs, used_topology_method = build_springs(
-        structure_points=structure_points,
-        controller_points_0=controller_points_0,
-        object_radius=topology_object_radius,
-        object_max_neighbours=object_max_neighbours,
-        controller_radius=topology_controller_radius,
-        controller_max_neighbours=controller_max_neighbours,
-        topology_method=args.topology_method,
-    )
+    # Resolve topology: prefer checkpoint (exact), fall back to reconstruction.
+    checkpoint_mass: np.ndarray | None = None
+    if "spring_edges" in checkpoint and "spring_rest_lengths" in checkpoint:
+        # New-style checkpoint: topology stored directly from training.
+        edges = to_array(checkpoint["spring_edges"], np.int32)
+        rest_lengths = to_array(checkpoint["spring_rest_lengths"], np.float32).reshape(-1)
+        if edges.ndim != 2 or edges.shape[1] != 2:
+            raise ValueError(f"Expected checkpoint spring_edges shape [N, 2], got {edges.shape}")
+        if rest_lengths.shape[0] != edges.shape[0]:
+            raise ValueError(
+                "Checkpoint spring_rest_lengths length mismatch: "
+                f"rest={rest_lengths.shape[0]}, edges={edges.shape[0]}"
+            )
+        num_object_springs = int(checkpoint.get("num_object_springs", edges.shape[0]))
+        if "init_vertices" in checkpoint:
+            points_all = to_array(checkpoint["init_vertices"], np.float32)
+            if points_all.ndim != 2 or points_all.shape[1] != 3:
+                raise ValueError(
+                    f"Expected checkpoint init_vertices shape [N, 3], got {points_all.shape}"
+                )
+        else:
+            points_all = np.concatenate(
+                [structure_points, controller_points_0], axis=0
+            ).astype(np.float32) if controller_points_0 is not None else structure_points.astype(np.float32)
+        if "init_masses" in checkpoint:
+            checkpoint_mass = to_array(checkpoint["init_masses"], np.float32).reshape(-1)
+        used_topology_method = "checkpoint"
+    else:
+        # Legacy checkpoint: reconstruct topology from points
+        import warnings
+        warnings.warn(
+            "Checkpoint missing spring topology; reconstructing from points. "
+            "Re-train with updated PhysTwin to store topology directly.",
+            RuntimeWarning,
+        )
+        points_all, edges, rest_lengths, num_object_springs, used_topology_method = build_springs(
+            structure_points=structure_points,
+            controller_points_0=controller_points_0,
+            object_radius=topology_object_radius,
+            object_max_neighbours=object_max_neighbours,
+            controller_radius=topology_controller_radius,
+            controller_max_neighbours=controller_max_neighbours,
+            topology_method=args.topology_method,
+        )
 
     spring_y = checkpoint["spring_Y"]
     if isinstance(spring_y, torch.Tensor):
@@ -393,13 +438,27 @@ def main() -> int:
     num_object_points = structure_points.shape[0]
     num_particles = points_all.shape[0]
     num_control_points = num_particles - num_object_points
+    if num_control_points != controller_traj.shape[1]:
+        raise ValueError(
+            "Controller count mismatch: "
+            f"from vertices={num_control_points}, from final_data={controller_traj.shape[1]}"
+        )
 
     is_controller = np.zeros((num_particles,), dtype=np.bool_)
     if num_control_points > 0:
         is_controller[num_object_points:] = True
     controller_idx = np.arange(num_object_points, num_particles, dtype=np.int32)
 
-    mass = np.ones((num_particles,), dtype=np.float32)
+    if checkpoint_mass is not None:
+        if checkpoint_mass.shape[0] != num_particles:
+            raise ValueError(
+                "Checkpoint init_masses length mismatch: "
+                f"mass={checkpoint_mass.shape[0]}, particles={num_particles}"
+            )
+        mass = checkpoint_mass.astype(np.float32, copy=True)
+    else:
+        mass = np.ones((num_particles,), dtype=np.float32)
+    # Keep controllers kinematic in Newton even if PhysTwin stores all-ones masses.
     mass[is_controller] = 0.0
 
     topology_radius = np.full((num_particles,), topology_object_radius, dtype=np.float32)
