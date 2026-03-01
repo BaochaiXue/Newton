@@ -1,10 +1,27 @@
 #!/usr/bin/env python3
+"""Import a PhysTwin IR into Newton and run a semi-implicit simulation.
+
+Architecture
+------------
+The pipeline has four phases, each handled by a dedicated function:
+
+1. **load_ir** → raw IR dict from disk
+2. **build_model** → Newton ``Model`` from IR (particles, springs, ground, …)
+3. **simulate** → rollout loop producing per-frame positions
+4. **save_results** → ``.npz`` + ``.json`` outputs
+
+Extensibility: ``build_model`` returns a standard ``newton.Model``.  To add
+new objects (rigid bodies, meshes, other particle systems), extend
+``build_model`` with additional ``builder.add_*`` calls before ``finalize()``.
+They will automatically interact through Newton's collision system.
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import time
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -13,646 +30,490 @@ import warp as wp
 import newton
 from path_defaults import default_device
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Constants – no magic numbers anywhere else in this file.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# IR
+IR_VERSION_KEY = "ir_version"
+IR_COLLISION_RADIUS_KEY = "collision_radius"
+
+# Numerical tolerances
+EPSILON = 1e-12                   # safe-division floor
+STRICT_KE_REL_TOL = 1e-4         # max relative error for ke consistency
+KINEMATIC_MASS_TOL = 1e-8         # controllers must have |mass| below this
+
+# Physics defaults
+DEFAULT_OBJECT_RADIUS = 0.02      # fallback collision radius for legacy IR
+LEGACY_RADIUS_RATIO_THRESH = 2.5  # above → interpret radius as topology
+
+# Contact clamping
+MU_MAX = 2.0
+RESTITUTION_MAX = 1.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SimConfig:
+    """All simulation parameters in one typed, inspectable object.
+
+    Created once from CLI args; threaded through every function that needs it.
+    No function reads ``argparse.Namespace`` directly.
+    """
+    # I/O
+    ir_path: Path = Path(".")
+    out_dir: Path = Path(".")
+    output_prefix: str = "newton_rollout"
+
+    # Spring tuning
+    spring_ke_scale: float = 1.0
+    spring_kd_scale: float = 1.0
+
+    # Solver
+    angular_damping: float = 0.05
+    friction_smoothing: float = 1.0
+    enable_tri_contact: bool = True
+    disable_particle_contact_kernel: bool = False
+
+    # Simulation
+    num_frames: int = 20
+    substeps_per_frame: int | None = None
+    sim_dt: float | None = None
+
+    # Gravity
+    gravity: float | None = None
+    gravity_mag: float = 9.8
+    gravity_from_reverse_z: bool = True
+    up_axis: str = "Z"
+
+    # Frame sync
+    frame_sync: str = "phystwin"
+
+    # Device
+    device: str = "cuda:0"
+
+    # Contacts
+    shape_contacts: bool = False
+    add_ground_plane: bool = True
+    particle_contacts: bool | None = None
+    particle_contact_radius: float = 1e-5
+    object_contact_radius: float | None = None
+
+    # Controls
+    interpolate_controls: bool = True
+
+    # Validation
+    strict_physics_checks: bool = True
+
+    # Drag
+    apply_drag: bool = False
+    drag_damping_scale: float = 1.0
+
+    # Friction / restitution
+    particle_mu_override: float | None = None
+    ground_mu_scale: float = 1.0
+    ground_restitution_scale: float = 1.0
+
+    # Baseline
+    inference_path: Path | None = None
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> SimConfig:
+        return cls(
+            ir_path=args.ir.resolve(),
+            out_dir=args.out_dir.resolve(),
+            output_prefix=args.output_prefix,
+            spring_ke_scale=args.spring_ke_scale,
+            spring_kd_scale=args.spring_kd_scale,
+            angular_damping=args.angular_damping,
+            friction_smoothing=args.friction_smoothing,
+            enable_tri_contact=args.enable_tri_contact,
+            disable_particle_contact_kernel=args.disable_particle_contact_kernel,
+            num_frames=args.num_frames,
+            substeps_per_frame=args.substeps_per_frame,
+            sim_dt=args.sim_dt,
+            gravity=args.gravity,
+            gravity_mag=args.gravity_mag,
+            gravity_from_reverse_z=args.gravity_from_reverse_z,
+            up_axis=args.up_axis,
+            frame_sync=args.frame_sync,
+            device=args.device,
+            shape_contacts=args.shape_contacts,
+            add_ground_plane=args.add_ground_plane,
+            particle_contacts=args.particle_contacts,
+            particle_contact_radius=args.particle_contact_radius,
+            object_contact_radius=args.object_contact_radius,
+            interpolate_controls=args.interpolate_controls,
+            strict_physics_checks=args.strict_physics_checks,
+            apply_drag=args.apply_drag,
+            drag_damping_scale=args.drag_damping_scale,
+            particle_mu_override=args.particle_mu_override,
+            ground_mu_scale=args.ground_mu_scale,
+            ground_restitution_scale=args.ground_restitution_scale,
+            inference_path=args.inference,
+        )
+
+
+@dataclass
+class ModelResult:
+    """Everything produced by ``build_model``."""
+    model: newton.Model
+    radius: np.ndarray
+    ir_version: int
+    checks: dict = field(default_factory=dict)
+
+
+@dataclass
+class SimResult:
+    """Everything produced by ``simulate``."""
+    particle_q_all: np.ndarray       # [frames+1, N, 3]
+    particle_q_object: np.ndarray    # [frames+1, n_obj, 3]
+    wall_time_sec: float
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Import a PhysTwin IR into Newton (SolverSemiImplicit)."
+    )
+
+    # I/O
+    p.add_argument("--ir", type=Path, required=True)
+    p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--output-prefix", default="newton_rollout")
+
+    # Spring tuning
+    p.add_argument("--spring-ke-scale", type=float, default=1.0)
+    p.add_argument("--spring-kd-scale", type=float, default=1.0)
+
+    # Solver
+    p.add_argument("--angular-damping", type=float, default=0.05)
+    p.add_argument("--friction-smoothing", type=float, default=1.0)
+    p.add_argument("--enable-tri-contact", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--disable-particle-contact-kernel", action=argparse.BooleanOptionalAction, default=False)
+
+    # Simulation
+    p.add_argument("--num-frames", type=int, default=20)
+    p.add_argument("--substeps-per-frame", type=int, default=None)
+    p.add_argument("--sim-dt", type=float, default=None)
+
+    # Gravity
+    p.add_argument("--gravity", type=float, default=None)
+    p.add_argument("--gravity-mag", type=float, default=9.8)
+    p.add_argument("--gravity-from-reverse-z", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--up-axis", choices=["X", "Y", "Z"], default="Z")
+
+    # Frame / device
+    p.add_argument("--frame-sync", choices=["legacy", "phystwin"], default="phystwin")
+    p.add_argument("--device", default=default_device())
+
+    # Contacts
+    p.add_argument("--shape-contacts", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--add-ground-plane", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--particle-contacts", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--particle-contact-radius", type=float, default=1e-5)
+    p.add_argument("--object-contact-radius", type=float, default=None)
+
+    # Controls / validation / drag
+    p.add_argument("--interpolate-controls", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--strict-physics-checks", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--drag-damping-scale", type=float, default=1.0)
+
+    # Friction / restitution
+    p.add_argument("--particle-mu-override", type=float, default=None)
+    p.add_argument("--ground-mu-scale", type=float, default=1.0)
+    p.add_argument("--ground-restitution-scale", type=float, default=1.0)
+
+    # Baseline
+    p.add_argument("--inference", type=Path, default=None)
+
+    return p.parse_args()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Warp kernels
+# ═══════════════════════════════════════════════════════════════════════════
 
 @wp.kernel
-def _set_indexed_particle_state(
+def _write_kinematic_state(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
-    particle_idx: wp.array(dtype=wp.int32),
+    indices: wp.array(dtype=wp.int32),
     target_q: wp.array(dtype=wp.vec3),
     target_qd: wp.array(dtype=wp.vec3),
 ):
+    """Scatter-write controller positions and velocities into state arrays."""
     tid = wp.tid()
-    idx = particle_idx[tid]
-    particle_q[idx] = target_q[tid]
-    particle_qd[idx] = target_qd[tid]
+    i = indices[tid]
+    particle_q[i] = target_q[tid]
+    particle_qd[i] = target_qd[tid]
 
 
 @wp.kernel
-def _apply_phystwin_drag(
+def _apply_drag_correction(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
-    num_object_points: int,
+    n_object: int,
     dt: float,
-    drag_damping: float,
+    damping: float,
 ):
-    """PhysTwin-style drag damping (v <- v*exp(-dt*k)) + matching position correction.
+    """PhysTwin drag: ``v ← v·exp(−dt·k)`` with position compensation.
 
-    PhysTwin applies exponential velocity damping each substep before integrating x using
-    the damped velocity. Newton's semi-implicit integrator integrates x using the undamped
-    v1; we compensate by adjusting x by v1*dt*(1-exp(-dt*k)).
+    Newton integrates position with the *undamped* velocity, so we subtract
+    the overshoot ``v·dt·(1−exp(−dt·k))`` from the position.
     """
     tid = wp.tid()
-    if tid >= num_object_points:
+    if tid >= n_object:
         return
+    v = particle_qd[tid]
+    scale = wp.exp(-dt * damping)
+    particle_q[tid] = particle_q[tid] - v * dt * (1.0 - scale)
+    particle_qd[tid] = v * scale
 
-    v1 = particle_qd[tid]
-    drag = wp.exp(-dt * drag_damping)
-    particle_q[tid] = particle_q[tid] - v1 * dt * (1.0 - drag)
-    particle_qd[tid] = v1 * drag
+# ═══════════════════════════════════════════════════════════════════════════
+# IR helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Instantiate a PhysTwin IR in Newton and run a native Newton rollout "
-            "(XPBD or semi_implicit)."
-        )
-    )
-    parser.add_argument("--ir", type=Path, required=True)
-    parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--output-prefix", default="newton_rollout")
-
-    parser.add_argument(
-        "--solver",
-        choices=["xpbd", "semi_implicit"],
-        default="xpbd",
-        help="Newton solver backend.",
-    )
-    parser.add_argument("--solver-iterations", type=int, default=10)
-    parser.add_argument(
-        "--spring-ke-scale",
-        type=float,
-        default=1.0,
-        help="Global scale factor applied to IR spring_ke for all solvers.",
-    )
-    parser.add_argument(
-        "--spring-kd-scale",
-        type=float,
-        default=1.0,
-        help="Global scale factor applied to IR spring_kd for all solvers.",
-    )
-    parser.add_argument(
-        "--xpbd-soft-body-relaxation",
-        type=float,
-        default=0.9,
-        help="XPBD soft-body relaxation.",
-    )
-    parser.add_argument(
-        "--xpbd-soft-contact-relaxation",
-        type=float,
-        default=0.9,
-        help="XPBD soft-contact relaxation.",
-    )
-    parser.add_argument(
-        "--xpbd-rigid-contact-relaxation",
-        type=float,
-        default=0.8,
-        help="XPBD rigid-contact relaxation.",
-    )
-    parser.add_argument(
-        "--xpbd-angular-damping",
-        type=float,
-        default=0.0,
-        help="XPBD rigid-body angular damping.",
-    )
-    parser.add_argument(
-        "--xpbd-enable-restitution",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable XPBD restitution.",
-    )
-
-    parser.add_argument(
-        "--semi-spring-ke-scale",
-        type=float,
-        default=1.0,
-        help="Scale factor applied to spring_ke when --solver semi_implicit.",
-    )
-    parser.add_argument(
-        "--semi-spring-kd-scale",
-        type=float,
-        default=1.0,
-        help="Scale factor applied to spring_kd when --solver semi_implicit.",
-    )
-    parser.add_argument(
-        "--semi-disable-particle-contact-kernel",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "When --solver semi_implicit, disable Newton particle contact kernel by setting "
-            "model.particle_grid=None."
-        ),
-    )
-    parser.add_argument(
-        "--semi-enable-tri-contact",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="When --solver semi_implicit, enable/disable triangle contact kernel.",
-    )
-    parser.add_argument(
-        "--semi-angular-damping",
-        type=float,
-        default=0.05,
-        help="Semi-implicit rigid-body angular damping.",
-    )
-    parser.add_argument(
-        "--semi-friction-smoothing",
-        type=float,
-        default=1.0,
-        help="Semi-implicit friction smoothing.",
-    )
-
-    parser.add_argument("--num-frames", type=int, default=20)
-    parser.add_argument(
-        "--substeps-per-frame",
-        type=int,
-        default=None,
-        help="Override IR substeps.",
-    )
-    parser.add_argument(
-        "--sim-dt",
-        type=float,
-        default=None,
-        help="Override IR sim_dt.",
-    )
-    parser.add_argument(
-        "--gravity",
-        type=float,
-        default=None,
-        help="Gravity scalar along --up-axis. If unset and --gravity-from-reverse-z is true, derive from IR reverse_z.",
-    )
-    parser.add_argument(
-        "--gravity-mag",
-        type=float,
-        default=9.8,
-        help="Gravity magnitude when deriving gravity from reverse_z.",
-    )
-    parser.add_argument(
-        "--gravity-from-reverse-z",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="When --gravity is unset, derive gravity sign from IR reverse_z.",
-    )
-    parser.add_argument("--up-axis", choices=["X", "Y", "Z"], default="Z")
-    parser.add_argument(
-        "--frame-sync",
-        choices=["legacy", "phystwin"],
-        default="phystwin",
-        help=(
-            "Rollout frame indexing convention. "
-            "'phystwin' keeps frame 0 as initial state and simulates 0->1, 1->2, ..."
-        ),
-    )
-    parser.add_argument(
-        "--device",
-        default=default_device(),
-        help="Warp device string. Defaults to NEWTON_DEVICE env var or cuda:0.",
-    )
-
-    parser.add_argument(
-        "--shape-contacts",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable shape contact generation via model.collide(...).",
-    )
-    parser.add_argument(
-        "--add-ground-plane",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Add a static Newton ground plane at z=0 using contact params from IR.",
-    )
-    parser.add_argument(
-        "--particle-contacts",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Enable particle-particle contacts. If unset, follows IR self_collision when available, "
-            "otherwise disabled."
-        ),
-    )
-    parser.add_argument(
-        "--particle-contact-radius",
-        type=float,
-        default=1e-5,
-        help=(
-            "Effective collision radius used when --no-particle-contacts. "
-            "Keeps solver kernels active while strongly suppressing internal collisions."
-        ),
-    )
-    parser.add_argument(
-        "--object-contact-radius",
-        type=float,
-        default=None,
-        help=(
-            "Override contact radius for object particles (0..num_object_points-1). "
-            "Useful when disabling particle-particle contacts but still needing stable particle-shape contacts "
-            "without a large sphere offset."
-        ),
-    )
-    parser.add_argument(
-        "--allow-coupled-contact-radius",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Allow shape-contacts with particle-contacts disabled. This is approximate because "
-            "particle radius affects both paths."
-        ),
-    )
-    parser.add_argument(
-        "--controller-inactive",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Deprecated: marking controllers inactive can break spring constraints in XPBD "
-            "(inactive particles are skipped by integration and delta application). "
-            "Prefer leaving controllers active with mass=0 and tiny radius."
-        ),
-    )
-    parser.add_argument(
-        "--interpolate-controls",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Linearly interpolate controller trajectories within each frame.",
-    )
-    parser.add_argument(
-        "--strict-physics-checks",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Require strict spring/parameter consistency checks when loading IR.",
-    )
-    parser.add_argument(
-        "--apply-drag",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Apply PhysTwin-style drag using IR drag_damping (applied after each Newton substep).",
-    )
-    parser.add_argument(
-        "--drag-damping-scale",
-        type=float,
-        default=1.0,
-        help="Optional scale applied to IR drag_damping when --apply-drag is enabled.",
-    )
-    parser.add_argument(
-        "--particle-mu-override",
-        type=float,
-        default=None,
-        help="Optional override for model.particle_mu.",
-    )
-    parser.add_argument(
-        "--ground-mu-scale",
-        type=float,
-        default=1.0,
-        help="Scale applied to ground-plane friction coefficient loaded from IR.",
-    )
-    parser.add_argument(
-        "--ground-restitution-scale",
-        type=float,
-        default=1.0,
-        help="Scale applied to ground-plane restitution loaded from IR.",
-    )
-    parser.add_argument(
-        "--inference",
-        type=Path,
-        default=None,
-        help="Optional PhysTwin baseline inference.pkl for RMSE reporting.",
-    )
-    return parser.parse_args()
+def load_ir(path: Path) -> dict[str, np.ndarray]:
+    """Load an IR ``.npz`` file into a plain dict."""
+    with np.load(path, allow_pickle=False) as data:
+        return {k: data[k] for k in data.files}
 
 
-def _as_scalar(array: np.ndarray) -> float:
-    return float(np.asarray(array).reshape(-1)[0])
+def ir_scalar(ir: dict, key: str, default: float | None = None) -> float:
+    """Extract a scalar value from the IR, with optional default."""
+    if key not in ir:
+        if default is not None:
+            return default
+        raise KeyError(f"IR missing required key: {key!r}")
+    return float(np.asarray(ir[key]).ravel()[0])
 
 
-def _as_bool(array: np.ndarray) -> bool:
-    return bool(np.asarray(array).reshape(-1)[0])
+def ir_bool(ir: dict, key: str, default: bool = False) -> bool:
+    if key not in ir:
+        return default
+    return bool(np.asarray(ir[key]).ravel()[0])
 
 
-def _as_string(array: np.ndarray) -> str:
-    return str(np.asarray(array).reshape(-1)[0])
+def ir_string(ir: dict, key: str, default: str = "") -> str:
+    if key not in ir:
+        return default
+    return str(np.asarray(ir[key]).ravel()[0])
 
 
-def _load_ir(ir_path: Path) -> dict[str, np.ndarray]:
-    with np.load(ir_path, allow_pickle=False) as data:
-        return {key: data[key] for key in data.files}
+def ir_version(ir: dict) -> int:
+    return int(ir_scalar(ir, IR_VERSION_KEY, default=1))
 
 
-def _resolve_device(device_str: str) -> str:
+def resolve_device(requested: str) -> str:
     try:
-        wp.get_device(device_str)
-        return device_str
+        wp.get_device(requested)
+        return requested
     except Exception:
         return "cpu"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Gravity
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _resolve_ir_version(ir: dict[str, np.ndarray]) -> int:
-    if "ir_version" not in ir:
-        return 1
-    return int(np.asarray(ir["ir_version"]).reshape(-1)[0])
+AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
 
-
-def _gravity_vector(up_axis: str, gravity_scalar: float) -> tuple[float, float, float]:
+def resolve_gravity(cfg: SimConfig, ir: dict) -> tuple[float, tuple[float, float, float]]:
+    """Compute gravity scalar and 3D vector from config + IR."""
+    if cfg.gravity is not None:
+        scalar = cfg.gravity
+    elif cfg.gravity_from_reverse_z:
+        reverse_z = ir_bool(ir, "reverse_z")
+        scalar = cfg.gravity_mag * (1.0 if reverse_z else -1.0)
+    else:
+        scalar = 0.0
     vec = [0.0, 0.0, 0.0]
-    axis_to_index = {"X": 0, "Y": 1, "Z": 2}
-    vec[axis_to_index[up_axis]] = float(gravity_scalar)
-    return tuple(vec)
+    vec[AXIS_INDEX[cfg.up_axis]] = scalar
+    return scalar, tuple(vec)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Physics validation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _validate_config_ranges(cfg: SimConfig) -> None:
+    """Fail fast on invalid scale/damping parameters."""
+    checks = {
+        ("--spring-ke-scale", cfg.spring_ke_scale, ">", 0.0),
+        ("--spring-kd-scale", cfg.spring_kd_scale, ">=", 0.0),
+        ("--angular-damping", cfg.angular_damping, ">=", 0.0),
+        ("--friction-smoothing", cfg.friction_smoothing, ">", 0.0),
+        ("--ground-mu-scale", cfg.ground_mu_scale, ">=", 0.0),
+        ("--ground-restitution-scale", cfg.ground_restitution_scale, ">=", 0.0),
+    }
+    for name, value, op, bound in checks:
+        if op == ">" and value <= bound:
+            raise ValueError(f"{name} must be > {bound}, got {value}")
+        if op == ">=" and value < bound:
+            raise ValueError(f"{name} must be >= {bound}, got {value}")
 
 
-def _resolve_gravity(args: argparse.Namespace, ir: dict[str, np.ndarray]) -> tuple[float, tuple[float, float, float]]:
-    if args.gravity is not None:
-        gravity_scalar = float(args.gravity)
-    elif bool(args.gravity_from_reverse_z):
-        reverse_z = _as_bool(ir["reverse_z"]) if "reverse_z" in ir else False
-        gravity_scalar = float(args.gravity_mag) * (1.0 if reverse_z else -1.0)
-    else:
-        gravity_scalar = 0.0
-    return gravity_scalar, _gravity_vector(args.up_axis, gravity_scalar)
+def validate_ir_physics(ir: dict, cfg: SimConfig) -> dict:
+    """Validate IR spring semantics.  Returns a diagnostics dict."""
+    _validate_config_ranges(cfg)
+    strict = cfg.strict_physics_checks
+    checks: dict = {}
 
+    # Springs
+    edges = np.asarray(ir["spring_edges"])
+    n = int(edges.shape[0])
+    ke = np.asarray(ir["spring_ke"], dtype=np.float64).ravel()
+    if ke.shape[0] != n:
+        raise ValueError(f"spring_ke length {ke.shape[0]} != edge count {n}")
+    if not np.all(np.isfinite(ke)):
+        raise ValueError("Non-finite spring_ke values.")
 
-def _resolve_particle_contacts_enabled(args: argparse.Namespace, ir: dict[str, np.ndarray]) -> bool:
-    if args.particle_contacts is not None:
-        return bool(args.particle_contacts)
-    if "self_collision" in ir:
-        return bool(_as_bool(ir["self_collision"]))
-    return False
-
-
-def _validate_physics_semantics(ir: dict[str, np.ndarray], args: argparse.Namespace) -> dict[str, float | str | bool]:
-    checks: dict[str, float | str | bool] = {}
-    strict = bool(args.strict_physics_checks)
-
-    if args.semi_spring_ke_scale <= 0.0:
-        raise ValueError(
-            f"--semi-spring-ke-scale must be > 0, got {args.semi_spring_ke_scale}."
-        )
-    if args.semi_spring_kd_scale < 0.0:
-        raise ValueError(
-            f"--semi-spring-kd-scale must be >= 0, got {args.semi_spring_kd_scale}."
-        )
-    if args.semi_angular_damping < 0.0:
-        raise ValueError(
-            f"--semi-angular-damping must be >= 0, got {args.semi_angular_damping}."
-        )
-    if args.semi_friction_smoothing <= 0.0:
-        raise ValueError(
-            f"--semi-friction-smoothing must be > 0, got {args.semi_friction_smoothing}."
-        )
-    if args.xpbd_soft_body_relaxation <= 0.0:
-        raise ValueError(
-            f"--xpbd-soft-body-relaxation must be > 0, got {args.xpbd_soft_body_relaxation}."
-        )
-    if args.xpbd_soft_contact_relaxation <= 0.0:
-        raise ValueError(
-            f"--xpbd-soft-contact-relaxation must be > 0, got {args.xpbd_soft_contact_relaxation}."
-        )
-    if args.xpbd_rigid_contact_relaxation <= 0.0:
-        raise ValueError(
-            f"--xpbd-rigid-contact-relaxation must be > 0, got {args.xpbd_rigid_contact_relaxation}."
-        )
-    if args.xpbd_angular_damping < 0.0:
-        raise ValueError(
-            f"--xpbd-angular-damping must be >= 0, got {args.xpbd_angular_damping}."
-        )
-    if args.spring_ke_scale <= 0.0:
-        raise ValueError(
-            f"--spring-ke-scale must be > 0, got {args.spring_ke_scale}."
-        )
-    if args.spring_kd_scale < 0.0:
-        raise ValueError(
-            f"--spring-kd-scale must be >= 0, got {args.spring_kd_scale}."
-        )
-    if args.ground_mu_scale < 0.0:
-        raise ValueError(
-            f"--ground-mu-scale must be >= 0, got {args.ground_mu_scale}."
-        )
-    if args.ground_restitution_scale < 0.0:
-        raise ValueError(
-            f"--ground-restitution-scale must be >= 0, got {args.ground_restitution_scale}."
-        )
-
-    spring_edges = np.asarray(ir["spring_edges"])
-    spring_count = int(spring_edges.shape[0])
-    spring_ke = np.asarray(ir["spring_ke"], dtype=np.float64).reshape(-1)
-    if spring_ke.shape[0] != spring_count:
-        raise ValueError(
-            f"Expected spring_ke length {spring_count}, got {spring_ke.shape[0]}."
-        )
-    if not np.all(np.isfinite(spring_ke)):
-        raise ValueError("Non-finite spring_ke values detected in IR.")
-
-    spring_rest = None
+    # Rest lengths
+    rest = None
     if "spring_rest_length" in ir:
-        spring_rest = np.asarray(ir["spring_rest_length"], dtype=np.float64).reshape(-1)
-        if spring_rest.shape[0] != spring_count:
-            raise ValueError(
-                f"Expected spring_rest_length length {spring_count}, got {spring_rest.shape[0]}."
-            )
-        if not np.all(np.isfinite(spring_rest)):
-            raise ValueError("Non-finite spring_rest_length values detected in IR.")
-        if np.any(spring_rest <= 0.0):
-            raise ValueError(
-                f"Non-positive spring_rest_length detected (min={float(np.min(spring_rest))})."
-            )
-        checks["spring_rest_length_min"] = float(np.min(spring_rest))
-        checks["spring_rest_length_max"] = float(np.max(spring_rest))
+        rest = np.asarray(ir["spring_rest_length"], dtype=np.float64).ravel()
+        if rest.shape[0] != n:
+            raise ValueError(f"spring_rest_length length {rest.shape[0]} != {n}")
+        if not np.all(np.isfinite(rest)):
+            raise ValueError("Non-finite spring_rest_length.")
+        if np.any(rest <= 0.0):
+            raise ValueError(f"Non-positive rest length (min={float(np.min(rest))})")
+        checks["spring_rest_min"] = float(np.min(rest))
+        checks["spring_rest_max"] = float(np.max(rest))
     elif strict:
-        raise ValueError("Strict physics checks require spring_rest_length in IR.")
-    else:
-        warnings.warn(
-            "IR missing spring_rest_length; spring semantic checks are limited.",
-            RuntimeWarning,
-        )
+        raise ValueError("Strict mode requires spring_rest_length.")
 
-    spring_ke_mode = "unknown"
-    if "spring_ke_mode" in ir:
-        spring_ke_mode = _as_string(ir["spring_ke_mode"])
-    checks["spring_ke_mode"] = spring_ke_mode
+    # ke mode
+    ke_mode = ir_string(ir, "spring_ke_mode", "unknown")
+    checks["spring_ke_mode"] = ke_mode
+    if strict and ke_mode != "y_over_rest":
+        raise ValueError(f"Strict mode requires spring_ke_mode=y_over_rest, got {ke_mode!r}")
 
-    if "spring_y" in ir and spring_rest is not None:
-        spring_y = np.asarray(ir["spring_y"], dtype=np.float64).reshape(-1)
-        if spring_y.shape[0] != spring_count:
-            raise ValueError(
-                f"Expected spring_y length {spring_count}, got {spring_y.shape[0]}."
-            )
-        expected_ke = spring_y / np.maximum(spring_rest, 1e-12)
-        abs_err = np.abs(spring_ke - expected_ke)
-        rel_err = abs_err / np.maximum(np.abs(expected_ke), 1e-12)
-        checks["spring_ke_rel_error_max"] = float(np.max(rel_err))
-        checks["spring_ke_rel_error_mean"] = float(np.mean(rel_err))
-        if strict and float(np.max(rel_err)) > 1e-4:
-            raise ValueError(
-                "spring_ke does not match spring_y/rest_length under strict checks "
-                f"(max_rel_error={float(np.max(rel_err)):.6e})."
-            )
+    # Cross-check ke ≈ Y / rest
+    if "spring_y" in ir and rest is not None:
+        y = np.asarray(ir["spring_y"], dtype=np.float64).ravel()
+        if y.shape[0] != n:
+            raise ValueError(f"spring_y length {y.shape[0]} != {n}")
+        expected = y / np.maximum(rest, EPSILON)
+        rel_err = np.abs(ke - expected) / np.maximum(np.abs(expected), EPSILON)
+        checks["ke_rel_error_max"] = float(np.max(rel_err))
+        checks["ke_rel_error_mean"] = float(np.mean(rel_err))
+        if strict and float(np.max(rel_err)) > STRICT_KE_REL_TOL:
+            raise ValueError(f"ke inconsistent with Y/rest (max_rel_err={float(np.max(rel_err)):.2e})")
     elif strict:
-        raise ValueError("Strict physics checks require spring_y and spring_rest_length in IR.")
+        raise ValueError("Strict mode requires spring_y and spring_rest_length.")
 
-    if strict and spring_ke_mode != "y_over_rest":
-        raise ValueError(
-            "Strict physics checks require IR spring_ke_mode=y_over_rest. "
-            f"Got {spring_ke_mode!r}. Re-export IR with strict defaults."
-        )
-
+    # Controller mass = 0
     if "controller_idx" in ir:
-        controller_idx = np.asarray(ir["controller_idx"], dtype=np.int64).reshape(-1)
-        mass = np.asarray(ir["mass"], dtype=np.float64).reshape(-1)
-        if controller_idx.size > 0:
-            if controller_idx.min() < 0 or controller_idx.max() >= mass.shape[0]:
-                raise ValueError("controller_idx out of bounds for mass array.")
-            controller_mass_abs_max = float(np.max(np.abs(mass[controller_idx])))
+        idx = np.asarray(ir["controller_idx"], dtype=np.int64).ravel()
+        mass = np.asarray(ir["mass"], dtype=np.float64).ravel()
+        if idx.size > 0:
+            if idx.min() < 0 or idx.max() >= mass.shape[0]:
+                raise ValueError("controller_idx out of bounds.")
+            max_mass = float(np.max(np.abs(mass[idx])))
         else:
-            controller_mass_abs_max = 0.0
-        checks["controller_mass_abs_max"] = controller_mass_abs_max
-        if strict and controller_mass_abs_max > 1e-8:
-            raise ValueError(
-                "Controller particles must be kinematic (mass=0) under strict checks. "
-                f"Observed max |mass|={controller_mass_abs_max:.6e}."
-            )
+            max_mass = 0.0
+        checks["controller_mass_abs_max"] = max_mass
+        if strict and max_mass > KINEMATIC_MASS_TOL:
+            raise ValueError(f"Controllers must have mass≈0, got max|mass|={max_mass:.2e}")
 
     if "self_collision" in ir:
-        checks["self_collision"] = bool(_as_bool(ir["self_collision"]))
+        checks["self_collision"] = ir_bool(ir, "self_collision")
 
     return checks
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Collision radius resolution
+# ═══════════════════════════════════════════════════════════════════════════
 
-def _uniform_collision_radius(
-    ir: dict[str, np.ndarray], num_particles: int, value: float
-) -> np.ndarray:
-    radius = np.full((num_particles,), float(value), dtype=np.float32)
+def _uniform_radius(ir: dict, n: int, value: float) -> np.ndarray:
+    r = np.full((n,), value, dtype=np.float32)
     if "controller_idx" in ir and "collision_controller_radius" in ir:
-        controller_idx = ir["controller_idx"].astype(np.int64, copy=False)
-        if controller_idx.size > 0:
-            controller_radius = _as_scalar(ir["collision_controller_radius"])
-            radius[controller_idx] = float(controller_radius)
-    return radius
+        idx = ir["controller_idx"].astype(np.int64, copy=False)
+        if idx.size > 0:
+            r[idx] = ir_scalar(ir, "collision_controller_radius")
+    return r
 
 
-def _legacy_collision_radius_from_ir(
-    ir: dict[str, np.ndarray], num_particles: int
-) -> tuple[np.ndarray, str]:
-    radius = None
-    source = "legacy_fallback_defaults"
-    if "radius" in ir:
-        radius = ir["radius"].astype(np.float32).copy()
-        source = "legacy_radius"
+def resolve_collision_radius(ir: dict, n: int) -> tuple[np.ndarray, int, str]:
+    """Determine per-particle collision radii from IR.  Returns (radii, version, source)."""
+    ver = ir_version(ir)
 
-    collision_dist = None
-    if "contact_collision_dist" in ir:
-        collision_dist = _as_scalar(ir["contact_collision_dist"])
+    if IR_COLLISION_RADIUS_KEY in ir:
+        return ir[IR_COLLISION_RADIUS_KEY].astype(np.float32).copy(), ver, "collision_radius"
 
-    if radius is not None and collision_dist is not None:
-        ratio = float(np.max(radius) / max(float(collision_dist), 1e-12))
-        if ratio > 2.5:
-            warnings.warn(
-                "Legacy IR detected: `radius` looks like topology radius. "
-                "Using `contact_collision_dist` for collision radius.",
-                RuntimeWarning,
-            )
-            return _uniform_collision_radius(ir=ir, num_particles=num_particles, value=collision_dist), (
-                "legacy_contact_collision_dist"
-            )
-        return radius, source
-
-    if radius is not None:
-        return radius, source
-
-    if collision_dist is not None:
-        warnings.warn(
-            "Legacy IR missing `radius`; using `contact_collision_dist` for collision radius.",
-            RuntimeWarning,
-        )
-        return _uniform_collision_radius(ir=ir, num_particles=num_particles, value=collision_dist), (
-            "legacy_contact_collision_dist"
-        )
-
-    object_radius = _as_scalar(
-        ir.get(
-            "collision_object_radius",
-            ir.get("object_radius", np.asarray(0.02, dtype=np.float32)),
-        )
-    )
-    controller_radius = _as_scalar(
-        ir.get(
-            "collision_controller_radius",
-            ir.get("controller_radius", np.asarray(object_radius, dtype=np.float32)),
-        )
-    )
-    radius = np.full((num_particles,), object_radius, dtype=np.float32)
-    if "controller_idx" in ir:
-        controller_idx = ir["controller_idx"].astype(np.int64, copy=False)
-        if controller_idx.size > 0:
-            radius[controller_idx] = controller_radius
-    return radius, source
-
-
-def _initial_collision_radius(
-    ir: dict[str, np.ndarray], num_particles: int
-) -> tuple[np.ndarray, int, str]:
-    ir_version = _resolve_ir_version(ir)
-    if "collision_radius" in ir:
-        return ir["collision_radius"].astype(np.float32).copy(), ir_version, "collision_radius"
-
-    if ir_version >= 2:
+    if ver >= 2:
         if "radius" in ir:
-            warnings.warn(
-                "IR v2 missing `collision_radius`; falling back to `radius`.",
-                RuntimeWarning,
-            )
-            return ir["radius"].astype(np.float32).copy(), ir_version, "v2_radius_fallback"
-        raise KeyError("IR v2 requires `collision_radius`.")
+            warnings.warn("IR v2 missing collision_radius; falling back to radius.", RuntimeWarning)
+            return ir["radius"].astype(np.float32).copy(), ver, "v2_radius_fallback"
+        raise KeyError("IR v2 requires collision_radius.")
 
-    legacy_radius, source = _legacy_collision_radius_from_ir(
-        ir=ir, num_particles=num_particles
-    )
-    return legacy_radius, ir_version, source
+    # Legacy heuristics
+    if "radius" in ir and "contact_collision_dist" in ir:
+        r = ir["radius"].astype(np.float32).copy()
+        dist = ir_scalar(ir, "contact_collision_dist")
+        if float(np.max(r) / max(dist, EPSILON)) > LEGACY_RADIUS_RATIO_THRESH:
+            warnings.warn("Legacy IR: radius looks like topology; using contact_collision_dist.", RuntimeWarning)
+            return _uniform_radius(ir, n, dist), ver, "legacy_contact_collision_dist"
+        return r, ver, "legacy_radius"
+
+    if "radius" in ir:
+        return ir["radius"].astype(np.float32).copy(), ver, "legacy_radius"
+
+    if "contact_collision_dist" in ir:
+        warnings.warn("Legacy IR missing radius; using contact_collision_dist.", RuntimeWarning)
+        return _uniform_radius(ir, n, ir_scalar(ir, "contact_collision_dist")), ver, "legacy_contact_collision_dist"
+
+    obj_r = ir_scalar(ir, "collision_object_radius", ir_scalar(ir, "object_radius", DEFAULT_OBJECT_RADIUS))
+    ctrl_r = ir_scalar(ir, "collision_controller_radius", ir_scalar(ir, "controller_radius", obj_r))
+    r = np.full((n,), obj_r, dtype=np.float32)
+    if "controller_idx" in ir:
+        idx = ir["controller_idx"].astype(np.int64, copy=False)
+        if idx.size > 0:
+            r[idx] = ctrl_r
+    return r, ver, "legacy_fallback"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Model building
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _resolve_particle_contacts(cfg: SimConfig, ir: dict) -> bool:
+    if cfg.particle_contacts is not None:
+        return cfg.particle_contacts
+    return ir_bool(ir, "self_collision")
 
 
-def _build_particle_data(
-    ir: dict[str, np.ndarray], args: argparse.Namespace, particle_contacts_enabled: bool
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, str]:
+def _add_particles(builder: newton.ModelBuilder, ir: dict, cfg: SimConfig,
+                   particle_contacts: bool) -> tuple[np.ndarray, np.ndarray, int, str]:
+    """Add IR particles to the builder.  Returns (radius, flags, ir_ver, radius_source)."""
     x0 = ir["x0"].astype(np.float32, copy=False)
     v0 = ir["v0"].astype(np.float32, copy=False)
     mass = ir["mass"].astype(np.float32, copy=False)
-    radius, ir_version, radius_source = _initial_collision_radius(
-        ir=ir, num_particles=x0.shape[0]
-    )
-    flags = np.full((x0.shape[0],), int(newton.ParticleFlags.ACTIVE), dtype=np.int32)
+    radius, ver, src = resolve_collision_radius(ir, x0.shape[0])
+    flags = np.full(x0.shape[0], int(newton.ParticleFlags.ACTIVE), dtype=np.int32)
 
-    # PhysTwin uses `contact_collision_dist` as a pairwise distance threshold (d < dist).
-    # Newton particle-particle contact triggers around (radius_i + radius_j), so we map
-    # to radius = dist/2. This radius also affects particle-shape contacts, so it must
-    # be set consistently even when particle-particle contacts are disabled.
+    # Map PhysTwin pairwise distance → Newton per-particle radius
     if "contact_collision_dist" in ir:
-        collision_dist = float(_as_scalar(ir["contact_collision_dist"]))
-        object_radius = float(max(collision_dist * 0.5, 1e-8))
-        radius.fill(object_radius)
-        radius_source = "contact_collision_dist_half"
+        dist = ir_scalar(ir, "contact_collision_dist")
+        if particle_contacts:
+            radius.fill(max(dist * 0.5, EPSILON))
+            src = "contact_collision_dist_half"
+        else:
+            src = f"{src}_shape_preserved"
         if "controller_idx" in ir:
-            controller_idx = ir["controller_idx"].astype(np.int64, copy=False)
-            if controller_idx.size > 0:
-                # Controllers are typically inactive for contact kernels; keep them tiny.
-                radius[controller_idx] = float(args.particle_contact_radius)
+            ctrl = ir["controller_idx"].astype(np.int64, copy=False)
+            if ctrl.size > 0:
+                radius[ctrl] = cfg.particle_contact_radius
 
-    if args.object_contact_radius is not None:
-        override = float(args.object_contact_radius)
-        if override <= 0.0:
-            raise ValueError(f"--object-contact-radius must be > 0, got {override}.")
-        num_object_points = int(np.asarray(ir["num_object_points"]).reshape(-1)[0])
-        radius[:num_object_points].fill(override)
-        radius_source = "object_contact_radius_override"
-
-    return x0, v0, mass, radius, flags, ir_version, radius_source
-
-
-def _build_model(
-    ir: dict[str, np.ndarray],
-    args: argparse.Namespace,
-    device: str,
-):
-    semantic_checks = _validate_physics_semantics(ir=ir, args=args)
-    shape_contacts_enabled = bool(args.shape_contacts)
-    particle_contacts_enabled = _resolve_particle_contacts_enabled(args, ir)
-
-    # With the current importer, particle radii always follow IR contact semantics (when available),
-    # regardless of whether particle-particle contacts are enabled. Disabling particle contacts only
-    # disables the particle-particle kernel, so shape-contacts remain consistent.
-    contact_semantics = "exact"
-
-    axis = newton.Axis.from_any(args.up_axis)
-    builder = newton.ModelBuilder(up_axis=axis, gravity=0.0)
-    x0, v0, mass, radius, flags, ir_version, radius_source = _build_particle_data(
-        ir=ir, args=args, particle_contacts_enabled=particle_contacts_enabled
-    )
+    if cfg.object_contact_radius is not None:
+        if cfg.object_contact_radius <= 0.0:
+            raise ValueError(f"object_contact_radius must be > 0, got {cfg.object_contact_radius}")
+        n_obj = int(np.asarray(ir["num_object_points"]).ravel()[0])
+        radius[:n_obj].fill(cfg.object_contact_radius)
+        src = "object_contact_radius_override"
 
     builder.add_particles(
         pos=[tuple(row.tolist()) for row in x0],
@@ -661,323 +522,195 @@ def _build_model(
         radius=radius.astype(float).tolist(),
         flags=flags.astype(int).tolist(),
     )
+    return radius, flags, ver, src
 
-    spring_edges = np.asarray(ir["spring_edges"])
-    if spring_edges.ndim != 2 or spring_edges.shape[1] != 2:
-        raise ValueError(f"Expected spring_edges shape [spring_count, 2], got {spring_edges.shape}")
-    spring_count = int(spring_edges.shape[0])
 
-    spring_ke = np.asarray(ir["spring_ke"], dtype=np.float32).reshape(-1)
-    spring_kd = np.asarray(ir["spring_kd"], dtype=np.float32).reshape(-1)
-    if spring_ke.shape[0] != spring_count:
-        raise ValueError(f"Expected spring_ke length {spring_count}, got {spring_ke.shape[0]}")
-    if spring_kd.shape[0] != spring_count:
-        raise ValueError(f"Expected spring_kd length {spring_count}, got {spring_kd.shape[0]}")
+def _add_springs(builder: newton.ModelBuilder, ir: dict, cfg: SimConfig, checks: dict) -> None:
+    """Add IR springs (with scaled ke/kd) to the builder."""
+    edges = np.asarray(ir["spring_edges"])
+    if edges.ndim != 2 or edges.shape[1] != 2:
+        raise ValueError(f"Expected spring_edges shape [N, 2], got {edges.shape}")
+    n = edges.shape[0]
 
-    spring_rest_length = None
-    if "spring_rest_length" in ir:
-        rest = np.asarray(ir["spring_rest_length"], dtype=np.float32).reshape(-1)
-        if rest.shape[0] != spring_count:
-            raise ValueError(
-                "spring_rest_length count mismatch: "
-                f"rest={rest.shape[0]}, edges={spring_count}"
-            )
-        spring_rest_length = rest
+    ke = np.asarray(ir["spring_ke"], dtype=np.float32).ravel() * cfg.spring_ke_scale
+    kd = np.asarray(ir["spring_kd"], dtype=np.float32).ravel() * cfg.spring_kd_scale
+    if ke.shape[0] != n or kd.shape[0] != n:
+        raise ValueError(f"Spring param count mismatch: ke={ke.shape[0]}, kd={kd.shape[0]}, edges={n}")
 
-    spring_ke = spring_ke * float(args.spring_ke_scale)
-    spring_kd = spring_kd * float(args.spring_kd_scale)
-    semantic_checks["spring_ke_scale"] = float(args.spring_ke_scale)
-    semantic_checks["spring_kd_scale"] = float(args.spring_kd_scale)
+    rest = ir["spring_rest_length"].astype(np.float32).ravel() if "spring_rest_length" in ir else None
 
-    if args.solver == "semi_implicit":
-        spring_ke = spring_ke * float(args.semi_spring_ke_scale)
-        spring_kd = spring_kd * float(args.semi_spring_kd_scale)
-        semantic_checks["semi_spring_ke_scale"] = float(args.semi_spring_ke_scale)
-        semantic_checks["semi_spring_kd_scale"] = float(args.semi_spring_kd_scale)
+    for i in range(n):
+        builder.add_spring(i=int(edges[i, 0]), j=int(edges[i, 1]),
+                           ke=float(ke[i]), kd=float(kd[i]), control=0.0)
+        if rest is not None:
+            builder.spring_rest_length[-1] = float(rest[i])
 
-    for spring_idx in range(spring_count):
-        i = int(spring_edges[spring_idx, 0])
-        j = int(spring_edges[spring_idx, 1])
-        builder.add_spring(
-            i=i,
-            j=j,
-            ke=float(spring_ke[spring_idx]),
-            kd=float(spring_kd[spring_idx]),
-            control=0.0,
-        )
-        if spring_rest_length is not None:
-            builder.spring_rest_length[-1] = float(spring_rest_length[spring_idx])
+    checks["spring_ke_scale"] = cfg.spring_ke_scale
+    checks["spring_kd_scale"] = cfg.spring_kd_scale
 
-    if bool(args.add_ground_plane):
-        ground_cfg = builder.default_shape_cfg.copy()
-        if "contact_collide_fric" in ir:
-            mu_value = _as_scalar(ir["contact_collide_fric"]) * float(args.ground_mu_scale)
-            ground_cfg.mu = float(np.clip(mu_value, 0.0, 2.0))
-        if "contact_collide_elas" in ir:
-            restitution_value = _as_scalar(ir["contact_collide_elas"]) * float(args.ground_restitution_scale)
-            ground_cfg.restitution = float(np.clip(restitution_value, 0.0, 1.0))
-        reverse_z = bool(_as_bool(ir["reverse_z"])) if "reverse_z" in ir else False
-        # Ground plane at 0 in Newton coordinates. Note particle-shape contacts are sphere-based:
-        # particle centers will rest at approximately -radius (or +radius depending on axis).
-        if args.up_axis != "Z":
-            builder.add_ground_plane(cfg=ground_cfg)
-            semantic_checks["ground_plane_reverse_z"] = False
-        elif reverse_z:
-            # Work around wp.quat_between_vectors ambiguity for opposite vectors (Z -> -Z) by
-            # explicitly supplying a transform whose local +Z points along world -Z.
-            xform = wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat(1.0, 0.0, 0.0, 0.0))
-            builder.add_shape_plane(
-                body=-1,
-                xform=xform,
-                width=0.0,
-                length=0.0,
-                cfg=ground_cfg,
-                label="ground_plane_reverse_z",
-            )
-            semantic_checks["ground_plane_reverse_z"] = True
-        else:
-            builder.add_ground_plane(cfg=ground_cfg)
-            semantic_checks["ground_plane_reverse_z"] = False
-        semantic_checks["ground_plane_added"] = True
-        semantic_checks["ground_mu"] = float(ground_cfg.mu)
-        semantic_checks["ground_restitution"] = float(ground_cfg.restitution)
+
+def _add_ground_plane(builder: newton.ModelBuilder, ir: dict, cfg: SimConfig, checks: dict) -> None:
+    """Optionally add a ground plane from IR contact params."""
+    if not cfg.add_ground_plane:
+        checks["ground_plane_added"] = False
+        return
+
+    gcfg = builder.default_shape_cfg.copy()
+    if "contact_collide_fric" in ir:
+        gcfg.mu = float(np.clip(ir_scalar(ir, "contact_collide_fric") * cfg.ground_mu_scale, 0, MU_MAX))
+    if "contact_collide_elas" in ir:
+        gcfg.restitution = float(np.clip(
+            ir_scalar(ir, "contact_collide_elas") * cfg.ground_restitution_scale, 0, RESTITUTION_MAX))
+
+    reverse_z = ir_bool(ir, "reverse_z")
+    if cfg.up_axis == "Z" and reverse_z:
+        xform = wp.transform(wp.vec3(0, 0, 0), wp.quat(1, 0, 0, 0))
+        builder.add_shape_plane(body=-1, xform=xform, width=0, length=0,
+                                cfg=gcfg, label="ground_plane_reverse_z")
     else:
-        semantic_checks["ground_plane_added"] = False
+        builder.add_ground_plane(cfg=gcfg)
+
+    checks["ground_plane_added"] = True
+    checks["ground_mu"] = float(gcfg.mu)
+    checks["ground_restitution"] = float(gcfg.restitution)
+
+
+def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
+    """Build a complete Newton Model from IR data.
+
+    This is the main extensibility point.  To add new objects to the
+    simulation, add ``builder.add_body()`` / ``builder.add_shape_*()``
+    calls before ``builder.finalize()``.
+    """
+    checks = validate_ir_physics(ir, cfg)
+    particle_contacts = _resolve_particle_contacts(cfg, ir)
+
+    builder = newton.ModelBuilder(
+        up_axis=newton.Axis.from_any(cfg.up_axis),
+        gravity=0.0,
+    )
+
+    radius, _flags, ver, radius_src = _add_particles(builder, ir, cfg, particle_contacts)
+    _add_springs(builder, ir, cfg, checks)
+    _add_ground_plane(builder, ir, cfg, checks)
+
+    # ── Extension point ──
+    # Add new objects here: builder.add_body(), builder.add_shape_mesh(), etc.
+    # They will interact with PhysTwin particles through Newton's collision.
 
     model = builder.finalize(device=device)
 
-    semantic_checks["particle_contacts_enabled"] = bool(particle_contacts_enabled)
-
-    # Disable particle-particle contact kernel while keeping particle radii for particle-shape contacts.
-    if not particle_contacts_enabled:
-        if args.solver == "xpbd":
-            model.particle_max_radius = 0.0
-            # Also disable hash-grid rebuilds in SolverXPBD (it rebuilds whenever particle_grid is not None).
-            model.particle_grid = None
-            semantic_checks["xpbd_particle_contacts_disabled"] = True
-        else:
-            model.particle_grid = None
-            semantic_checks["semi_particle_contacts_disabled"] = True
-    else:
-        semantic_checks["xpbd_particle_contacts_disabled"] = False
-        semantic_checks["semi_particle_contacts_disabled"] = False
-
-    # Optional extra guard: allow manually disabling semi-implicit particle contact kernel even if enabled.
-    if args.solver == "semi_implicit" and bool(args.semi_disable_particle_contact_kernel):
+    # Particle contact grid
+    if not particle_contacts or cfg.disable_particle_contact_kernel:
         model.particle_grid = None
-        semantic_checks["semi_particle_contact_kernel_disabled"] = True
-    else:
-        semantic_checks["semi_particle_contact_kernel_disabled"] = False
 
-    gravity_scalar, gravity_vector = _resolve_gravity(args=args, ir=ir)
-    model.set_gravity(gravity_vector)
+    # Gravity
+    _, gravity_vec = resolve_gravity(cfg, ir)
+    model.set_gravity(gravity_vec)
 
-    if args.particle_mu_override is not None:
-        particle_mu = float(np.clip(float(args.particle_mu_override), 0.0, 2.0))
-        model.particle_mu = particle_mu
-        semantic_checks["particle_mu"] = particle_mu
-        semantic_checks["particle_mu_source"] = "override"
+    # Particle friction
+    if cfg.particle_mu_override is not None:
+        model.particle_mu = float(np.clip(cfg.particle_mu_override, 0, MU_MAX))
     elif "contact_collide_fric" in ir:
-        particle_mu = float(np.clip(_as_scalar(ir["contact_collide_fric"]), 0.0, 2.0))
-        model.particle_mu = particle_mu
-        semantic_checks["particle_mu"] = particle_mu
-        semantic_checks["particle_mu_source"] = "ir"
+        model.particle_mu = float(np.clip(ir_scalar(ir, "contact_collide_fric"), 0, MU_MAX))
 
-    return (
+    checks["particle_contacts_enabled"] = particle_contacts
+    checks["collision_radius_source"] = radius_src
+
+    return ModelResult(model=model, radius=radius, ir_version=ver, checks=checks)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Controller interpolation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def interpolate_controller(traj: np.ndarray, frame: int, substep: int,
+                           n_substeps: int, interpolate: bool) -> np.ndarray:
+    """Linearly interpolate controller positions within a frame."""
+    if not interpolate:
+        return traj[frame]
+    if frame == 0:
+        return traj[0]
+    alpha = (substep + 1) / n_substeps
+    return traj[frame - 1] + (traj[frame] - traj[frame - 1]) * alpha
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Simulation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimResult:
+    """Run the semi-implicit simulation loop.  Returns per-frame positions."""
+    solver = newton.solvers.SolverSemiImplicit(
         model,
-        gravity_scalar,
-        gravity_vector,
-        radius,
-        flags,
-        shape_contacts_enabled,
-        particle_contacts_enabled,
-        ir_version,
-        radius_source,
-        contact_semantics,
-        semantic_checks,
+        angular_damping=cfg.angular_damping,
+        friction_smoothing=cfg.friction_smoothing,
+        enable_tri_contact=cfg.enable_tri_contact,
     )
-
-
-def _make_solver(
-    model: newton.Model,
-    args: argparse.Namespace,
-):
-    if args.solver == "semi_implicit":
-        return newton.solvers.SolverSemiImplicit(
-            model,
-            angular_damping=float(args.semi_angular_damping),
-            friction_smoothing=float(args.semi_friction_smoothing),
-            enable_tri_contact=bool(args.semi_enable_tri_contact),
-        )
-    return newton.solvers.SolverXPBD(
-        model,
-        iterations=int(args.solver_iterations),
-        soft_body_relaxation=float(args.xpbd_soft_body_relaxation),
-        soft_contact_relaxation=float(args.xpbd_soft_contact_relaxation),
-        rigid_contact_relaxation=float(args.xpbd_rigid_contact_relaxation),
-        angular_damping=float(args.xpbd_angular_damping),
-        enable_restitution=bool(args.xpbd_enable_restitution),
-    )
-
-
-def _load_inference(path: Path | None):
-    if path is None or not path.exists():
-        return None
-    import pickle
-
-    with path.open("rb") as handle:
-        inference = pickle.load(handle)
-    return np.asarray(inference, dtype=np.float32)
-
-
-def _controller_target_for_substep(
-    controller_traj: np.ndarray,
-    frame_idx: int,
-    substep_idx: int,
-    substeps_per_frame: int,
-    interpolate_controls: bool,
-) -> np.ndarray:
-    if not interpolate_controls:
-        return controller_traj[frame_idx]
-    if frame_idx == 0:
-        return controller_traj[0]
-    alpha = float(substep_idx + 1) / float(substeps_per_frame)
-    prev_ctrl = controller_traj[frame_idx - 1]
-    next_ctrl = controller_traj[frame_idx]
-    return prev_ctrl + (next_ctrl - prev_ctrl) * alpha
-
-
-def main() -> int:
-    args = parse_args()
-    ir_path = args.ir.resolve()
-    out_dir = args.out_dir.resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    ir = _load_ir(ir_path)
-    resolved_device = _resolve_device(args.device)
-    wp.init()
-
-    (
-        model,
-        gravity_scalar,
-        gravity_vector,
-        radius_used,
-        flags_used,
-        shape_contacts_enabled,
-        particle_contacts_enabled,
-        ir_version,
-        radius_source,
-        contact_semantics,
-        semantic_checks,
-    ) = _build_model(
-        ir=ir,
-        args=args,
-        device=resolved_device,
-    )
-    solver = _make_solver(model, args=args)
 
     state_in = model.state()
     state_out = model.state()
     control = model.control()
-    shape_contacts_enabled = bool(shape_contacts_enabled)
-    particle_contacts_enabled = bool(particle_contacts_enabled)
-    contacts_enabled = bool(shape_contacts_enabled or particle_contacts_enabled)
-    # Keep a Contacts buffer allocated even when contacts are disabled. XPBD shape contact
-    # kernels expect a non-null Contacts object whenever the model has shapes.
     contacts = model.contacts()
+    contacts_enabled = cfg.shape_contacts or ir_bool(ir, "self_collision")
 
-    controller_idx = ir["controller_idx"].astype(np.int64)
-    controller_traj = ir["controller_traj"].astype(np.float32)
-    num_object_points = int(ir["num_object_points"])
-    if controller_idx.ndim != 1:
-        raise ValueError(f"Expected controller_idx 1D array, got {controller_idx.shape}")
-    if controller_traj.ndim != 3 or controller_traj.shape[-1] != 3:
-        raise ValueError(f"Expected controller_traj shape [frames, ctrl_count, 3], got {controller_traj.shape}")
-    if controller_traj.shape[1] != controller_idx.size:
-        raise ValueError(
-            "Controller count mismatch between controller_traj and controller_idx: "
-            f"traj_ctrl={controller_traj.shape[1]}, idx_ctrl={controller_idx.size}."
-        )
-    if controller_idx.size > 0:
-        particle_count = int(np.asarray(ir["x0"]).shape[0])
-        if controller_idx.min() < 0 or controller_idx.max() >= particle_count:
-            raise ValueError(
-                f"controller_idx out of bounds for particle_count={particle_count}: "
-                f"min={int(controller_idx.min())}, max={int(controller_idx.max())}."
-            )
+    # Controller arrays
+    ctrl_idx = ir["controller_idx"].astype(np.int64)
+    ctrl_traj = ir["controller_traj"].astype(np.float32)
+    n_obj = int(ir["num_object_points"])
+    has_controllers = ctrl_idx.size > 0
 
-    ir_frames = controller_traj.shape[0]
-    frames_to_run = max(1, min(int(args.num_frames), ir_frames))
+    if ctrl_idx.ndim != 1:
+        raise ValueError(f"controller_idx must be 1D, got {ctrl_idx.shape}")
+    if ctrl_traj.ndim != 3 or ctrl_traj.shape[-1] != 3:
+        raise ValueError(f"controller_traj must be [F, C, 3], got {ctrl_traj.shape}")
+    if ctrl_traj.shape[1] != ctrl_idx.size:
+        raise ValueError(f"Controller count mismatch: traj={ctrl_traj.shape[1]}, idx={ctrl_idx.size}")
 
-    sim_dt = float(args.sim_dt) if args.sim_dt is not None else _as_scalar(ir["sim_dt"])
-    substeps_per_frame = (
-        int(args.substeps_per_frame)
-        if args.substeps_per_frame is not None
-        else int(np.asarray(ir["sim_substeps"]).reshape(-1)[0])
-    )
-    substeps_per_frame = max(1, substeps_per_frame)
+    # GPU buffers for controllers
+    ctrl_idx_wp = ctrl_target_wp = ctrl_vel_wp = None
+    ctrl_vel_zero = None
+    if has_controllers:
+        ctrl_idx_wp = wp.array(ctrl_idx.astype(np.int32), dtype=wp.int32, device=device)
+        ctrl_target_wp = wp.empty(ctrl_idx.size, dtype=wp.vec3, device=device)
+        ctrl_vel_wp = wp.empty(ctrl_idx.size, dtype=wp.vec3, device=device)
+        ctrl_vel_zero = np.zeros((ctrl_idx.size, 3), dtype=np.float32)
 
+    # Timing
+    sim_dt = cfg.sim_dt if cfg.sim_dt is not None else ir_scalar(ir, "sim_dt")
+    substeps = cfg.substeps_per_frame or int(ir_scalar(ir, "sim_substeps"))
+    substeps = max(1, substeps)
+    n_frames = max(1, min(cfg.num_frames, ctrl_traj.shape[0]))
+
+    # Drag
+    drag = 0.0
+    if cfg.apply_drag and "drag_damping" in ir:
+        drag = ir_scalar(ir, "drag_damping") * cfg.drag_damping_scale
+
+    # Collect rollout
     rollout_all: list[np.ndarray] = []
-    rollout_object: list[np.ndarray] = []
+    rollout_obj: list[np.ndarray] = []
 
-    controller_idx_wp = None
-    controller_target_wp = None
-    controller_vel_wp = None
-    controller_vel_zero = None
-    if controller_idx.size > 0:
-        controller_idx_wp = wp.array(
-            controller_idx.astype(np.int32, copy=False),
-            dtype=wp.int32,
-            device=model.device,
-        )
-        controller_target_wp = wp.empty((controller_idx.size,), dtype=wp.vec3, device=model.device)
-        controller_vel_wp = wp.empty((controller_idx.size,), dtype=wp.vec3, device=model.device)
-        # PhysTwin keeps controller velocities at zero (control points are driven by position only).
-        controller_vel_zero = np.zeros((controller_idx.size, 3), dtype=np.float32)
-
-    if args.frame_sync == "phystwin":
+    if cfg.frame_sync == "phystwin":
         q0 = state_in.particle_q.numpy().astype(np.float32)
         rollout_all.append(q0)
-        rollout_object.append(q0[:num_object_points])
-        frame_indices = range(1, frames_to_run)
+        rollout_obj.append(q0[:n_obj])
+        frame_range = range(1, n_frames)
     else:
-        frame_indices = range(frames_to_run)
+        frame_range = range(n_frames)
 
-    wall_start = time.perf_counter()
-    for frame_idx in frame_indices:
-        for substep_idx in range(substeps_per_frame):
-            # Newton solvers accumulate forces into state_in.{particle_f,body_f};
-            # these buffers must be cleared every substep to avoid force carry-over.
+    # Main loop
+    t0 = time.perf_counter()
+    for frame in frame_range:
+        for sub in range(substeps):
             state_in.clear_forces()
-            if controller_idx.size > 0:
-                target_ctrl = _controller_target_for_substep(
-                    controller_traj=controller_traj,
-                    frame_idx=frame_idx,
-                    substep_idx=substep_idx,
-                    substeps_per_frame=substeps_per_frame,
-                    interpolate_controls=bool(args.interpolate_controls),
-                )
-                target_ctrl_f32 = target_ctrl.astype(np.float32, copy=False)
-                assert controller_vel_zero is not None
-                controller_vel = controller_vel_zero
 
-                assert controller_idx_wp is not None
-                assert controller_target_wp is not None
-                assert controller_vel_wp is not None
-                controller_target_wp.assign(target_ctrl_f32)
-                controller_vel_wp.assign(controller_vel)
-                wp.launch(
-                    kernel=_set_indexed_particle_state,
-                    dim=controller_idx.size,
-                    inputs=[
-                        state_in.particle_q,
-                        state_in.particle_qd,
-                        controller_idx_wp,
-                        controller_target_wp,
-                        controller_vel_wp,
-                    ],
-                    device=model.device,
-                )
+            if has_controllers:
+                target = interpolate_controller(ctrl_traj, frame, sub, substeps, cfg.interpolate_controls)
+                ctrl_target_wp.assign(target.astype(np.float32, copy=False))
+                ctrl_vel_wp.assign(ctrl_vel_zero)
+                wp.launch(_write_kinematic_state, dim=ctrl_idx.size,
+                          inputs=[state_in.particle_q, state_in.particle_qd,
+                                  ctrl_idx_wp, ctrl_target_wp, ctrl_vel_wp],
+                          device=device)
 
             if contacts_enabled:
                 model.collide(state_in, contacts)
@@ -987,122 +720,139 @@ def main() -> int:
             solver.step(state_in, state_out, control, contacts, sim_dt)
             state_in, state_out = state_out, state_in
 
-            if bool(args.apply_drag) and "drag_damping" in ir:
-                drag_damping = float(_as_scalar(ir["drag_damping"])) * float(args.drag_damping_scale)
-                if drag_damping > 0.0:
-                    wp.launch(
-                        kernel=_apply_phystwin_drag,
-                        dim=num_object_points,
-                        inputs=[
-                            state_in.particle_q,
-                            state_in.particle_qd,
-                            num_object_points,
-                            sim_dt,
-                            drag_damping,
-                        ],
-                        device=model.device,
-                    )
+            if drag > 0.0:
+                wp.launch(_apply_drag_correction, dim=n_obj,
+                          inputs=[state_in.particle_q, state_in.particle_qd,
+                                  n_obj, sim_dt, drag],
+                          device=device)
 
-        q_frame = state_in.particle_q.numpy().astype(np.float32)
-        rollout_all.append(q_frame)
-        rollout_object.append(q_frame[:num_object_points])
-    wall_elapsed = time.perf_counter() - wall_start
+        q = state_in.particle_q.numpy().astype(np.float32)
+        rollout_all.append(q)
+        rollout_obj.append(q[:n_obj])
 
-    rollout_all_np = np.stack(rollout_all, axis=0)
-    rollout_object_np = np.stack(rollout_object, axis=0)
+    return SimResult(
+        particle_q_all=np.stack(rollout_all),
+        particle_q_object=np.stack(rollout_obj),
+        wall_time_sec=time.perf_counter() - t0,
+    )
 
-    inference_path = args.inference
-    if inference_path is None:
-        case_name = _as_string(ir["case_name"])
-        candidate = ir_path.parent.parent.parent / "inputs" / "cases" / case_name / "inference.pkl"
-        inference_path = candidate if candidate.exists() else None
+# ═══════════════════════════════════════════════════════════════════════════
+# Output
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load_inference(path: Path | None) -> np.ndarray | None:
+    if path is None or not path.exists():
+        return None
+    import pickle
+    with path.open("rb") as f:
+        return np.asarray(pickle.load(f), dtype=np.float32)
+
+
+def _resolve_inference_path(cfg: SimConfig, ir: dict) -> Path | None:
+    if cfg.inference_path is not None:
+        return cfg.inference_path
+    case = ir_string(ir, "case_name")
+    if not case:
+        return None
+    cand = cfg.ir_path.parent.parent.parent / "inputs" / "cases" / case / "inference.pkl"
+    return cand if cand.exists() else None
+
+
+def save_results(cfg: SimConfig, ir: dict, model_result: ModelResult,
+                 sim_result: SimResult) -> dict:
+    """Write ``.npz`` + ``.json`` and return the summary dict."""
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    n_obj = int(ir["num_object_points"])
+
+    # Inference RMSE
+    inference_path = _resolve_inference_path(cfg, ir)
     inference = _load_inference(inference_path)
-
-    rmse_per_frame = None
-    mean_rmse = None
-    max_rmse = None
-    compared_frames = 0
-    if inference is not None and inference.ndim == 3 and inference.shape[1] == num_object_points:
-        compared_frames = min(frames_to_run, inference.shape[0])
-        err = rollout_object_np[:compared_frames] - inference[:compared_frames]
-        rmse_per_frame = np.sqrt(np.mean(err * err, axis=(1, 2))).astype(np.float32)
+    rmse_per_frame = mean_rmse = max_rmse = None
+    compared = 0
+    if inference is not None and inference.ndim == 3 and inference.shape[1] == n_obj:
+        compared = min(sim_result.particle_q_object.shape[0], inference.shape[0])
+        err = sim_result.particle_q_object[:compared] - inference[:compared]
+        rmse_per_frame = np.sqrt(np.mean(err ** 2, axis=(1, 2))).astype(np.float32)
         mean_rmse = float(rmse_per_frame.mean())
         max_rmse = float(rmse_per_frame.max())
 
-    output_prefix = args.output_prefix
-    npz_path = out_dir / f"{output_prefix}.npz"
-    json_path = out_dir / f"{output_prefix}.json"
+    npz_path = cfg.out_dir / f"{cfg.output_prefix}.npz"
+    json_path = cfg.out_dir / f"{cfg.output_prefix}.json"
 
     np.savez_compressed(
         npz_path,
-        particle_q_all=rollout_all_np,
-        particle_q_object=rollout_object_np,
-        sim_dt=np.asarray(sim_dt, dtype=np.float32),
-        substeps_per_frame=np.asarray(substeps_per_frame, dtype=np.int32),
-        frames_run=np.asarray(frames_to_run, dtype=np.int32),
-        rmse_per_frame=(
-            rmse_per_frame if rmse_per_frame is not None else np.zeros((0,), dtype=np.float32)
-        ),
+        particle_q_all=sim_result.particle_q_all,
+        particle_q_object=sim_result.particle_q_object,
+        sim_dt=np.float32(cfg.sim_dt or ir_scalar(ir, "sim_dt")),
+        substeps_per_frame=np.int32(cfg.substeps_per_frame or int(ir_scalar(ir, "sim_substeps"))),
+        frames_run=np.int32(sim_result.particle_q_all.shape[0]),
+        rmse_per_frame=rmse_per_frame if rmse_per_frame is not None else np.zeros(0, dtype=np.float32),
     )
 
+    gravity_scalar, gravity_vec = resolve_gravity(cfg, ir)
     summary = {
-        "ir_path": str(ir_path),
+        "ir_path": str(cfg.ir_path),
         "output_npz": str(npz_path),
-        "device_requested": args.device,
-        "device_used": resolved_device,
-        "ir_version": int(ir_version),
-        "solver": args.solver,
-        "solver_iterations": int(args.solver_iterations),
-        "spring_ke_scale": float(args.spring_ke_scale),
-        "spring_kd_scale": float(args.spring_kd_scale),
-        "xpbd_soft_body_relaxation": float(args.xpbd_soft_body_relaxation),
-        "xpbd_soft_contact_relaxation": float(args.xpbd_soft_contact_relaxation),
-        "xpbd_rigid_contact_relaxation": float(args.xpbd_rigid_contact_relaxation),
-        "xpbd_angular_damping": float(args.xpbd_angular_damping),
-        "xpbd_enable_restitution": bool(args.xpbd_enable_restitution),
-        "semi_spring_ke_scale": float(args.semi_spring_ke_scale),
-        "semi_spring_kd_scale": float(args.semi_spring_kd_scale),
-        "semi_disable_particle_contact_kernel": bool(args.semi_disable_particle_contact_kernel),
-        "semi_enable_tri_contact": bool(args.semi_enable_tri_contact),
-        "semi_angular_damping": float(args.semi_angular_damping),
-        "semi_friction_smoothing": float(args.semi_friction_smoothing),
-        "frames_run": int(frames_to_run),
-        "substeps_per_frame": int(substeps_per_frame),
-        "sim_dt": float(sim_dt),
-        "gravity_scalar": float(gravity_scalar),
-        "gravity_mag": float(args.gravity_mag),
-        "gravity_from_reverse_z": bool(args.gravity_from_reverse_z),
-        "gravity_vector": [float(v) for v in gravity_vector],
-        "wall_time_sec": float(wall_elapsed),
-        "particles_total": int(rollout_all_np.shape[1]),
-        "particles_object": int(num_object_points),
-        "particle_radius_min": float(np.min(radius_used)),
-        "particle_radius_max": float(np.max(radius_used)),
-        "inactive_particle_count": int(np.sum(flags_used == 0)),
-        "shape_contacts_enabled": bool(shape_contacts_enabled),
-        "add_ground_plane": bool(args.add_ground_plane),
-        "particle_contacts_enabled": bool(particle_contacts_enabled),
-        "allow_coupled_contact_radius": bool(args.allow_coupled_contact_radius),
-        "object_contact_radius": float(args.object_contact_radius)
-        if args.object_contact_radius is not None
-        else None,
-        "contact_semantics": contact_semantics,
-        "collision_radius_source": radius_source,
-        "controller_inactive": bool(args.controller_inactive),
-        "interpolate_controls": bool(args.interpolate_controls),
-        "frame_sync": args.frame_sync,
-        "strict_physics_checks": bool(args.strict_physics_checks),
-        "particle_mu_override": args.particle_mu_override,
-        "ground_mu_scale": float(args.ground_mu_scale),
-        "ground_restitution_scale": float(args.ground_restitution_scale),
-        "semantic_checks": semantic_checks,
-        "inference_used": str(inference_path) if inference is not None else None,
-        "compared_frames": int(compared_frames),
-        "rmse_mean": mean_rmse,
-        "rmse_max": max_rmse,
+        "device": cfg.device,
+        "ir_version": model_result.ir_version,
+        "config": {
+            "spring_ke_scale": cfg.spring_ke_scale,
+            "spring_kd_scale": cfg.spring_kd_scale,
+            "angular_damping": cfg.angular_damping,
+            "friction_smoothing": cfg.friction_smoothing,
+            "enable_tri_contact": cfg.enable_tri_contact,
+            "interpolate_controls": cfg.interpolate_controls,
+            "frame_sync": cfg.frame_sync,
+            "apply_drag": cfg.apply_drag,
+            "drag_damping_scale": cfg.drag_damping_scale,
+            "ground_mu_scale": cfg.ground_mu_scale,
+            "ground_restitution_scale": cfg.ground_restitution_scale,
+        },
+        "simulation": {
+            "frames_run": int(sim_result.particle_q_all.shape[0]),
+            "substeps_per_frame": cfg.substeps_per_frame or int(ir_scalar(ir, "sim_substeps")),
+            "sim_dt": cfg.sim_dt or ir_scalar(ir, "sim_dt"),
+            "gravity_scalar": gravity_scalar,
+            "gravity_vector": list(gravity_vec),
+            "wall_time_sec": sim_result.wall_time_sec,
+        },
+        "particles": {
+            "total": int(sim_result.particle_q_all.shape[1]),
+            "object": n_obj,
+            "radius_min": float(np.min(model_result.radius)),
+            "radius_max": float(np.max(model_result.radius)),
+        },
+        "contacts": {
+            "shape_contacts": cfg.shape_contacts,
+            "ground_plane": cfg.add_ground_plane,
+            "particle_contacts": model_result.checks.get("particle_contacts_enabled", False),
+        },
+        "validation": model_result.checks,
+        "baseline": {
+            "inference_path": str(inference_path) if inference is not None else None,
+            "compared_frames": compared,
+            "rmse_mean": mean_rmse,
+            "rmse_max": max_rmse,
+        },
     }
-    with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
+
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    return summary
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main() -> int:
+    cfg = SimConfig.from_args(parse_args())
+    ir = load_ir(cfg.ir_path)
+    device = resolve_device(cfg.device)
+    wp.init()
+
+    model_result = build_model(ir, cfg, device)
+    sim_result = simulate(model_result.model, ir, cfg, device)
+    summary = save_results(cfg, ir, model_result, sim_result)
 
     print(json.dumps(summary, indent=2))
     return 0
