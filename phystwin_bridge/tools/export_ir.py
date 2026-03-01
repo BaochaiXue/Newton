@@ -377,21 +377,9 @@ def main() -> int:
             checkpoint_mass = to_array(checkpoint["init_masses"], np.float32).reshape(-1)
         used_topology_method = "checkpoint"
     else:
-        # Legacy checkpoint: reconstruct topology from points
-        import warnings
-        warnings.warn(
-            "Checkpoint missing spring topology; reconstructing from points. "
-            "Re-train with updated PhysTwin to store topology directly.",
-            RuntimeWarning,
-        )
-        points_all, edges, rest_lengths, num_object_springs, used_topology_method = build_springs(
-            structure_points=structure_points,
-            controller_points_0=controller_points_0,
-            object_radius=topology_object_radius,
-            object_max_neighbours=object_max_neighbours,
-            controller_radius=topology_controller_radius,
-            controller_max_neighbours=controller_max_neighbours,
-            topology_method=args.topology_method,
+        raise ValueError(
+            "Checkpoint is missing spring topology fields ('spring_edges', 'spring_rest_lengths'). "
+            "Re-train with updated PhysTwin (trainer_warp.py) that stores topology directly."
         )
 
     spring_y = checkpoint["spring_Y"]
