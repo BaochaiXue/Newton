@@ -94,13 +94,15 @@ class SimConfig:
     gravity_from_reverse_z: bool = True
     up_axis: str = "Z"
 
-    # Frame sync
     # Device
     device: str = "cuda:0"
 
     # Contacts
     shape_contacts: bool = False
     add_ground_plane: bool = True
+    # Override for IR `self_collision` (which we treat as the PhysTwin collision enable).
+    # Note: enabling particle self-collision in SemiImplicit also requires enabling the
+    # particle contact kernel (see `disable_particle_contact_kernel`).
     particle_contacts: bool | None = None
     particle_contact_radius: float = 1e-5
     object_contact_radius: float | None = None
@@ -254,8 +256,10 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Override IR self_collision. When enabled, we rebuild the HashGrid each substep "
-            "to support SemiImplicit particle-particle contacts (expensive)."
+            "Override IR self_collision (PhysTwin collision enable). "
+            "When enabled and `--no-disable-particle-contact-kernel` is set, we rebuild the "
+            "HashGrid each substep to support SemiImplicit particle-particle contacts (expensive). "
+            "If the kernel remains disabled, this flag only affects radius mapping/metadata."
         ),
     )
     p.add_argument(

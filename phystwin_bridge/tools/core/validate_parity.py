@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         "--disable-particle-contact-kernel",
         action=argparse.BooleanOptionalAction,
         default=True,
+        help=(
+            "Pass-through to importer. Default disables SemiImplicit particle-particle contact kernel "
+            "(model.particle_grid=None) to preserve PhysTwin parity and performance. "
+            "Use --no-disable-particle-contact-kernel only for experiments/debugging."
+        ),
     )
 
     # ── Simulation ──
@@ -97,16 +102,28 @@ def parse_args() -> argparse.Namespace:
         "--shape-contacts",
         action=argparse.BooleanOptionalAction,
         default=False,
+        help=(
+            "Pass-through to importer: run Newton collision detection each substep to enable "
+            "particle-vs-shape contacts (e.g. ground plane)."
+        ),
     )
     parser.add_argument(
         "--add-ground-plane",
         action=argparse.BooleanOptionalAction,
         default=True,
+        help=(
+            "Pass-through to importer: add a ground plane shape. Requires shape contacts (or IR self_collision=True) "
+            "for forces to be applied."
+        ),
     )
     parser.add_argument(
         "--particle-contacts",
         action=argparse.BooleanOptionalAction,
         default=None,
+        help=(
+            "Pass-through to importer: override IR self_collision (PhysTwin collision enable). "
+            "Particle self-collision in SemiImplicit also requires --no-disable-particle-contact-kernel."
+        ),
     )
     parser.add_argument("--particle-contact-radius", type=float, default=1e-5)
     parser.add_argument(
