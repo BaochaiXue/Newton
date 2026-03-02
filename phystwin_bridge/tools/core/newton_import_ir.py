@@ -244,7 +244,10 @@ def parse_args() -> argparse.Namespace:
         "--add-ground-plane",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Add a ground plane shape to the model (only affects dynamics if --shape-contacts is enabled).",
+        help=(
+            "Add a ground plane shape to the model. Particle-vs-plane forces require running the "
+            "collision pipeline (see --shape-contacts; also enabled by IR self_collision=True)."
+        ),
     )
     p.add_argument(
         "--particle-contacts",
@@ -743,11 +746,16 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
     state_in = model.state()
     state_out = model.state()
     control = model.control()
-    # Shape contacts (particles vs rigid shapes) require running collision detection.
-    # Particle self-collision does *not* use the Contacts buffer; it is handled by the
-    # SemiImplicit solver via a HashGrid-based kernel.
-    shape_contacts_enabled = bool(cfg.shape_contacts)
-    contacts = model.contacts() if shape_contacts_enabled else None
+    # Shape contacts (particles vs rigid shapes) require running Newton's collision pipeline.
+    #
+    # We run the collision pipeline when either:
+    # - the user explicitly requests it (--shape-contacts), or
+    # - the IR indicates PhysTwin collisions were enabled (self_collision=True).
+    #
+    # This preserves parity/performance characteristics of existing cases:
+    # contact-heavy cases run collisions; others skip the expensive pipeline.
+    collision_pipeline_enabled = bool(cfg.shape_contacts or ir_bool(ir, "self_collision"))
+    contacts = model.contacts() if collision_pipeline_enabled else None
 
     # Controller arrays
     ctrl_idx = ir["controller_idx"].astype(np.int64)
@@ -839,7 +847,7 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
                 with wp.ScopedDevice(model.device):
                     particle_grid.build(state_in.particle_q, radius=search_radius)
 
-            if shape_contacts_enabled:
+            if collision_pipeline_enabled:
                 assert contacts is not None
                 model.collide(state_in, contacts)
 
@@ -978,8 +986,9 @@ def save_results(
             "radius_max": float(np.max(model_result.radius)),
         },
         "contacts": {
-            "shape_contacts": cfg.shape_contacts,
-            "ground_plane": cfg.add_ground_plane,
+            "shape_contacts_requested": bool(cfg.shape_contacts),
+            "collision_pipeline_enabled": bool(cfg.shape_contacts or ir_bool(ir, "self_collision")),
+            "ground_plane": bool(cfg.add_ground_plane),
             "particle_contacts": model_result.checks.get(
                 "particle_contacts_enabled", False
             ),
