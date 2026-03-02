@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""Export a PhysTwin case into a Newton-oriented IR (Intermediate Representation).
+
+This script is the "PhysTwin -> Newton bridge" entry point.
+
+Inputs (from a PhysTwin case directory):
+- `final_data.pkl`: point clouds + controller trajectories (and various metadata)
+- `optimal_params.pkl`: CMA-ES results (used to overwrite config defaults)
+- `best.pth`: trained checkpoint containing per-spring parameters (and, in new runs, topology)
+- a config file (`.yaml`): training-time hyperparameters / simulation timing
+
+Output:
+- IR v2 `.npz` bundle (plus a small `.json` summary) consumed by `newton_import_ir.py`.
+
+Design notes:
+- Checkpoint-first topology: we require `best.pth` to contain `spring_edges` and
+  `spring_rest_lengths` so that learned `spring_Y[i]` is aligned with the spring edge
+  ordering. If the checkpoint does not contain topology, we *fail fast*.
+- Spring mapping: PhysTwin's "Y" parameter corresponds to Newton's spring stiffness
+  `ke` via `ke = Y / rest_length` when using the PhysTwin force form
+  `F = Y * (l/rest - 1) * n_hat`.
+"""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +34,7 @@ import torch
 
 
 def _parse_scalar(value: str):
+    """Parse a loose YAML-ish scalar string (fallback when PyYAML isn't available)."""
     raw = value.strip()
     lowered = raw.lower()
     if lowered in {"true", "false"}:
@@ -30,6 +52,11 @@ def _parse_scalar(value: str):
 
 
 def load_config(config_path: Path) -> dict:
+    """Load a config file as a dict.
+
+    Prefers PyYAML when available. Falls back to a very small `key: value` parser
+    so the bridge remains usable even without `pyyaml` installed.
+    """
     try:
         import yaml  # type: ignore
 
@@ -51,6 +78,7 @@ def load_config(config_path: Path) -> dict:
 
 
 def to_scalar(value, default: float) -> float:
+    """Convert tensor/ndarray/python scalar -> python float."""
     if value is None:
         return float(default)
     if isinstance(value, torch.Tensor):
@@ -67,6 +95,7 @@ def to_scalar(value, default: float) -> float:
 
 
 def to_array(value, dtype: np.dtype | type | None = None) -> np.ndarray:
+    """Convert tensor/ndarray/list -> numpy array (optionally casting dtype)."""
     if isinstance(value, torch.Tensor):
         array = value.detach().cpu().numpy()
     else:
@@ -77,6 +106,12 @@ def to_array(value, dtype: np.dtype | type | None = None) -> np.ndarray:
 
 
 def build_structure_points(final_data: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Build the particle set used by PhysTwin/bridge from `final_data.pkl`.
+
+    Returns:
+    - `structure_points`: object + surface + interior points (single frame)
+    - `controller_points`: controller trajectory `[frames, n_ctrl, 3]`
+    """
     object_points = np.asarray(final_data["object_points"], dtype=np.float32)
     surface_points = np.asarray(final_data["surface_points"], dtype=np.float32)
     interior_points = np.asarray(final_data["interior_points"], dtype=np.float32)
@@ -93,192 +128,14 @@ def build_structure_points(final_data: dict) -> tuple[np.ndarray, np.ndarray]:
     return structure_points, controller_points
 
 
-def build_springs_open3d(
-    structure_points: np.ndarray,
-    controller_points_0: np.ndarray | None,
-    object_radius: float,
-    object_max_neighbours: int,
-    controller_radius: float,
-    controller_max_neighbours: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    import open3d as o3d  # type: ignore
-
-    object_pcd = o3d.geometry.PointCloud()
-    object_pcd.points = o3d.utility.Vector3dVector(structure_points)
-    pcd_tree = o3d.geometry.KDTreeFlann(object_pcd)
-
-    points = np.asarray(object_pcd.points)
-    spring_flags = np.zeros((len(points), len(points)), dtype=np.uint8)
-    edges: list[list[int]] = []
-    rest_lengths: list[float] = []
-
-    for i in range(len(points)):
-        _, idx, _ = pcd_tree.search_hybrid_vector_3d(
-            points[i], object_radius, object_max_neighbours
-        )
-        idx = idx[1:]
-        for j in idx:
-            rest_length = float(np.linalg.norm(points[i] - points[j]))
-            if spring_flags[i, j] == 0 and spring_flags[j, i] == 0 and rest_length > 1e-4:
-                spring_flags[i, j] = 1
-                spring_flags[j, i] = 1
-                edges.append([i, j])
-                rest_lengths.append(rest_length)
-
-    num_object_springs = len(edges)
-
-    if controller_points_0 is not None and controller_points_0.shape[0] > 0:
-        num_object_points = len(points)
-        points = np.concatenate([points, controller_points_0], axis=0)
-        for i in range(controller_points_0.shape[0]):
-            _, idx, _ = pcd_tree.search_hybrid_vector_3d(
-                controller_points_0[i], controller_radius, controller_max_neighbours
-            )
-            for j in idx:
-                edges.append([num_object_points + i, j])
-                rest_lengths.append(
-                    float(np.linalg.norm(controller_points_0[i] - points[j]))
-                )
-
-    return (
-        points.astype(np.float32),
-        np.asarray(edges, dtype=np.int32),
-        np.asarray(rest_lengths, dtype=np.float32),
-        num_object_springs,
-    )
-
-
-def build_springs_bruteforce(
-    structure_points: np.ndarray,
-    controller_points_0: np.ndarray | None,
-    object_radius: float,
-    object_max_neighbours: int,
-    controller_radius: float,
-    controller_max_neighbours: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    points_object = structure_points.astype(np.float32)
-    object_count = points_object.shape[0]
-    object_radius_sq = float(object_radius) ** 2
-    controller_radius_sq = float(controller_radius) ** 2
-
-    spring_flags = np.zeros((object_count, object_count), dtype=np.uint8)
-    edges: list[list[int]] = []
-    rest_lengths: list[float] = []
-
-    for i in range(object_count):
-        deltas = points_object - points_object[i]
-        distances_sq = np.einsum("ij,ij->i", deltas, deltas)
-        candidate_indices = np.flatnonzero(distances_sq <= object_radius_sq)
-        candidate_indices = candidate_indices[
-            np.argsort(distances_sq[candidate_indices], kind="mergesort")
-        ]
-        if candidate_indices.size > object_max_neighbours:
-            candidate_indices = candidate_indices[:object_max_neighbours]
-        for j in candidate_indices:
-            if j == i:
-                continue
-            rest_length = float(np.sqrt(distances_sq[j]))
-            if spring_flags[i, j] == 0 and spring_flags[j, i] == 0 and rest_length > 1e-4:
-                spring_flags[i, j] = 1
-                spring_flags[j, i] = 1
-                edges.append([i, int(j)])
-                rest_lengths.append(rest_length)
-
-    num_object_springs = len(edges)
-    points_all = points_object
-
-    if controller_points_0 is not None and controller_points_0.shape[0] > 0:
-        points_all = np.concatenate([points_object, controller_points_0], axis=0)
-        for i in range(controller_points_0.shape[0]):
-            deltas = points_object - controller_points_0[i]
-            distances_sq = np.einsum("ij,ij->i", deltas, deltas)
-            candidate_indices = np.flatnonzero(distances_sq <= controller_radius_sq)
-            candidate_indices = candidate_indices[
-                np.argsort(distances_sq[candidate_indices], kind="mergesort")
-            ]
-            if candidate_indices.size > controller_max_neighbours:
-                candidate_indices = candidate_indices[:controller_max_neighbours]
-            for j in candidate_indices:
-                edges.append([object_count + i, int(j)])
-                rest_lengths.append(float(np.sqrt(distances_sq[j])))
-
-    return (
-        points_all.astype(np.float32),
-        np.asarray(edges, dtype=np.int32),
-        np.asarray(rest_lengths, dtype=np.float32),
-        num_object_springs,
-    )
-
-
-def build_springs(
-    structure_points: np.ndarray,
-    controller_points_0: np.ndarray | None,
-    object_radius: float,
-    object_max_neighbours: int,
-    controller_radius: float,
-    controller_max_neighbours: int,
-    topology_method: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
-    if topology_method == "open3d":
-        points, edges, rest, num_object_springs = build_springs_open3d(
-            structure_points=structure_points,
-            controller_points_0=controller_points_0,
-            object_radius=object_radius,
-            object_max_neighbours=object_max_neighbours,
-            controller_radius=controller_radius,
-            controller_max_neighbours=controller_max_neighbours,
-        )
-        return points, edges, rest, num_object_springs, "open3d"
-
-    if topology_method == "bruteforce":
-        points, edges, rest, num_object_springs = build_springs_bruteforce(
-            structure_points=structure_points,
-            controller_points_0=controller_points_0,
-            object_radius=object_radius,
-            object_max_neighbours=object_max_neighbours,
-            controller_radius=controller_radius,
-            controller_max_neighbours=controller_max_neighbours,
-        )
-        return points, edges, rest, num_object_springs, "bruteforce"
-
-    try:
-        points, edges, rest, num_object_springs = build_springs_bruteforce(
-            structure_points=structure_points,
-            controller_points_0=controller_points_0,
-            object_radius=object_radius,
-            object_max_neighbours=object_max_neighbours,
-            controller_radius=controller_radius,
-            controller_max_neighbours=controller_max_neighbours,
-        )
-        return points, edges, rest, num_object_springs, "bruteforce"
-    except Exception:
-        points, edges, rest, num_object_springs = build_springs_open3d(
-            structure_points=structure_points,
-            controller_points_0=controller_points_0,
-            object_radius=object_radius,
-            object_max_neighbours=object_max_neighbours,
-            controller_radius=controller_radius,
-            controller_max_neighbours=controller_max_neighbours,
-        )
-        return points, edges, rest, num_object_springs, "open3d"
-
-
 def parse_args() -> argparse.Namespace:
+    """CLI for exporting an IR bundle."""
     parser = argparse.ArgumentParser(
         description="Export a PhysTwin case to a Newton-oriented IR v2 .npz bundle."
     )
     parser.add_argument("--case-dir", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument(
-        "--topology-method",
-        choices=["auto", "open3d", "bruteforce"],
-        default="bruteforce",
-        help=(
-            "Spring topology reconstruction method. "
-            "Use 'bruteforce' for determinism (recommended for matching checkpoint spring_Y ordering)."
-        ),
-    )
     parser.add_argument(
         "--strict-phystwin",
         action=argparse.BooleanOptionalAction,
@@ -331,13 +188,17 @@ def main() -> int:
     config = load_config(config_path)
     optimal_params = dict(optimal_params)
     if "global_spring_Y" in optimal_params:
+        # Older PhysTwin checkpoints used `global_spring_Y`; normalize to the newer key.
         optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")
     config.update(optimal_params)
 
+    # Topology hyperparameters from PhysTwin config (stored in IR metadata).
     topology_object_radius = float(config.get("object_radius", 0.02))
     object_max_neighbours = int(config.get("object_max_neighbours", 30))
     topology_controller_radius = float(config.get("controller_radius", 0.04))
     controller_max_neighbours = int(config.get("controller_max_neighbours", 50))
+
+    # Collision radii: used by Newton importer to decide contact radii (separate from topology radii).
     collision_dist = float(config.get("collision_dist", topology_object_radius))
     collision_object_radius = float(
         config.get("collision_object_radius", collision_dist)
@@ -349,7 +210,11 @@ def main() -> int:
     structure_points, controller_traj = build_structure_points(final_data)
     controller_points_0 = controller_traj[0] if controller_traj.shape[1] > 0 else None
 
-    # Resolve topology: prefer checkpoint (exact), fall back to reconstruction.
+    # Resolve topology.
+    #
+    # We intentionally require checkpoint topology so that spring_Y aligns with the exact
+    # spring edge ordering used during training. Reconstructing edges would make spring_Y
+    # ambiguous and can silently corrupt the mapping.
     checkpoint_mass: np.ndarray | None = None
     if "spring_edges" in checkpoint and "spring_rest_lengths" in checkpoint:
         # New-style checkpoint: topology stored directly from training.
@@ -382,6 +247,7 @@ def main() -> int:
             "Re-train with updated PhysTwin (trainer_warp.py) that stores topology directly."
         )
 
+    # Learned spring parameter (PhysTwin): one scalar per spring edge.
     spring_y = checkpoint["spring_Y"]
     if isinstance(spring_y, torch.Tensor):
         spring_y = spring_y.detach().cpu().numpy()
@@ -406,8 +272,13 @@ def main() -> int:
         spring_ke_mode = "y_over_rest" if args.strict_phystwin else "raw"
 
     if spring_ke_mode == "raw":
+        # Directly treat PhysTwin's spring_Y as Newton spring_ke.
+        # Only valid if the force forms are already aligned upstream.
         spring_ke = spring_y.copy()
     elif spring_ke_mode == "y_over_rest":
+        # PhysTwin force: F = Y * (l/rest - 1) * n_hat
+        # Newton spring:  F = ke * (l - rest) * n_hat
+        # => ke = Y / rest
         safe_rest = np.maximum(rest_lengths, float(args.rest_length_eps))
         spring_ke = spring_y / safe_rest
     else:
@@ -445,10 +316,14 @@ def main() -> int:
             )
         mass = checkpoint_mass.astype(np.float32, copy=True)
     else:
+        # PhysTwin may store masses separately; when missing we default to 1.0 and rely on
+        # downstream code to interpret controller particles as kinematic.
         mass = np.ones((num_particles,), dtype=np.float32)
     # Keep controllers kinematic in Newton even if PhysTwin stores all-ones masses.
     mass[is_controller] = 0.0
 
+    # "Topology radius" describes the neighborhood size used to construct the spring graph.
+    # This is not necessarily the same as the collision/contact radius used for contacts.
     topology_radius = np.full((num_particles,), topology_object_radius, dtype=np.float32)
     if num_control_points > 0:
         topology_radius[num_object_points:] = topology_controller_radius
@@ -459,17 +334,21 @@ def main() -> int:
     if num_control_points > 0:
         collision_radius[num_object_points:] = collision_controller_radius
 
+    # Dashpot damping (Newton spring `kd`). PhysTwin uses a global `dashpot_damping` in config.
     spring_kd = np.full(
         (edges.shape[0],),
         float(config.get("dashpot_damping", 0.0)),
         dtype=np.float32,
     )
+    # Clamp range for PhysTwin spring Y (kept for diagnostics; checkpoint may already be clamped).
     spring_y_min = float(config.get("spring_Y_min", 0.0))
     spring_y_max = float(config.get("spring_Y_max", 1.0e5))
+    # Global drag damping used in PhysTwin (optional). Newton importer can emulate this.
     drag_damping = float(config.get("drag_damping", 0.0))
     spring_is_object = np.zeros((edges.shape[0],), dtype=np.bool_)
     spring_is_object[:num_object_springs] = True
 
+    # Timing / stepping parameters (used by importer defaults).
     sim_dt = float(config.get("dt", 5e-5))
     sim_substeps = int(config.get("num_substeps", 1))
     sim_fps = float(config.get("FPS", 30))
@@ -492,6 +371,7 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
+        # ---- Metadata / versioning ----
         ir_version=np.asarray(2, dtype=np.int32),
         case_name=np.asarray(case_dir.name),
         created_at_utc=np.asarray(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
@@ -499,16 +379,18 @@ def main() -> int:
         spring_ke_mode=np.asarray(spring_ke_mode),
         rest_length_eps=np.asarray(float(args.rest_length_eps), dtype=np.float32),
         topology_method=np.asarray(used_topology_method),
+        # ---- Particles ----
         x0=points_all.astype(np.float32),
         v0=np.zeros_like(points_all, dtype=np.float32),
         mass=mass,
-        # Backward-compat alias: legacy readers treat `radius` as particle contact radius.
+        # Backward-compat alias: legacy readers treat `radius` as per-particle collision/contact radius.
         radius=collision_radius,
         topology_radius=topology_radius,
         collision_radius=collision_radius,
         is_controller=is_controller,
         controller_idx=controller_idx,
         controller_traj=controller_traj.astype(np.float32),
+        # ---- Springs ----
         spring_edges=edges.astype(np.int32),
         spring_rest_length=rest_lengths.astype(np.float32),
         spring_y=spring_y.astype(np.float32),
@@ -521,7 +403,7 @@ def main() -> int:
         num_object_points=np.asarray(num_object_points, dtype=np.int32),
         num_control_points=np.asarray(num_control_points, dtype=np.int32),
         num_object_springs=np.asarray(num_object_springs, dtype=np.int32),
-        # Legacy scalar names preserved for topology reconstruction compatibility.
+        # ---- Legacy scalar names (kept for compatibility/debugging) ----
         object_radius=np.asarray(topology_object_radius, dtype=np.float32),
         object_max_neighbours=np.asarray(object_max_neighbours, dtype=np.int32),
         controller_radius=np.asarray(topology_controller_radius, dtype=np.float32),
@@ -530,6 +412,7 @@ def main() -> int:
         topology_controller_radius=np.asarray(topology_controller_radius, dtype=np.float32),
         collision_object_radius=np.asarray(collision_object_radius, dtype=np.float32),
         collision_controller_radius=np.asarray(collision_controller_radius, dtype=np.float32),
+        # ---- Simulation timing / contact knobs ----
         sim_dt=np.asarray(sim_dt, dtype=np.float32),
         sim_substeps=np.asarray(sim_substeps, dtype=np.int32),
         sim_fps=np.asarray(sim_fps, dtype=np.float32),

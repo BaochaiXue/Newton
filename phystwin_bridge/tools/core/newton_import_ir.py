@@ -310,6 +310,7 @@ def ir_version(ir: dict) -> int:
 
 
 def resolve_device(requested: str) -> str:
+    """Return a valid Warp device string, falling back to CPU if unavailable."""
     try:
         wp.get_device(requested)
         return requested
@@ -543,6 +544,8 @@ def _add_springs(builder: newton.ModelBuilder, ir: dict, cfg: SimConfig, checks:
         builder.add_spring(i=int(edges[i, 0]), j=int(edges[i, 1]),
                            ke=float(ke[i]), kd=float(kd[i]), control=0.0)
         if rest is not None:
+            # `add_spring()` appends one spring; overwrite its rest length in-place.
+            # This keeps spring force semantics aligned with PhysTwin/IR.
             builder.spring_rest_length[-1] = float(rest[i])
 
     checks["spring_ke_scale"] = cfg.spring_ke_scale
@@ -650,6 +653,9 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
     state_out = model.state()
     control = model.control()
     contacts = model.contacts()
+    # Collisions can be expensive. We only run collision detection if needed:
+    # - `shape_contacts=True` enables particle-vs-shape contacts (e.g., ground plane).
+    # - `self_collision=True` enables particle-vs-particle contacts.
     contacts_enabled = cfg.shape_contacts or ir_bool(ir, "self_collision")
 
     # Controller arrays
@@ -701,9 +707,14 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
     t0 = time.perf_counter()
     for frame in frame_range:
         for sub in range(substeps):
+            # Newton state stores force accumulators; clear them every substep so forces
+            # don't unintentionally persist across integration steps.
             state_in.clear_forces()
 
             if has_controllers:
+                # PhysTwin "control points" are position-driven. We replicate that by
+                # directly writing controller particle positions (and setting qd=0) so
+                # spring forces become the implicit interaction channel.
                 target = interpolate_controller(ctrl_traj, frame, sub, substeps, cfg.interpolate_controls)
                 ctrl_target_wp.assign(target.astype(np.float32, copy=False))
                 ctrl_vel_wp.assign(ctrl_vel_zero)
@@ -721,6 +732,8 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
             state_in, state_out = state_out, state_in
 
             if drag > 0.0:
+                # PhysTwin drag is a post-step velocity damping; Newton doesn't have
+                # an equivalent built-in knob, so we apply it explicitly here.
                 wp.launch(_apply_drag_correction, dim=n_obj,
                           inputs=[state_in.particle_q, state_in.particle_qd,
                                   n_obj, sim_dt, drag],

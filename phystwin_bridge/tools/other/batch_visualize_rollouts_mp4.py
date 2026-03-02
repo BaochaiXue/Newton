@@ -5,9 +5,16 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
-from path_defaults import default_python, resolve_overlay_base
+# Allow running this script directly from `tools/other/` while reusing shared
+# defaults/utilities that live under `tools/core/`.
+_CORE_DIR = Path(__file__).resolve().parents[1] / "core"
+if str(_CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(_CORE_DIR))
+
+from path_defaults import default_python, repo_root, resolve_overlay_base
 
 
 def _load_json(path: Path) -> dict:
@@ -87,14 +94,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    repo_root = Path(__file__).resolve().parents[2]
+    root = repo_root()
     outputs_root = (
-        (repo_root / args.outputs_root).resolve()
+        (root / args.outputs_root).resolve()
         if not args.outputs_root.is_absolute()
         else args.outputs_root.resolve()
     )
     cases_root = (
-        (repo_root / args.cases_root).resolve()
+        (root / args.cases_root).resolve()
         if not args.cases_root.is_absolute()
         else args.cases_root.resolve()
     )

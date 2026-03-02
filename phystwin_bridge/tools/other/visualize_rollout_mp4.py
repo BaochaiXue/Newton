@@ -13,6 +13,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+# Allow running this script directly from `tools/other/` while reusing shared
+# defaults/utilities that live under `tools/core/`.
+_CORE_DIR = Path(__file__).resolve().parents[1] / "core"
+if str(_CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(_CORE_DIR))
+
 from path_defaults import resolve_overlay_base
 
 

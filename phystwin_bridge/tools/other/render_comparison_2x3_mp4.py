@@ -6,11 +6,18 @@ import json
 import pickle
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 
-from path_defaults import default_python, resolve_overlay_base
+# Allow running this script directly from `tools/other/` while reusing shared
+# defaults/utilities that live under `tools/core/`.
+_CORE_DIR = Path(__file__).resolve().parents[1] / "core"
+if str(_CORE_DIR) not in sys.path:
+    sys.path.insert(0, str(_CORE_DIR))
+
+from path_defaults import default_python, repo_root, resolve_overlay_base
 
 
 def _load_json(path: Path) -> dict:
@@ -203,11 +210,11 @@ def main() -> int:
     rollout_npz = Path(str(report["rollout_npz"])).resolve()
     case_name = str(report["case_name"])
 
-    repo_root = Path(__file__).resolve().parents[2]
+    root = repo_root()
     case_dir = (
         args.case_dir.resolve()
         if args.case_dir is not None
-        else (repo_root / "phystwin_bridge" / "inputs" / "cases" / case_name).resolve()
+        else (root / "phystwin_bridge" / "inputs" / "cases" / case_name).resolve()
     )
     if not case_dir.exists():
         raise FileNotFoundError(f"Missing case-dir: {case_dir}")

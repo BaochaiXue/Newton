@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""Run a Newton rollout from an IR and validate against PhysTwin baselines.
+
+This is a thin orchestration layer around `newton_import_ir.py`:
+- Runs the importer to generate rollout outputs (`.npz` + `.json`) unless `--skip-run`.
+- Loads PhysTwin inference (if available) to compute a per-frame RMSE curve.
+- Optionally loads GT from `final_data.pkl` to compute a Chamfer-to-GT curve.
+- Produces a single PASS/FAIL report JSON used by the pipeline and meeting plots.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,10 +16,12 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
-from path_defaults import default_device, default_python
+from path_defaults import bridge_root, default_device, default_python
 
 
 DEFAULT_THRESHOLDS = {
+    # Defaults are intentionally loose; most runs override per-case values via
+    # `inputs/configs/parity_thresholds.yaml` (or CLI flags).
     "max_x0_rmse": 1e-6,
     "max_rmse_mean": 0.05,
     "max_rmse_max": 0.1,
@@ -21,15 +31,18 @@ DEFAULT_THRESHOLDS = {
 
 
 def _default_importer() -> Path:
+    """Default to the colocated importer under `tools/core/`."""
     return Path(__file__).resolve().with_name("newton_import_ir.py")
 
 
 def _default_threshold_config() -> Path | None:
-    candidate = Path(__file__).resolve().parents[1] / "inputs" / "configs" / "parity_thresholds.yaml"
+    """Best-effort resolve of the repo's default threshold config."""
+    candidate = bridge_root() / "inputs" / "configs" / "parity_thresholds.yaml"
     return candidate if candidate.exists() else None
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI args for validation + importer pass-through."""
     parser = argparse.ArgumentParser(
         description=(
             "Run a native Newton semi-implicit rollout and validate "
@@ -340,12 +353,16 @@ def _apply_threshold_overrides(target: dict[str, float], source: dict, origin: s
 def _resolve_thresholds(
     args: argparse.Namespace, case_name: str | None
 ) -> tuple[dict[str, float], list[dict], Path | None]:
+    """Resolve thresholds from (config file) + (case overrides) + (CLI overrides)."""
     thresholds = dict(DEFAULT_THRESHOLDS)
     applied: list[dict] = []
     config_path = args.threshold_config.resolve() if args.threshold_config is not None else None
 
     if config_path is not None:
         config_data = _load_structured_config(config_path)
+        # Config can be either:
+        # - flat mapping (legacy): keys are threshold names
+        # - structured mapping: {defaults: {...}, cases: {case_name: {...}}}
         has_sections = "defaults" in config_data or "cases" in config_data
         defaults = config_data.get("defaults", {}) if has_sections else config_data
         if defaults is not None:
@@ -392,6 +409,7 @@ def _build_importer_cmd(
     ir_path: Path,
     out_dir: Path,
 ) -> list[str]:
+    """Build the subprocess command that runs the importer with pass-through args."""
     cmd = [
         args.python,
         str(args.importer),
@@ -472,14 +490,17 @@ def main() -> int:
 
     ir = _load_ir(ir_path)
     case_name = _resolve_case_name(args=args, ir=ir)
+    # Baselines are optional, but without inference the RMSE-based checks will be N/A.
     inference_path = _resolve_inference_path(args=args, ir_path=ir_path, ir=ir)
     inference = _load_inference(inference_path)
+    # GT metrics are optional and require SciPy (for cKDTree) if enabled.
     final_data_path = _resolve_final_data_path(args=args, ir_path=ir_path, ir=ir)
     gt_points, gt_mask = _load_gt_from_final_data(
         path=final_data_path,
         use_mask=bool(args.gt_use_mask),
     )
     x0_rmse = _compute_x0_rmse(ir=ir, inference=inference)
+    # Thresholds come from defaults, then optional config file, then CLI overrides.
     thresholds, threshold_overrides, threshold_config_path = _resolve_thresholds(
         args=args,
         case_name=case_name,
@@ -487,6 +508,7 @@ def main() -> int:
 
     importer_cmd = _build_importer_cmd(args=args, ir_path=ir_path, out_dir=out_dir)
     if not args.skip_run:
+        # The importer produces `<prefix>.npz` + `<prefix>.json` in `out_dir`.
         subprocess.run(importer_cmd, check=True)
 
     rollout_json_path = out_dir / f"{args.output_prefix}.json"
@@ -501,7 +523,9 @@ def main() -> int:
     with rollout_json_path.open("r", encoding="utf-8") as handle:
         rollout_summary = json.load(handle)
     with np.load(rollout_npz_path) as data:
+        # `rmse_per_frame` is computed by the importer vs PhysTwin inference (if provided).
         rmse_curve = data["rmse_per_frame"].astype(np.float32)
+        # Used for optional GT (Chamfer) comparison below.
         rollout_object = data["particle_q_object"].astype(np.float32)
 
     _write_rmse_curve_csv(rmse_curve=rmse_curve, csv_path=rmse_curve_csv_path)
