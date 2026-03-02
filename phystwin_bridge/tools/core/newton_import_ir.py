@@ -110,7 +110,7 @@ class SimConfig:
     strict_physics_checks: bool = True
 
     # Drag
-    apply_drag: bool = False
+    apply_drag: bool = True
     drag_damping_scale: float = 1.0
 
     # Friction / restitution
@@ -245,7 +245,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--strict-physics-checks", action=argparse.BooleanOptionalAction, default=True
     )
-    p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drag-damping-scale", type=float, default=1.0)
 
     # Friction / restitution

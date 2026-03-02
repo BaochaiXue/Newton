@@ -137,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--apply-drag",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Enable PhysTwin-style drag in the importer.",
     )
     parser.add_argument("--drag-damping-scale", type=float, default=1.0)
