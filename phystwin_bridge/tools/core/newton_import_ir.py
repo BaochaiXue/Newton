@@ -48,6 +48,7 @@ IR_COLLISION_RADIUS_KEY = "collision_radius"
 EPSILON = 1e-12  # safe-division floor
 STRICT_KE_REL_TOL = 1e-4  # max relative error for ke consistency
 KINEMATIC_MASS_TOL = 1e-8  # controllers must have |mass| below this
+RESTITUTION_EPS = 1e-4  # avoid log(0) in restitution -> damping-ratio mapping
 
 # Contact clamping
 MU_MAX = 2.0
@@ -106,6 +107,8 @@ class SimConfig:
     particle_contacts: bool | None = None
     particle_contact_radius: float = 1e-5
     object_contact_radius: float | None = None
+    particle_contact_ke: float | None = None
+    particle_contact_kf_scale: float = 1.0
 
     # Controls
     interpolate_controls: bool = True
@@ -150,6 +153,8 @@ class SimConfig:
             particle_contacts=args.particle_contacts,
             particle_contact_radius=args.particle_contact_radius,
             object_contact_radius=args.object_contact_radius,
+            particle_contact_ke=args.particle_contact_ke,
+            particle_contact_kf_scale=args.particle_contact_kf_scale,
             interpolate_controls=args.interpolate_controls,
             strict_physics_checks=args.strict_physics_checks,
             apply_drag=args.apply_drag,
@@ -276,6 +281,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Optional override for object particle collision radius (does not affect controllers).",
+    )
+    p.add_argument(
+        "--particle-contact-ke",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for Newton particle contact stiffness (model.particle_ke) when "
+            "mapping PhysTwin collide_object_* parameters."
+        ),
+    )
+    p.add_argument(
+        "--particle-contact-kf-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scales Newton particle tangential friction stiffness: particle_kf = "
+            "particle_contact_kf_scale * particle_kd."
+        ),
     )
 
     # Controls / validation / drag
@@ -423,12 +446,17 @@ def _validate_config_ranges(cfg: SimConfig) -> None:
         ("--friction-smoothing", cfg.friction_smoothing, ">", 0.0),
         ("--ground-mu-scale", cfg.ground_mu_scale, ">=", 0.0),
         ("--ground-restitution-scale", cfg.ground_restitution_scale, ">=", 0.0),
+        ("--particle-contact-kf-scale", cfg.particle_contact_kf_scale, ">=", 0.0),
     }
     for name, value, op, bound in checks:
         if op == ">" and value <= bound:
             raise ValueError(f"{name} must be > {bound}, got {value}")
         if op == ">=" and value < bound:
             raise ValueError(f"{name} must be >= {bound}, got {value}")
+    if cfg.particle_contact_ke is not None and cfg.particle_contact_ke <= 0.0:
+        raise ValueError(
+            f"--particle-contact-ke must be > 0 when provided, got {cfg.particle_contact_ke}"
+        )
 
 
 def validate_ir_physics(ir: dict, cfg: SimConfig) -> dict:
@@ -666,6 +694,84 @@ def _add_ground_plane(
     checks["ground_restitution"] = float(gcfg.restitution)
 
 
+def _restitution_to_damping_ratio(restitution: float) -> float:
+    """Map coefficient of restitution `e` to equivalent damping ratio `zeta`.
+
+    For an underdamped 2nd-order system:
+      e = exp(-zeta*pi/sqrt(1-zeta^2))
+      => zeta = -ln(e)/sqrt(pi^2 + ln(e)^2)
+    """
+    e = float(np.clip(restitution, RESTITUTION_EPS, 1.0 - RESTITUTION_EPS))
+    ln_e = float(np.log(e))
+    return float(-ln_e / np.sqrt(np.pi * np.pi + ln_e * ln_e))
+
+
+def _resolve_object_mass_reference(ir: dict) -> float:
+    """Return a robust object-particle mass reference for contact mapping."""
+    n_obj = int(np.asarray(ir["num_object_points"]).ravel()[0])
+    mass = np.asarray(ir["mass"], dtype=np.float64).ravel()
+    if mass.shape[0] < n_obj:
+        raise ValueError(f"mass length {mass.shape[0]} < num_object_points {n_obj}")
+    obj_mass = mass[:n_obj]
+    positive = obj_mass[obj_mass > EPSILON]
+    if positive.size == 0:
+        return 1.0
+    return float(np.median(positive))
+
+
+def _apply_ps_object_collision_mapping(
+    model: newton.Model, ir: dict, cfg: SimConfig, checks: dict
+) -> bool:
+    """Map PhysTwin collide_object_{elas,fric} to Newton particle contact params.
+
+    This is an approximation bridge:
+    - PhysTwin uses impulse-style pairwise collision response.
+    - Newton SemiImplicit uses penalty-force particle contacts.
+    """
+    if (
+        "contact_collide_object_elas" not in ir
+        and "contact_collide_object_fric" not in ir
+    ):
+        return False
+
+    elas_raw = ir_scalar(ir, "contact_collide_object_elas", default=0.7)
+    fric_raw = ir_scalar(ir, "contact_collide_object_fric", default=0.3)
+
+    # 1) Friction coefficient maps directly.
+    mu = float(np.clip(fric_raw, 0.0, MU_MAX))
+
+    # 2) Restitution maps to damping ratio, then kd via critical damping form:
+    #    kd = 2*zeta*sqrt(ke*m_eff_ref)
+    zeta = _restitution_to_damping_ratio(elas_raw)
+    ke = (
+        float(cfg.particle_contact_ke)
+        if cfg.particle_contact_ke is not None
+        else float(model.particle_ke)
+    )
+    ke = max(ke, EPSILON)
+    m_ref = _resolve_object_mass_reference(ir)
+    m_eff_ref = max(0.5 * m_ref, EPSILON)  # equal-mass pair effective mass
+    kd = 2.0 * zeta * np.sqrt(ke * m_eff_ref)
+    kf = cfg.particle_contact_kf_scale * kd
+
+    model.particle_ke = float(ke)
+    model.particle_kd = float(max(kd, 0.0))
+    model.particle_kf = float(max(kf, 0.0))
+    if cfg.particle_mu_override is None:
+        model.particle_mu = mu
+
+    checks["particle_contact_param_source"] = "ps_object_collision_map"
+    checks["contact_collide_object_elas_raw"] = float(elas_raw)
+    checks["contact_collide_object_fric_raw"] = float(fric_raw)
+    checks["particle_contact_map_zeta"] = float(zeta)
+    checks["particle_contact_map_m_eff_ref"] = float(m_eff_ref)
+    checks["particle_contact_map_ke"] = float(model.particle_ke)
+    checks["particle_contact_map_kd"] = float(model.particle_kd)
+    checks["particle_contact_map_kf"] = float(model.particle_kf)
+    checks["particle_contact_map_mu"] = float(model.particle_mu)
+    return True
+
+
 def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     """Build a complete Newton Model from IR data.
 
@@ -702,14 +808,22 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     _, gravity_vec = resolve_gravity(cfg, ir)
     model.set_gravity(gravity_vec)
 
-    # Particle friction
+    # Optional mapping from PhysTwin object-collision params to Newton particle-contact params.
+    object_collision_mapped = _apply_ps_object_collision_mapping(model, ir, cfg, checks)
+
+    # Particle friction fallback/override.
     if cfg.particle_mu_override is not None:
         model.particle_mu = float(np.clip(cfg.particle_mu_override, 0, MU_MAX))
-    elif "contact_collide_fric" in ir:
+    elif (not object_collision_mapped) and "contact_collide_fric" in ir:
         model.particle_mu = float(
             np.clip(ir_scalar(ir, "contact_collide_fric"), 0, MU_MAX)
         )
 
+    checks.setdefault("particle_contact_param_source", "newton_default")
+    checks["particle_contact_final_ke"] = float(model.particle_ke)
+    checks["particle_contact_final_kd"] = float(model.particle_kd)
+    checks["particle_contact_final_kf"] = float(model.particle_kf)
+    checks["particle_contact_final_mu"] = float(model.particle_mu)
     checks["particle_contacts_enabled"] = particle_contact_kernel
     checks["collision_radius_source"] = radius_src
 
@@ -970,6 +1084,8 @@ def save_results(
             "disable_particle_contact_kernel": cfg.disable_particle_contact_kernel,
             "particle_contact_radius": cfg.particle_contact_radius,
             "object_contact_radius": cfg.object_contact_radius,
+            "particle_contact_ke": cfg.particle_contact_ke,
+            "particle_contact_kf_scale": cfg.particle_contact_kf_scale,
             "particle_mu_override": cfg.particle_mu_override,
             "ground_mu_scale": cfg.ground_mu_scale,
             "ground_restitution_scale": cfg.ground_restitution_scale,

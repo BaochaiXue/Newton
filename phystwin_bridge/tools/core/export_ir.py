@@ -13,9 +13,12 @@ Output:
 - IR v2 `.npz` bundle (plus a small `.json` summary) consumed by `newton_import_ir.py`.
 
 Design notes:
-- Checkpoint-first topology: we require `best.pth` to contain `spring_edges` and
-  `spring_rest_lengths` so that learned `spring_Y[i]` is aligned with the spring edge
-  ordering. If the checkpoint does not contain topology, we *fail fast*.
+- Checkpoint-first topology: when available, we read `spring_edges` and
+  `spring_rest_lengths` directly from `best.pth` so learned `spring_Y[i]` stays
+  aligned with spring edge ordering.
+- Topology is mandatory: checkpoints without stored topology are rejected. In
+  that case you must rerun PhysTwin optimize/train/infer to produce a new
+  checkpoint that stores topology directly.
 - IR schema: we export an explicit per-particle `collision_radius` field and avoid
   ambiguous legacy conventions where a single `radius` could refer to topology vs
   contact radius.
@@ -97,6 +100,35 @@ def to_scalar(value, default: float) -> float:
     return float(value)
 
 
+def resolve_scalar_from_sources(
+    key: str,
+    checkpoint: dict,
+    optimal_params: dict,
+    config: dict,
+    default: float,
+) -> tuple[float, str]:
+    """Resolve a scalar with explicit source priority.
+
+    Priority:
+    1) checkpoint (`best.pth`)
+    2) optimization result (`optimal_params.pkl`)
+    3) merged config
+    4) hardcoded default
+    """
+    sources = [
+        ("checkpoint", checkpoint.get(key)),
+        ("optimal_params", optimal_params.get(key)),
+        ("config", config.get(key)),
+    ]
+    for source_name, raw in sources:
+        if raw is None:
+            continue
+        value = to_scalar(raw, default)
+        if np.isfinite(value):
+            return float(value), source_name
+    return float(default), "default"
+
+
 def to_array(value, dtype: np.dtype | type | None = None) -> np.ndarray:
     """Convert tensor/ndarray/list -> numpy array (optionally casting dtype)."""
     if isinstance(value, torch.Tensor):
@@ -144,8 +176,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Enable strict PhysTwin-aligned defaults and checks. "
-            "When enabled, spring_ke defaults to spring_Y/rest_length."
+            "Compatibility flag kept for pipeline parity. "
+            "When spring-ke-mode is unset, strict mode defaults to y_over_rest."
         ),
     )
     parser.add_argument(
@@ -195,8 +227,7 @@ def main() -> int:
         optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")
     config.update(optimal_params)
 
-    # Topology radii from PhysTwin config.
-    # Topology edges come from checkpoint fields; these radii are kept as metadata/defaults.
+    # Topology radii from PhysTwin config. Topology itself must be loaded from checkpoint.
     topology_object_radius = float(config.get("object_radius", 0.02))
     topology_controller_radius = float(config.get("controller_radius", 0.04))
 
@@ -212,48 +243,44 @@ def main() -> int:
     structure_points, controller_traj = build_structure_points(final_data)
     controller_points_0 = controller_traj[0] if controller_traj.shape[1] > 0 else None
 
-    # Resolve topology.
-    #
-    # We intentionally require checkpoint topology so that spring_Y aligns with the exact
-    # spring edge ordering used during training. Reconstructing edges would make spring_Y
-    # ambiguous and can silently corrupt the mapping.
-    checkpoint_mass: np.ndarray | None = None
-    if "spring_edges" in checkpoint and "spring_rest_lengths" in checkpoint:
-        # New-style checkpoint: topology stored directly from training.
-        edges = to_array(checkpoint["spring_edges"], np.int32)
-        rest_lengths = to_array(checkpoint["spring_rest_lengths"], np.float32).reshape(-1)
-        if edges.ndim != 2 or edges.shape[1] != 2:
-            raise ValueError(f"Expected checkpoint spring_edges shape [N, 2], got {edges.shape}")
-        if rest_lengths.shape[0] != edges.shape[0]:
-            raise ValueError(
-                "Checkpoint spring_rest_lengths length mismatch: "
-                f"rest={rest_lengths.shape[0]}, edges={edges.shape[0]}"
-            )
-        num_object_springs = int(checkpoint.get("num_object_springs", edges.shape[0]))
-        if "init_vertices" in checkpoint:
-            points_all = to_array(checkpoint["init_vertices"], np.float32)
-            if points_all.ndim != 2 or points_all.shape[1] != 3:
-                raise ValueError(
-                    f"Expected checkpoint init_vertices shape [N, 3], got {points_all.shape}"
-                )
-        else:
-            points_all = np.concatenate(
-                [structure_points, controller_points_0], axis=0
-            ).astype(np.float32) if controller_points_0 is not None else structure_points.astype(np.float32)
-        if "init_masses" in checkpoint:
-            checkpoint_mass = to_array(checkpoint["init_masses"], np.float32).reshape(-1)
-        used_topology_method = "checkpoint"
-    else:
-        raise ValueError(
-            "Checkpoint is missing spring topology fields ('spring_edges', 'spring_rest_lengths'). "
-            "Re-train with updated PhysTwin (trainer_warp.py) that stores topology directly."
-        )
-
     # Learned spring parameter (PhysTwin): one scalar per spring edge.
     spring_y = checkpoint["spring_Y"]
     if isinstance(spring_y, torch.Tensor):
         spring_y = spring_y.detach().cpu().numpy()
     spring_y = np.asarray(spring_y, dtype=np.float32).reshape(-1)
+
+    # Resolve topology strictly from checkpoint.
+    checkpoint_mass: np.ndarray | None = None
+    if "spring_edges" not in checkpoint or "spring_rest_lengths" not in checkpoint:
+        raise ValueError(
+            "Checkpoint is missing required topology fields ('spring_edges', 'spring_rest_lengths'). "
+            "Do not reconstruct topology from legacy checkpoints. "
+            "Rerun PhysTwin optimize/train/infer and use the new checkpoint."
+        )
+
+    edges = to_array(checkpoint["spring_edges"], np.int32)
+    rest_lengths = to_array(checkpoint["spring_rest_lengths"], np.float32).reshape(-1)
+    if edges.ndim != 2 or edges.shape[1] != 2:
+        raise ValueError(f"Expected checkpoint spring_edges shape [N, 2], got {edges.shape}")
+    if rest_lengths.shape[0] != edges.shape[0]:
+        raise ValueError(
+            "Checkpoint spring_rest_lengths length mismatch: "
+            f"rest={rest_lengths.shape[0]}, edges={edges.shape[0]}"
+        )
+    num_object_springs = int(checkpoint.get("num_object_springs", edges.shape[0]))
+    if "init_vertices" in checkpoint:
+        points_all = to_array(checkpoint["init_vertices"], np.float32)
+        if points_all.ndim != 2 or points_all.shape[1] != 3:
+            raise ValueError(
+                f"Expected checkpoint init_vertices shape [N, 3], got {points_all.shape}"
+            )
+    else:
+        points_all = np.concatenate(
+            [structure_points, controller_points_0], axis=0
+        ).astype(np.float32) if controller_points_0 is not None else structure_points.astype(np.float32)
+    if "init_masses" in checkpoint:
+        checkpoint_mass = to_array(checkpoint["init_masses"], np.float32).reshape(-1)
+    used_topology_method = "checkpoint_direct"
     if spring_y.shape[0] != edges.shape[0]:
         raise ValueError(
             f"Spring count mismatch: checkpoint={spring_y.shape[0]}, topology={edges.shape[0]}"
@@ -345,11 +372,36 @@ def main() -> int:
     sim_fps = float(config.get("FPS", 30))
     self_collision = bool(config.get("self_collision", False))
 
-    collide_elas = to_scalar(
-        checkpoint.get("collide_elas"), config.get("collide_elas", 0.5)
+    collide_elas, collide_elas_source = resolve_scalar_from_sources(
+        key="collide_elas",
+        checkpoint=checkpoint,
+        optimal_params=optimal_params,
+        config=config,
+        default=0.5,
     )
-    collide_fric = to_scalar(
-        checkpoint.get("collide_fric"), config.get("collide_fric", 0.3)
+    collide_fric, collide_fric_source = resolve_scalar_from_sources(
+        key="collide_fric",
+        checkpoint=checkpoint,
+        optimal_params=optimal_params,
+        config=config,
+        default=0.3,
+    )
+    # PhysTwin particle-particle collision parameters (impulse model).
+    # Keep them as optional IR fields so Newton-side experiments can map them
+    # to SemiImplicit particle-contact coefficients when explicitly enabled.
+    collide_object_elas, collide_object_elas_source = resolve_scalar_from_sources(
+        key="collide_object_elas",
+        checkpoint=checkpoint,
+        optimal_params=optimal_params,
+        config=config,
+        default=0.7,
+    )
+    collide_object_fric, collide_object_fric_source = resolve_scalar_from_sources(
+        key="collide_object_fric",
+        checkpoint=checkpoint,
+        optimal_params=optimal_params,
+        config=config,
+        default=0.3,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -386,6 +438,9 @@ def main() -> int:
         contact_collide_elas=np.asarray(collide_elas, dtype=np.float32),
         contact_collide_fric=np.asarray(collide_fric, dtype=np.float32),
         contact_collision_dist=np.asarray(collision_dist, dtype=np.float32),
+        # Optional PhysTwin particle-particle collision parameters.
+        contact_collide_object_elas=np.asarray(collide_object_elas, dtype=np.float32),
+        contact_collide_object_fric=np.asarray(collide_object_fric, dtype=np.float32),
     )
 
     summary = {
@@ -416,6 +471,12 @@ def main() -> int:
         "sim_substeps": sim_substeps,
         "sim_fps": sim_fps,
         "self_collision": bool(self_collision),
+        "contact_collide_elas_source": collide_elas_source,
+        "contact_collide_fric_source": collide_fric_source,
+        "contact_collide_object_elas": float(collide_object_elas),
+        "contact_collide_object_fric": float(collide_object_fric),
+        "contact_collide_object_elas_source": collide_object_elas_source,
+        "contact_collide_object_fric_source": collide_object_fric_source,
     }
     summary_path = output_path.with_suffix(".json")
     with summary_path.open("w", encoding="utf-8") as handle:

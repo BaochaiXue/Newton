@@ -127,6 +127,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--particle-contact-radius", type=float, default=1e-5)
     parser.add_argument(
+        "--particle-contact-ke",
+        type=float,
+        default=None,
+        help="Pass-through to importer: override model.particle_ke for object-collision mapping.",
+    )
+    parser.add_argument(
+        "--particle-contact-kf-scale",
+        type=float,
+        default=1.0,
+        help="Pass-through to importer: particle_kf = particle_contact_kf_scale * particle_kd.",
+    )
+    parser.add_argument(
         "--object-contact-radius",
         type=float,
         default=None,
@@ -439,11 +451,14 @@ def _build_importer_cmd(
         "--device", args.device,
         "--up-axis", args.up_axis,
         "--particle-contact-radius", str(args.particle_contact_radius),
+        "--particle-contact-kf-scale", str(args.particle_contact_kf_scale),
         "--gravity-mag", str(args.gravity_mag),
         "--ground-mu-scale", str(args.ground_mu_scale),
         "--ground-restitution-scale", str(args.ground_restitution_scale),
         "--drag-damping-scale", str(args.drag_damping_scale),
     ]
+    if args.particle_contact_ke is not None:
+        cmd.extend(["--particle-contact-ke", str(args.particle_contact_ke)])
     if args.object_contact_radius is not None:
         cmd.extend(["--object-contact-radius", str(args.object_contact_radius)])
     if args.substeps_per_frame is not None:
