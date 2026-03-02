@@ -42,19 +42,19 @@ def _parse_camera_indices(value: str) -> list[int]:
     return indices
 
 
-def _load_rollout_frames(npz_path: Path) -> tuple[np.ndarray, int]:
+def _load_rollout_frame_count(npz_path: Path) -> int:
     if not npz_path.exists():
         raise FileNotFoundError(f"Missing rollout npz: {npz_path}")
     with np.load(npz_path, allow_pickle=False) as data:
         if "particle_q_object" in data:
-            positions = data["particle_q_object"].astype(np.float32)
+            positions = data["particle_q_object"]
         elif "particle_q_all" in data:
-            positions = data["particle_q_all"].astype(np.float32)
+            positions = data["particle_q_all"]
         else:
             raise KeyError(f"{npz_path} missing particle positions")
     if positions.ndim != 3 or positions.shape[-1] != 3:
         raise ValueError(f"Unexpected rollout shape in {npz_path}: {positions.shape}")
-    return positions, int(positions.shape[0])
+    return int(positions.shape[0])
 
 
 def _load_inference(path: Path) -> np.ndarray:
@@ -231,7 +231,7 @@ def main() -> int:
     visualizer = args.visualizer.resolve()
     python = str(args.python)
 
-    rollout_positions, rollout_frames = _load_rollout_frames(rollout_npz)
+    rollout_frames = _load_rollout_frame_count(rollout_npz)
     inference_positions = _load_inference(inference_pkl)
     frames_to_render = min(int(rollout_frames), int(inference_positions.shape[0]))
     if frames_to_render <= 0:

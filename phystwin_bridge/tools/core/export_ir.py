@@ -192,7 +192,8 @@ def main() -> int:
         optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")
     config.update(optimal_params)
 
-    # Topology hyperparameters from PhysTwin config (stored in IR metadata).
+    # Topology hyperparameters from PhysTwin config.
+    # These are exported as metadata only (topology itself comes from checkpoint fields).
     topology_object_radius = float(config.get("object_radius", 0.02))
     object_max_neighbours = int(config.get("object_max_neighbours", 30))
     topology_controller_radius = float(config.get("controller_radius", 0.04))
@@ -254,12 +255,12 @@ def main() -> int:
     spring_y = np.asarray(spring_y, dtype=np.float32).reshape(-1)
     if spring_y.shape[0] != edges.shape[0]:
         raise ValueError(
-            f"Spring count mismatch: checkpoint={spring_y.shape[0]}, reconstructed={edges.shape[0]}"
+            f"Spring count mismatch: checkpoint={spring_y.shape[0]}, topology={edges.shape[0]}"
         )
     if rest_lengths.shape[0] != edges.shape[0]:
         raise ValueError(
             "Rest-length count mismatch: "
-            f"rest_lengths={rest_lengths.shape[0]}, reconstructed={edges.shape[0]}"
+            f"rest_lengths={rest_lengths.shape[0]}, topology={edges.shape[0]}"
         )
     if not np.all(np.isfinite(rest_lengths)):
         raise ValueError("Non-finite spring rest lengths detected.")
@@ -291,7 +292,7 @@ def main() -> int:
     if checkpoint_num_object_springs != num_object_springs:
         raise ValueError(
             "Object spring count mismatch: "
-            f"checkpoint={checkpoint_num_object_springs}, reconstructed={num_object_springs}"
+            f"checkpoint={checkpoint_num_object_springs}, topology={num_object_springs}"
         )
 
     num_object_points = structure_points.shape[0]
