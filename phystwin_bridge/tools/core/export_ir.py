@@ -16,6 +16,9 @@ Design notes:
 - Checkpoint-first topology: we require `best.pth` to contain `spring_edges` and
   `spring_rest_lengths` so that learned `spring_Y[i]` is aligned with the spring edge
   ordering. If the checkpoint does not contain topology, we *fail fast*.
+- IR schema: we export an explicit per-particle `collision_radius` field and avoid
+  ambiguous legacy conventions where a single `radius` could refer to topology vs
+  contact radius.
 - Spring mapping: PhysTwin's "Y" parameter corresponds to Newton's spring stiffness
   `ke` via `ke = Y / rest_length` when using the PhysTwin force form
   `F = Y * (l/rest - 1) * n_hat`.
@@ -192,12 +195,10 @@ def main() -> int:
         optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")
     config.update(optimal_params)
 
-    # Topology hyperparameters from PhysTwin config.
-    # These are exported as metadata only (topology itself comes from checkpoint fields).
+    # Topology radii from PhysTwin config.
+    # Topology edges come from checkpoint fields; these radii are kept as metadata/defaults.
     topology_object_radius = float(config.get("object_radius", 0.02))
-    object_max_neighbours = int(config.get("object_max_neighbours", 30))
     topology_controller_radius = float(config.get("controller_radius", 0.04))
-    controller_max_neighbours = int(config.get("controller_max_neighbours", 50))
 
     # Collision radii: used by Newton importer to decide contact radii (separate from topology radii).
     collision_dist = float(config.get("collision_dist", topology_object_radius))
@@ -304,9 +305,6 @@ def main() -> int:
             f"from vertices={num_control_points}, from final_data={controller_traj.shape[1]}"
         )
 
-    is_controller = np.zeros((num_particles,), dtype=np.bool_)
-    if num_control_points > 0:
-        is_controller[num_object_points:] = True
     controller_idx = np.arange(num_object_points, num_particles, dtype=np.int32)
 
     if checkpoint_mass is not None:
@@ -321,13 +319,7 @@ def main() -> int:
         # downstream code to interpret controller particles as kinematic.
         mass = np.ones((num_particles,), dtype=np.float32)
     # Keep controllers kinematic in Newton even if PhysTwin stores all-ones masses.
-    mass[is_controller] = 0.0
-
-    # "Topology radius" describes the neighborhood size used to construct the spring graph.
-    # This is not necessarily the same as the collision/contact radius used for contacts.
-    topology_radius = np.full((num_particles,), topology_object_radius, dtype=np.float32)
-    if num_control_points > 0:
-        topology_radius[num_object_points:] = topology_controller_radius
+    mass[controller_idx] = 0.0
 
     collision_radius = np.full(
         (num_particles,), collision_object_radius, dtype=np.float32
@@ -346,14 +338,11 @@ def main() -> int:
     spring_y_max = float(config.get("spring_Y_max", 1.0e5))
     # Global drag damping used in PhysTwin (optional). Newton importer can emulate this.
     drag_damping = float(config.get("drag_damping", 0.0))
-    spring_is_object = np.zeros((edges.shape[0],), dtype=np.bool_)
-    spring_is_object[:num_object_springs] = True
 
     # Timing / stepping parameters (used by importer defaults).
     sim_dt = float(config.get("dt", 5e-5))
     sim_substeps = int(config.get("num_substeps", 1))
     sim_fps = float(config.get("FPS", 30))
-    frame_dt = float(1.0 / sim_fps) if sim_fps > 0 else float(sim_dt * sim_substeps)
     self_collision = bool(config.get("self_collision", False))
 
     collide_elas = to_scalar(
@@ -361,12 +350,6 @@ def main() -> int:
     )
     collide_fric = to_scalar(
         checkpoint.get("collide_fric"), config.get("collide_fric", 0.3)
-    )
-    collide_object_elas = to_scalar(
-        checkpoint.get("collide_object_elas"), config.get("collide_object_elas", 0.7)
-    )
-    collide_object_fric = to_scalar(
-        checkpoint.get("collide_object_fric"), config.get("collide_object_fric", 0.3)
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,46 +367,24 @@ def main() -> int:
         x0=points_all.astype(np.float32),
         v0=np.zeros_like(points_all, dtype=np.float32),
         mass=mass,
-        # Backward-compat alias: legacy readers treat `radius` as per-particle collision/contact radius.
-        radius=collision_radius,
-        topology_radius=topology_radius,
         collision_radius=collision_radius,
-        is_controller=is_controller,
         controller_idx=controller_idx,
         controller_traj=controller_traj.astype(np.float32),
         # ---- Springs ----
         spring_edges=edges.astype(np.int32),
         spring_rest_length=rest_lengths.astype(np.float32),
         spring_y=spring_y.astype(np.float32),
-        spring_y_min=np.asarray(spring_y_min, dtype=np.float32),
-        spring_y_max=np.asarray(spring_y_max, dtype=np.float32),
         spring_ke=spring_ke.astype(np.float32),
         spring_kd=spring_kd,
         drag_damping=np.asarray(drag_damping, dtype=np.float32),
-        spring_is_object=spring_is_object,
         num_object_points=np.asarray(num_object_points, dtype=np.int32),
-        num_control_points=np.asarray(num_control_points, dtype=np.int32),
-        num_object_springs=np.asarray(num_object_springs, dtype=np.int32),
-        # ---- Legacy scalar names (kept for compatibility/debugging) ----
-        object_radius=np.asarray(topology_object_radius, dtype=np.float32),
-        object_max_neighbours=np.asarray(object_max_neighbours, dtype=np.int32),
-        controller_radius=np.asarray(topology_controller_radius, dtype=np.float32),
-        controller_max_neighbours=np.asarray(controller_max_neighbours, dtype=np.int32),
-        topology_object_radius=np.asarray(topology_object_radius, dtype=np.float32),
-        topology_controller_radius=np.asarray(topology_controller_radius, dtype=np.float32),
-        collision_object_radius=np.asarray(collision_object_radius, dtype=np.float32),
-        collision_controller_radius=np.asarray(collision_controller_radius, dtype=np.float32),
         # ---- Simulation timing / contact knobs ----
         sim_dt=np.asarray(sim_dt, dtype=np.float32),
         sim_substeps=np.asarray(sim_substeps, dtype=np.int32),
-        sim_fps=np.asarray(sim_fps, dtype=np.float32),
-        frame_dt=np.asarray(frame_dt, dtype=np.float32),
         reverse_z=np.asarray(bool(config.get("reverse_z", True))),
         self_collision=np.asarray(self_collision),
         contact_collide_elas=np.asarray(collide_elas, dtype=np.float32),
         contact_collide_fric=np.asarray(collide_fric, dtype=np.float32),
-        contact_collide_object_elas=np.asarray(collide_object_elas, dtype=np.float32),
-        contact_collide_object_fric=np.asarray(collide_object_fric, dtype=np.float32),
         contact_collision_dist=np.asarray(collision_dist, dtype=np.float32),
     )
 

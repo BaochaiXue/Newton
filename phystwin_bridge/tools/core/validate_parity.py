@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable-particle-contact-kernel",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
 
     # ── Simulation ──
@@ -86,11 +86,6 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--up-axis", choices=["X", "Y", "Z"], default="Z")
-    parser.add_argument(
-        "--frame-sync",
-        choices=["legacy", "phystwin"],
-        default="phystwin",
-    )
     parser.add_argument(
         "--device",
         default=default_device(),
@@ -185,25 +180,27 @@ def _load_ir(ir_path: Path) -> dict[str, np.ndarray]:
         return {k: data[k] for k in data.files}
 
 
-def _resolve_inference_path(args: argparse.Namespace, ir_path: Path, ir: dict[str, np.ndarray]) -> Path | None:
+def _resolve_inference_path(
+    args: argparse.Namespace, ir: dict[str, np.ndarray]
+) -> Path | None:
     if args.inference is not None:
         return args.inference.resolve()
     if "case_name" not in ir:
         return None
     case_name = str(np.asarray(ir["case_name"]).reshape(-1)[0])
-    candidate = ir_path.parent.parent.parent / "inputs" / "cases" / case_name / "inference.pkl"
+    candidate = bridge_root() / "inputs" / "cases" / case_name / "inference.pkl"
     return candidate if candidate.exists() else None
 
 
 def _resolve_final_data_path(
-    args: argparse.Namespace, ir_path: Path, ir: dict[str, np.ndarray]
+    args: argparse.Namespace, ir: dict[str, np.ndarray]
 ) -> Path | None:
     if args.gt_final_data is not None:
         return args.gt_final_data.resolve()
     if "case_name" not in ir:
         return None
     case_name = str(np.asarray(ir["case_name"]).reshape(-1)[0])
-    candidate = ir_path.parent.parent.parent / "inputs" / "cases" / case_name / "final_data.pkl"
+    candidate = bridge_root() / "inputs" / "cases" / case_name / "final_data.pkl"
     return candidate if candidate.exists() else None
 
 
@@ -408,6 +405,7 @@ def _build_importer_cmd(
     args: argparse.Namespace,
     ir_path: Path,
     out_dir: Path,
+    resolved_inference_path: Path | None,
 ) -> list[str]:
     """Build the subprocess command that runs the importer with pass-through args."""
     cmd = [
@@ -423,7 +421,6 @@ def _build_importer_cmd(
         "--num-frames", str(args.num_frames),
         "--device", args.device,
         "--up-axis", args.up_axis,
-        "--frame-sync", args.frame_sync,
         "--particle-contact-radius", str(args.particle_contact_radius),
         "--gravity-mag", str(args.gravity_mag),
         "--ground-mu-scale", str(args.ground_mu_scale),
@@ -438,8 +435,10 @@ def _build_importer_cmd(
         cmd.extend(["--sim-dt", str(args.sim_dt)])
     if args.gravity is not None:
         cmd.extend(["--gravity", str(args.gravity)])
-    if args.inference is not None:
-        cmd.extend(["--inference", str(args.inference)])
+    if resolved_inference_path is not None:
+        cmd.extend(["--inference", str(resolved_inference_path.resolve())])
+    elif args.inference is not None:
+        cmd.extend(["--inference", str(args.inference.resolve())])
     if args.particle_mu_override is not None:
         cmd.extend(["--particle-mu-override", str(args.particle_mu_override)])
 
@@ -491,10 +490,10 @@ def main() -> int:
     ir = _load_ir(ir_path)
     case_name = _resolve_case_name(args=args, ir=ir)
     # Baselines are optional, but without inference the RMSE-based checks will be N/A.
-    inference_path = _resolve_inference_path(args=args, ir_path=ir_path, ir=ir)
+    inference_path = _resolve_inference_path(args=args, ir=ir)
     inference = _load_inference(inference_path)
     # GT metrics are optional and require SciPy (for cKDTree) if enabled.
-    final_data_path = _resolve_final_data_path(args=args, ir_path=ir_path, ir=ir)
+    final_data_path = _resolve_final_data_path(args=args, ir=ir)
     gt_points, gt_mask = _load_gt_from_final_data(
         path=final_data_path,
         use_mask=bool(args.gt_use_mask),
@@ -506,7 +505,12 @@ def main() -> int:
         case_name=case_name,
     )
 
-    importer_cmd = _build_importer_cmd(args=args, ir_path=ir_path, out_dir=out_dir)
+    importer_cmd = _build_importer_cmd(
+        args=args,
+        ir_path=ir_path,
+        out_dir=out_dir,
+        resolved_inference_path=inference_path,
+    )
     if not args.skip_run:
         # The importer produces `<prefix>.npz` + `<prefix>.json` in `out_dir`.
         subprocess.run(importer_cmd, check=True)

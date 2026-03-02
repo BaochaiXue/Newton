@@ -26,9 +26,12 @@ def _load_json(path: Path) -> dict:
 
 
 def _select_best_report(case_out_dir: Path) -> Path:
-    candidates = sorted(case_out_dir.glob("*_rollout_report.json"))
+    # Support both layouts:
+    # - legacy: outputs/<case>/*_rollout_report.json
+    # - timestamped: outputs/<case>/<run_timestamp>/*_rollout_report.json
+    candidates = sorted(case_out_dir.rglob("*_rollout_report.json"))
     if not candidates:
-        candidates = sorted(case_out_dir.glob("*_parity_report.json"))
+        candidates = sorted(case_out_dir.rglob("*_parity_report.json"))
     if not candidates:
         raise FileNotFoundError(
             f"No *_rollout_report.json or *_parity_report.json found under {case_out_dir}"
@@ -71,7 +74,10 @@ def parse_args() -> argparse.Namespace:
         "--outputs-root",
         type=Path,
         default=Path("phystwin_bridge/outputs"),
-        help="Directory containing per-case output subfolders.",
+        help=(
+            "Directory containing per-case output subfolders. "
+            "Each case may contain reports directly or under timestamp subfolders."
+        ),
     )
     parser.add_argument(
         "--cases-root",

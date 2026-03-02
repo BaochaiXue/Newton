@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Import a PhysTwin IR into Newton and run a semi-implicit simulation.
 
+IR requirements
+---------------
+This importer intentionally targets **IR v2+** exported by `export_ir.py` and
+requires an explicit per-particle `collision_radius`. We do **not** support
+legacy heuristics where a generic `radius` field could ambiguously mean either
+topology radius or contact radius.
+
 Architecture
 ------------
 The pipeline has four phases, each handled by a dedicated function:
@@ -20,7 +27,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,7 +34,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from path_defaults import default_device
+from path_defaults import bridge_root, default_device
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Constants – no magic numbers anywhere else in this file.
@@ -42,10 +48,6 @@ IR_COLLISION_RADIUS_KEY = "collision_radius"
 EPSILON = 1e-12  # safe-division floor
 STRICT_KE_REL_TOL = 1e-4  # max relative error for ke consistency
 KINEMATIC_MASS_TOL = 1e-8  # controllers must have |mass| below this
-
-# Physics defaults
-DEFAULT_OBJECT_RADIUS = 0.02  # fallback collision radius for legacy IR
-LEGACY_RADIUS_RATIO_THRESH = 2.5  # above → interpret radius as topology
 
 # Contact clamping
 MU_MAX = 2.0
@@ -77,7 +79,9 @@ class SimConfig:
     angular_damping: float = 0.05
     friction_smoothing: float = 1.0
     enable_tri_contact: bool = True
-    disable_particle_contact_kernel: bool = False
+    # Default to disabling Newton's particle-particle contact kernel: it is expensive and
+    # not PhysTwin-aligned, so enabling it can easily break parity.
+    disable_particle_contact_kernel: bool = True
 
     # Simulation
     num_frames: int = 20
@@ -91,8 +95,6 @@ class SimConfig:
     up_axis: str = "Z"
 
     # Frame sync
-    frame_sync: str = "phystwin"
-
     # Device
     device: str = "cuda:0"
 
@@ -140,7 +142,6 @@ class SimConfig:
             gravity_mag=args.gravity_mag,
             gravity_from_reverse_z=args.gravity_from_reverse_z,
             up_axis=args.up_axis,
-            frame_sync=args.frame_sync,
             device=args.device,
             shape_contacts=args.shape_contacts,
             add_ground_plane=args.add_ground_plane,
@@ -205,7 +206,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--disable-particle-contact-kernel",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
+        help=(
+            "Force-disable particle-particle contact kernel in SemiImplicit by setting "
+            "model.particle_grid=None. Useful for debugging and to avoid costly/unstable "
+            "particle self-collisions. Default: disabled (use --no-disable-particle-contact-kernel to enable)."
+        ),
     )
 
     # Simulation
@@ -221,22 +227,49 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--up-axis", choices=["X", "Y", "Z"], default="Z")
 
-    # Frame / device
-    p.add_argument("--frame-sync", choices=["legacy", "phystwin"], default="phystwin")
+    # Device
     p.add_argument("--device", default=default_device())
 
     # Contacts
     p.add_argument(
-        "--shape-contacts", action=argparse.BooleanOptionalAction, default=False
+        "--shape-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable particle-vs-shape contacts (e.g. ground plane) by running Newton "
+            "collision detection each substep."
+        ),
     )
     p.add_argument(
-        "--add-ground-plane", action=argparse.BooleanOptionalAction, default=True
+        "--add-ground-plane",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add a ground plane shape to the model (only affects dynamics if --shape-contacts is enabled).",
     )
     p.add_argument(
-        "--particle-contacts", action=argparse.BooleanOptionalAction, default=None
+        "--particle-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override IR self_collision. When enabled, we rebuild the HashGrid each substep "
+            "to support SemiImplicit particle-particle contacts (expensive)."
+        ),
     )
-    p.add_argument("--particle-contact-radius", type=float, default=1e-5)
-    p.add_argument("--object-contact-radius", type=float, default=None)
+    p.add_argument(
+        "--particle-contact-radius",
+        type=float,
+        default=1e-5,
+        help=(
+            "Controller particle radius used for contacts. Default is tiny to avoid "
+            "kinematic controllers acting like 'bulldozers' in collisions."
+        ),
+    )
+    p.add_argument(
+        "--object-contact-radius",
+        type=float,
+        default=None,
+        help="Optional override for object particle collision radius (does not affect controllers).",
+    )
 
     # Controls / validation / drag
     p.add_argument(
@@ -471,75 +504,24 @@ def validate_ir_physics(ir: dict, cfg: SimConfig) -> dict:
 # Collision radius resolution
 # ═══════════════════════════════════════════════════════════════════════════
 
-
-def _uniform_radius(ir: dict, n: int, value: float) -> np.ndarray:
-    r = np.full((n,), value, dtype=np.float32)
-    if "controller_idx" in ir and "collision_controller_radius" in ir:
-        idx = ir["controller_idx"].astype(np.int64, copy=False)
-        if idx.size > 0:
-            r[idx] = ir_scalar(ir, "collision_controller_radius")
-    return r
-
-
 def resolve_collision_radius(ir: dict, n: int) -> tuple[np.ndarray, int, str]:
-    """Determine per-particle collision radii from IR.  Returns (radii, version, source)."""
+    """Return per-particle collision radii from IR.
+
+    We intentionally require IR v2+ and the explicit `collision_radius` field to
+    avoid ambiguous legacy heuristics (`radius` could mean topology radius vs
+    contact radius).
+    """
     ver = ir_version(ir)
-
-    if IR_COLLISION_RADIUS_KEY in ir:
-        return (
-            ir[IR_COLLISION_RADIUS_KEY].astype(np.float32).copy(),
-            ver,
-            "collision_radius",
+    if ver < 2:
+        raise ValueError(
+            f"IR v2+ required (got ir_version={ver}). Re-export using export_ir.py."
         )
-
-    if ver >= 2:
-        if "radius" in ir:
-            warnings.warn(
-                "IR v2 missing collision_radius; falling back to radius.",
-                RuntimeWarning,
-            )
-            return ir["radius"].astype(np.float32).copy(), ver, "v2_radius_fallback"
-        raise KeyError("IR v2 requires collision_radius.")
-
-    # Legacy heuristics
-    if "radius" in ir and "contact_collision_dist" in ir:
-        r = ir["radius"].astype(np.float32).copy()
-        dist = ir_scalar(ir, "contact_collision_dist")
-        if float(np.max(r) / max(dist, EPSILON)) > LEGACY_RADIUS_RATIO_THRESH:
-            warnings.warn(
-                "Legacy IR: radius looks like topology; using contact_collision_dist.",
-                RuntimeWarning,
-            )
-            return _uniform_radius(ir, n, dist), ver, "legacy_contact_collision_dist"
-        return r, ver, "legacy_radius"
-
-    if "radius" in ir:
-        return ir["radius"].astype(np.float32).copy(), ver, "legacy_radius"
-
-    if "contact_collision_dist" in ir:
-        warnings.warn(
-            "Legacy IR missing radius; using contact_collision_dist.", RuntimeWarning
-        )
-        return (
-            _uniform_radius(ir, n, ir_scalar(ir, "contact_collision_dist")),
-            ver,
-            "legacy_contact_collision_dist",
-        )
-
-    obj_r = ir_scalar(
-        ir,
-        "collision_object_radius",
-        ir_scalar(ir, "object_radius", DEFAULT_OBJECT_RADIUS),
-    )
-    ctrl_r = ir_scalar(
-        ir, "collision_controller_radius", ir_scalar(ir, "controller_radius", obj_r)
-    )
-    r = np.full((n,), obj_r, dtype=np.float32)
-    if "controller_idx" in ir:
-        idx = ir["controller_idx"].astype(np.int64, copy=False)
-        if idx.size > 0:
-            r[idx] = ctrl_r
-    return r, ver, "legacy_fallback"
+    if IR_COLLISION_RADIUS_KEY not in ir:
+        raise KeyError(f"IR missing required key: {IR_COLLISION_RADIUS_KEY!r}")
+    r = np.asarray(ir[IR_COLLISION_RADIUS_KEY], dtype=np.float32).reshape(-1)
+    if r.shape[0] != n:
+        raise ValueError(f"collision_radius length {r.shape[0]} != particle count {n}")
+    return r.copy(), ver, "collision_radius"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -555,8 +537,8 @@ def _resolve_particle_contacts(cfg: SimConfig, ir: dict) -> bool:
 
 def _add_particles(
     builder: newton.ModelBuilder, ir: dict, cfg: SimConfig, particle_contacts: bool
-) -> tuple[np.ndarray, np.ndarray, int, str]:
-    """Add IR particles to the builder.  Returns (radius, flags, ir_ver, radius_source)."""
+) -> tuple[np.ndarray, int, str]:
+    """Add IR particles to the builder.  Returns (radius, ir_ver, radius_source)."""
     x0 = ir["x0"].astype(np.float32, copy=False)
     v0 = ir["v0"].astype(np.float32, copy=False)
     mass = ir["mass"].astype(np.float32, copy=False)
@@ -592,7 +574,7 @@ def _add_particles(
         radius=radius.astype(float).tolist(),
         flags=flags.astype(int).tolist(),
     )
-    return radius, flags, ver, src
+    return radius, ver, src
 
 
 def _add_springs(
@@ -692,9 +674,7 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
         gravity=0.0,
     )
 
-    radius, _flags, ver, radius_src = _add_particles(
-        builder, ir, cfg, particle_contacts
-    )
+    radius, ver, radius_src = _add_particles(builder, ir, cfg, particle_contacts)
     _add_springs(builder, ir, cfg, checks)
     _add_ground_plane(builder, ir, cfg, checks)
 
@@ -704,8 +684,11 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
 
     model = builder.finalize(device=device)
 
-    # Particle contact grid
-    if not particle_contacts or cfg.disable_particle_contact_kernel:
+    # Particle contact kernel in SemiImplicit relies on a HashGrid being built each substep.
+    # We disable it unless explicitly requested, since it is expensive and can complicate
+    # gradient-based workflows.
+    particle_contact_kernel = particle_contacts and (not cfg.disable_particle_contact_kernel)
+    if not particle_contact_kernel:
         model.particle_grid = None
 
     # Gravity
@@ -720,7 +703,7 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
             np.clip(ir_scalar(ir, "contact_collide_fric"), 0, MU_MAX)
         )
 
-    checks["particle_contacts_enabled"] = particle_contacts
+    checks["particle_contacts_enabled"] = particle_contact_kernel
     checks["collision_radius_source"] = radius_src
 
     return ModelResult(model=model, radius=radius, ir_version=ver, checks=checks)
@@ -760,11 +743,11 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
     state_in = model.state()
     state_out = model.state()
     control = model.control()
-    contacts = model.contacts()
-    # Collisions can be expensive. We only run collision detection if needed:
-    # - `shape_contacts=True` enables particle-vs-shape contacts (e.g., ground plane).
-    # - `self_collision=True` enables particle-vs-particle contacts.
-    contacts_enabled = cfg.shape_contacts or ir_bool(ir, "self_collision")
+    # Shape contacts (particles vs rigid shapes) require running collision detection.
+    # Particle self-collision does *not* use the Contacts buffer; it is handled by the
+    # SemiImplicit solver via a HashGrid-based kernel.
+    shape_contacts_enabled = bool(cfg.shape_contacts)
+    contacts = model.contacts() if shape_contacts_enabled else None
 
     # Controller arrays
     ctrl_idx = ir["controller_idx"].astype(np.int64)
@@ -801,17 +784,26 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
     if cfg.apply_drag and "drag_damping" in ir:
         drag = ir_scalar(ir, "drag_damping") * cfg.drag_damping_scale
 
+    # Particle self-collision (SemiImplicit): requires building the HashGrid each substep.
+    particle_contacts = _resolve_particle_contacts(cfg, ir)
+    particle_contact_kernel = particle_contacts and (not cfg.disable_particle_contact_kernel)
+    particle_grid = model.particle_grid if particle_contact_kernel else None
+    if particle_grid is not None:
+        with wp.ScopedDevice(model.device):
+            particle_grid.reserve(model.particle_count)
+        search_radius = float(model.particle_max_radius) * 2.0 + float(model.particle_cohesion)
+        # Prevent build errors for degenerate radii.
+        search_radius = max(search_radius, float(EPSILON))
+
     # Collect rollout
     rollout_all: list[np.ndarray] = []
     rollout_obj: list[np.ndarray] = []
 
-    if cfg.frame_sync == "phystwin":
-        q0 = state_in.particle_q.numpy().astype(np.float32)
-        rollout_all.append(q0)
-        rollout_obj.append(q0[:n_obj])
-        frame_range = range(1, n_frames)
-    else:
-        frame_range = range(n_frames)
+    # Frame 0 is the initial state (matches PhysTwin inference indexing).
+    q0 = state_in.particle_q.numpy().astype(np.float32)
+    rollout_all.append(q0)
+    rollout_obj.append(q0[:n_obj])
+    frame_range = range(1, n_frames)
 
     # Main loop
     t0 = time.perf_counter()
@@ -843,10 +835,13 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
                     device=device,
                 )
 
-            if contacts_enabled:
+            if particle_grid is not None:
+                with wp.ScopedDevice(model.device):
+                    particle_grid.build(state_in.particle_q, radius=search_radius)
+
+            if shape_contacts_enabled:
+                assert contacts is not None
                 model.collide(state_in, contacts)
-            else:
-                contacts.clear()
 
             solver.step(state_in, state_out, control, contacts, sim_dt)
             state_in, state_out = state_out, state_in
@@ -898,9 +893,7 @@ def _resolve_inference_path(cfg: SimConfig, ir: dict) -> Path | None:
     case = ir_string(ir, "case_name")
     if not case:
         return None
-    cand = (
-        cfg.ir_path.parent.parent.parent / "inputs" / "cases" / case / "inference.pkl"
-    )
+    cand = bridge_root() / "inputs" / "cases" / case / "inference.pkl"
     return cand if cand.exists() else None
 
 
@@ -946,7 +939,8 @@ def save_results(
     summary = {
         "ir_path": str(cfg.ir_path),
         "output_npz": str(npz_path),
-        "device": cfg.device,
+        "device_requested": cfg.device,
+        "device_used": str(model_result.model.device),
         "ir_version": model_result.ir_version,
         "config": {
             "spring_ke_scale": cfg.spring_ke_scale,
@@ -955,9 +949,16 @@ def save_results(
             "friction_smoothing": cfg.friction_smoothing,
             "enable_tri_contact": cfg.enable_tri_contact,
             "interpolate_controls": cfg.interpolate_controls,
-            "frame_sync": cfg.frame_sync,
+            "strict_physics_checks": cfg.strict_physics_checks,
             "apply_drag": cfg.apply_drag,
             "drag_damping_scale": cfg.drag_damping_scale,
+            "shape_contacts": cfg.shape_contacts,
+            "add_ground_plane": cfg.add_ground_plane,
+            "particle_contacts_override": cfg.particle_contacts,
+            "disable_particle_contact_kernel": cfg.disable_particle_contact_kernel,
+            "particle_contact_radius": cfg.particle_contact_radius,
+            "object_contact_radius": cfg.object_contact_radius,
+            "particle_mu_override": cfg.particle_mu_override,
             "ground_mu_scale": cfg.ground_mu_scale,
             "ground_restitution_scale": cfg.ground_restitution_scale,
         },
