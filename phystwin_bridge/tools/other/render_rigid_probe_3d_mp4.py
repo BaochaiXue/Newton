@@ -24,7 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter
-from mpl_toolkits.mplot3d.art3d import Line3DCollection
+from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
 
 BOX_EDGES = np.asarray(
@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--elev", type=float, default=20.0, help="Camera elevation in degrees.")
     p.add_argument("--azim", type=float, default=-55.0, help="Camera azimuth in degrees.")
     p.add_argument(
+        "--draw-ground",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw a visible table plane at z=0 for presentation clarity.",
+    )
+    p.add_argument(
         "--track-center",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -93,6 +99,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.12,
         help="Lower bound for dynamic camera half-span in world units.",
+    )
+    p.add_argument(
+        "--display-reverse-z",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Visualization-only axis flip: render z'=-z to match conventional "
+            "upward Z display when simulation uses reverse-z gravity."
+        ),
     )
     return p.parse_args()
 
@@ -140,6 +155,14 @@ def box_corners(pos: np.ndarray, quat_xyzw: np.ndarray, hx: float, hy: float, hz
     return local @ rot.T + np.asarray(pos, dtype=np.float64).reshape(1, 3)
 
 
+def mesh_vertices_world(
+    pos: np.ndarray, quat_xyzw: np.ndarray, vertices_local: np.ndarray, scale: float
+) -> np.ndarray:
+    rot = quat_xyzw_to_rot(quat_xyzw)
+    v = np.asarray(vertices_local, dtype=np.float64) * float(scale)
+    return v @ rot.T + np.asarray(pos, dtype=np.float64).reshape(1, 3)
+
+
 def build_segments(points: np.ndarray, edges: np.ndarray) -> np.ndarray:
     # points: [N,3], edges: [M,2] -> [M,2,3]
     return points[edges]
@@ -165,17 +188,45 @@ def main() -> int:
         hy = float(np.asarray(data["rigid_hy"]).ravel()[0])
         hz = float(np.asarray(data["rigid_hz"]).ravel()[0])
         sim_dt = float(np.asarray(data["sim_dt"]).ravel()[0]) if "sim_dt" in data.files else 1.0 / args.fps
+        rigid_shape_kind = "box"
+        if "rigid_shape_kind" in data.files:
+            rigid_shape_kind = str(np.asarray(data["rigid_shape_kind"]).reshape(-1)[0])
+        rigid_mesh_vertices_local = None
+        rigid_mesh_edges = None
+        rigid_mesh_scale = 1.0
+        if rigid_shape_kind == "bunny_mesh":
+            if (
+                "rigid_mesh_vertices_local" in data.files
+                and "rigid_mesh_render_edges" in data.files
+            ):
+                rigid_mesh_vertices_local = np.asarray(
+                    data["rigid_mesh_vertices_local"], dtype=np.float32
+                ).reshape(-1, 3)
+                rigid_mesh_edges = np.asarray(
+                    data["rigid_mesh_render_edges"], dtype=np.int32
+                ).reshape(-1, 2)
+                if "rigid_mesh_scale" in data.files:
+                    rigid_mesh_scale = float(np.asarray(data["rigid_mesh_scale"]).ravel()[0])
+            else:
+                rigid_shape_kind = "box"
 
     if q_obj.ndim != 3 or q_obj.shape[-1] != 3:
         raise ValueError(f"Unexpected particle_q_object shape: {q_obj.shape}")
     if body_q.ndim != 2 or body_q.shape[0] != q_obj.shape[0] or body_q.shape[1] < 7:
         raise ValueError(f"Unexpected body_q shape: {body_q.shape}")
 
+    q_obj_raw = q_obj.copy()
+    body_pos_raw = body_q[:, 0:3].astype(np.float64)
+    if args.display_reverse_z:
+        q_obj[:, :, 2] *= -1.0
+
     frames = int(q_obj.shape[0])
     if args.max_frames is not None:
         frames = max(1, min(frames, int(args.max_frames)))
         q_obj = q_obj[:frames]
+        q_obj_raw = q_obj_raw[:frames]
         body_q = body_q[:frames]
+        body_pos_raw = body_pos_raw[:frames]
 
     n_obj = int(q_obj.shape[1])
     if n_obj > args.max_points:
@@ -204,10 +255,22 @@ def main() -> int:
                 if edges.shape[0] > 0:
                     spring_edges = edges[:: args.spring_stride].copy()
 
+    body_pos_vis = body_pos_raw.copy()
+    if args.display_reverse_z:
+        body_pos_vis[:, 2] *= -1.0
+
     # Base global span for consistent dynamic zoom floor.
     all_pts = q_vis.reshape(-1, 3)
     xyz_min = np.min(all_pts, axis=0)
     xyz_max = np.max(all_pts, axis=0)
+    if rigid_shape_kind == "bunny_mesh" and rigid_mesh_vertices_local is not None:
+        rigid_extent_radius = float(
+            np.max(np.linalg.norm(rigid_mesh_vertices_local * rigid_mesh_scale, axis=1))
+        )
+    else:
+        rigid_extent_radius = float(np.linalg.norm(np.asarray([hx, hy, hz], dtype=np.float64)))
+    xyz_min = np.minimum(xyz_min, np.min(body_pos_vis, axis=0) - rigid_extent_radius)
+    xyz_max = np.maximum(xyz_max, np.max(body_pos_vis, axis=0) + rigid_extent_radius)
     base_half_span = 0.5 * np.max(xyz_max - xyz_min)
     base_half_span = max(base_half_span, float(args.min_half_span))
 
@@ -227,11 +290,22 @@ def main() -> int:
         depthshade=False,
     )
 
-    # Box wireframe.
-    c0 = box_corners(body_q[0, 0:3], body_q[0, 3:7], hx, hy, hz)
-    box_segments = c0[BOX_EDGES]
-    box_lc = Line3DCollection(box_segments, colors="#D64137", linewidths=2.5)
-    ax.add_collection3d(box_lc)
+    # Rigid shape wireframe.
+    if rigid_shape_kind == "bunny_mesh" and rigid_mesh_vertices_local is not None and rigid_mesh_edges is not None:
+        v0 = mesh_vertices_world(
+            body_q[0, 0:3], body_q[0, 3:7], rigid_mesh_vertices_local, rigid_mesh_scale
+        )
+        if args.display_reverse_z:
+            v0[:, 2] *= -1.0
+        rigid_segments = v0[rigid_mesh_edges]
+        rigid_lc = Line3DCollection(rigid_segments, colors="#D64137", linewidths=0.65, alpha=0.90)
+    else:
+        c0 = box_corners(body_q[0, 0:3], body_q[0, 3:7], hx, hy, hz)
+        if args.display_reverse_z:
+            c0[:, 2] *= -1.0
+        rigid_segments = c0[BOX_EDGES]
+        rigid_lc = Line3DCollection(rigid_segments, colors="#D64137", linewidths=2.5)
+    ax.add_collection3d(rigid_lc)
 
     rope_lc = None
     if spring_edges is not None and spring_edges.shape[0] > 0:
@@ -240,9 +314,9 @@ def main() -> int:
         ax.add_collection3d(rope_lc)
 
     body_marker = ax.scatter(
-        [body_q[0, 0]],
-        [body_q[0, 1]],
-        [body_q[0, 2]],
+        [body_pos_vis[0, 0]],
+        [body_pos_vis[0, 1]],
+        [body_pos_vis[0, 2]],
         s=46.0,
         c="#D64137",
         depthshade=False,
@@ -257,9 +331,9 @@ def main() -> int:
         depthshade=False,
     )
     connector, = ax.plot(
-        [body_q[0, 0], com0[0]],
-        [body_q[0, 1], com0[1]],
-        [body_q[0, 2], com0[2]],
+        [body_pos_vis[0, 0], com0[0]],
+        [body_pos_vis[0, 1], com0[1]],
+        [body_pos_vis[0, 2], com0[2]],
         color="#777777",
         linewidth=1.5,
         alpha=0.8,
@@ -268,7 +342,27 @@ def main() -> int:
     ax.view_init(elev=float(args.elev), azim=float(args.azim))
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
+    ax.set_zlabel("Z (display=-sim)" if args.display_reverse_z else "Z")
+
+    if args.draw_ground:
+        ground_center = 0.5 * (xyz_min + xyz_max)
+        ground_half = max(float(base_half_span) * 1.35, 0.25)
+        gx = float(ground_center[0])
+        gy = float(ground_center[1])
+        gz = 0.0
+        table = np.asarray(
+            [
+                [gx - ground_half, gy - ground_half, gz],
+                [gx + ground_half, gy - ground_half, gz],
+                [gx + ground_half, gy + ground_half, gz],
+                [gx - ground_half, gy + ground_half, gz],
+            ],
+            dtype=np.float64,
+        )
+        table_poly = Poly3DCollection(
+            [table], facecolors="#D5DCE4", edgecolors="#8A94A0", linewidths=0.9, alpha=0.42
+        )
+        ax.add_collection3d(table_poly)
 
     # Camera tracking state.
     cam_center = None
@@ -280,13 +374,15 @@ def main() -> int:
     with writer.saving(fig, str(out_mp4), dpi=int(args.dpi)):
         for f in range(frames):
             pts = q_vis[f]
-            bpos = body_q[f, 0:3].astype(np.float64)
+            bpos_raw = body_pos_raw[f]
+            bpos = body_pos_vis[f]
             bquat = body_q[f, 3:7].astype(np.float64)
             com = np.mean(pts, axis=0).astype(np.float64)
-            dist = float(np.linalg.norm(bpos - com))
+            raw_com = np.mean(q_obj_raw[f], axis=0).astype(np.float64)
+            dist = float(np.linalg.norm(bpos_raw - raw_com))
             speed = 0.0
             if f > 0 and sim_dt > 0.0:
-                speed = float(np.linalg.norm(body_q[f, 0:3] - body_q[f - 1, 0:3]) / sim_dt)
+                speed = float(np.linalg.norm(body_pos_raw[f] - body_pos_raw[f - 1]) / sim_dt)
 
             # Update particle scatter.
             scatter._offsets3d = (pts[:, 0], pts[:, 1], pts[:, 2])
@@ -295,9 +391,23 @@ def main() -> int:
             if rope_lc is not None:
                 rope_lc.set_segments(build_segments(pts, spring_edges))
 
-            # Update box.
-            c = box_corners(bpos, bquat, hx, hy, hz)
-            box_lc.set_segments(c[BOX_EDGES])
+            # Update rigid shape.
+            if (
+                rigid_shape_kind == "bunny_mesh"
+                and rigid_mesh_vertices_local is not None
+                and rigid_mesh_edges is not None
+            ):
+                v = mesh_vertices_world(
+                    bpos_raw, bquat, rigid_mesh_vertices_local, rigid_mesh_scale
+                )
+                if args.display_reverse_z:
+                    v[:, 2] *= -1.0
+                rigid_lc.set_segments(v[rigid_mesh_edges])
+            else:
+                c = box_corners(bpos_raw, bquat, hx, hy, hz)
+                if args.display_reverse_z:
+                    c[:, 2] *= -1.0
+                rigid_lc.set_segments(c[BOX_EDGES])
 
             # Update body/com markers and connector.
             body_marker._offsets3d = ([bpos[0]], [bpos[1]], [bpos[2]])
@@ -326,7 +436,11 @@ def main() -> int:
                 ax.set_ylim(xyz_min[1], xyz_max[1])
                 ax.set_zlim(xyz_min[2], xyz_max[2])
 
-            ax.set_title("Rigid Box vs Rope Collision (Newton SemiImplicit)", fontsize=13, pad=10)
+            rigid_label = "Bunny Mesh" if rigid_shape_kind == "bunny_mesh" else "Rigid Box"
+            title = f"{rigid_label} vs Rope Collision (Newton SemiImplicit)"
+            if args.display_reverse_z:
+                title += " | display z=-sim z"
+            ax.set_title(title, fontsize=13, pad=10)
             meta_text.set_text(
                 f"frame {f+1}/{frames}  |  body_speed={speed:.3f} m/s  |  dist(body, COM)={dist:.4f} m"
             )

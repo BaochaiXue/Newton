@@ -145,6 +145,13 @@ class SimConfig:
     rigid_probe_mu: float = 0.4
     rigid_probe_ke: float = 5.0e4
     rigid_probe_kd: float = 5.0e2
+    rigid_probe_shape: str = "box"  # choices: box | bunny
+    rigid_probe_bunny_scale: float = 0.12
+    rigid_probe_bunny_asset: str = "bunny.usd"
+    rigid_probe_bunny_prim: str = "/root/bunny"
+    rigid_probe_bunny_edge_stride: int = 40
+    rigid_probe_use_scene_gravity: bool = False
+    rigid_probe_add_ground_plane: bool = False
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> SimConfig:
@@ -195,6 +202,13 @@ class SimConfig:
             rigid_probe_mu=args.rigid_probe_mu,
             rigid_probe_ke=args.rigid_probe_ke,
             rigid_probe_kd=args.rigid_probe_kd,
+            rigid_probe_shape=args.rigid_probe_shape,
+            rigid_probe_bunny_scale=args.rigid_probe_bunny_scale,
+            rigid_probe_bunny_asset=args.rigid_probe_bunny_asset,
+            rigid_probe_bunny_prim=args.rigid_probe_bunny_prim,
+            rigid_probe_bunny_edge_stride=args.rigid_probe_bunny_edge_stride,
+            rigid_probe_use_scene_gravity=args.rigid_probe_use_scene_gravity,
+            rigid_probe_add_ground_plane=args.rigid_probe_add_ground_plane,
         )
 
 
@@ -374,7 +388,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Run built-in two-way interaction probe mode: imported spring-mass object "
-            "vs one native Newton rigid box. Outputs probe diagnostics instead of parity baseline files."
+            "vs one native Newton rigid object (box or bunny). "
+            "Outputs probe diagnostics instead of parity baseline files."
         ),
     )
     p.add_argument("--rigid-probe-object-mass", type=float, default=1.0)
@@ -412,6 +427,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rigid-probe-mu", type=float, default=0.4)
     p.add_argument("--rigid-probe-ke", type=float, default=5e4)
     p.add_argument("--rigid-probe-kd", type=float, default=5e2)
+    p.add_argument(
+        "--rigid-probe-shape",
+        choices=["box", "bunny"],
+        default="box",
+        help="Rigid probe shape type.",
+    )
+    p.add_argument("--rigid-probe-bunny-scale", type=float, default=0.12)
+    p.add_argument("--rigid-probe-bunny-asset", type=str, default="bunny.usd")
+    p.add_argument("--rigid-probe-bunny-prim", type=str, default="/root/bunny")
+    p.add_argument("--rigid-probe-bunny-edge-stride", type=int, default=40)
+    p.add_argument(
+        "--rigid-probe-use-scene-gravity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use resolve_gravity(cfg, ir) in rigid probe mode instead of zero gravity.",
+    )
+    p.add_argument(
+        "--rigid-probe-add-ground-plane",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add Newton ground plane in rigid probe mode (table).",
+    )
 
     return p.parse_args()
 
@@ -562,10 +599,28 @@ def _validate_config_ranges(cfg: SimConfig) -> None:
             raise ValueError(
                 f"--rigid-probe-inertia-diag must be > 0, got {cfg.rigid_probe_inertia_diag}"
             )
-        if cfg.rigid_probe_hx <= 0.0 or cfg.rigid_probe_hy <= 0.0 or cfg.rigid_probe_hz <= 0.0:
+        if cfg.rigid_probe_shape == "box":
+            if (
+                cfg.rigid_probe_hx <= 0.0
+                or cfg.rigid_probe_hy <= 0.0
+                or cfg.rigid_probe_hz <= 0.0
+            ):
+                raise ValueError(
+                    "Rigid probe box half extents must be > 0 "
+                    f"(got hx={cfg.rigid_probe_hx}, hy={cfg.rigid_probe_hy}, hz={cfg.rigid_probe_hz})"
+                )
+        elif cfg.rigid_probe_shape == "bunny":
+            if cfg.rigid_probe_bunny_scale <= 0.0:
+                raise ValueError(
+                    f"--rigid-probe-bunny-scale must be > 0, got {cfg.rigid_probe_bunny_scale}"
+                )
+            if cfg.rigid_probe_bunny_edge_stride < 1:
+                raise ValueError(
+                    f"--rigid-probe-bunny-edge-stride must be >= 1, got {cfg.rigid_probe_bunny_edge_stride}"
+                )
+        else:
             raise ValueError(
-                "Rigid probe box half extents must be > 0 "
-                f"(got hx={cfg.rigid_probe_hx}, hy={cfg.rigid_probe_hy}, hz={cfg.rigid_probe_hz})"
+                f"--rigid-probe-shape must be one of ['box','bunny'], got {cfg.rigid_probe_shape!r}"
             )
 
 
@@ -1306,10 +1361,105 @@ def _to_body_translation(body_q: np.ndarray) -> np.ndarray:
     return body_q[:, :3]
 
 
+def _triangle_edges_from_indices(indices: np.ndarray) -> np.ndarray:
+    """Convert triangle indices [T*3] to unique undirected edges [E,2]."""
+    tri = np.asarray(indices, dtype=np.int32).reshape(-1, 3)
+    e01 = tri[:, [0, 1]]
+    e12 = tri[:, [1, 2]]
+    e20 = tri[:, [2, 0]]
+    edges = np.concatenate([e01, e12, e20], axis=0)
+    edges = np.sort(edges, axis=1)
+    edges = np.unique(edges, axis=0)
+    return edges.astype(np.int32, copy=False)
+
+
+def _load_probe_bunny_geometry(
+    cfg: SimConfig,
+) -> tuple[newton.Mesh, np.ndarray, np.ndarray, np.ndarray, Path]:
+    """Load canonical bunny mesh for rigid-probe contact + rendering."""
+    try:
+        import newton.examples as newton_examples
+        import newton.usd as newton_usd
+        from pxr import Usd
+    except Exception as exc:
+        raise RuntimeError(
+            "Rigid probe shape 'bunny' requires 'newton.examples', 'newton.usd', and 'pxr'."
+        ) from exc
+
+    asset_arg = str(cfg.rigid_probe_bunny_asset).strip()
+    asset_path = Path(asset_arg)
+    if not asset_path.exists():
+        asset_path = Path(newton_examples.get_asset(asset_arg))
+    asset_path = asset_path.resolve()
+
+    stage = Usd.Stage.Open(str(asset_path))
+    if stage is None:
+        raise RuntimeError(f"Failed to open USD stage: {asset_path}")
+    prim = stage.GetPrimAtPath(str(cfg.rigid_probe_bunny_prim))
+    if not prim or not prim.IsValid():
+        raise RuntimeError(
+            f"USD prim not found/invalid: {cfg.rigid_probe_bunny_prim} in {asset_path}"
+        )
+
+    mesh = newton_usd.get_mesh(prim)
+    vertices = np.asarray(mesh.vertices, dtype=np.float32).reshape(-1, 3)
+    indices = np.asarray(mesh.indices, dtype=np.int32).reshape(-1)
+    if indices.size % 3 != 0:
+        raise ValueError(f"Bunny mesh indices length must be multiple of 3, got {indices.size}")
+
+    edges = _triangle_edges_from_indices(indices)
+    stride = max(1, int(cfg.rigid_probe_bunny_edge_stride))
+    render_edges = edges[::stride].copy()
+    return mesh, vertices, indices, render_edges, asset_path
+
+
+def _add_probe_ground_plane(
+    builder: newton.ModelBuilder, ir: dict, cfg: SimConfig, checks: dict
+) -> None:
+    """Optional ground/table for rigid-probe mode."""
+    if not cfg.rigid_probe_add_ground_plane:
+        checks["ground_plane_added"] = False
+        return
+
+    gcfg = builder.default_shape_cfg.copy()
+    if "contact_collide_fric" in ir:
+        gcfg.mu = float(
+            np.clip(
+                ir_scalar(ir, "contact_collide_fric") * cfg.ground_mu_scale, 0, MU_MAX
+            )
+        )
+    if "contact_collide_elas" in ir:
+        gcfg.restitution = float(
+            np.clip(
+                ir_scalar(ir, "contact_collide_elas") * cfg.ground_restitution_scale,
+                0,
+                RESTITUTION_MAX,
+            )
+        )
+
+    reverse_z = ir_bool(ir, "reverse_z")
+    if cfg.up_axis == "Z" and reverse_z:
+        xform = wp.transform(wp.vec3(0, 0, 0), wp.quat(1, 0, 0, 0))
+        builder.add_shape_plane(
+            body=-1,
+            xform=xform,
+            width=0,
+            length=0,
+            cfg=gcfg,
+            label="rigid_probe_ground_plane_reverse_z",
+        )
+    else:
+        builder.add_ground_plane(cfg=gcfg)
+
+    checks["ground_plane_added"] = True
+    checks["ground_mu"] = float(gcfg.mu)
+    checks["ground_restitution"] = float(gcfg.restitution)
+
+
 def _build_rigid_probe_model(
     ir: dict, cfg: SimConfig, device: str
-) -> tuple[newton.Model, int, np.ndarray]:
-    """Build a probe model: imported spring-mass object + one native rigid box."""
+) -> tuple[newton.Model, int, np.ndarray, dict]:
+    """Build probe model: imported spring-mass object + one native rigid body."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any(cfg.up_axis), gravity=0.0)
 
     x0 = np.asarray(ir["x0"], dtype=np.float32)
@@ -1361,10 +1511,19 @@ def _build_rigid_probe_model(
         builder.add_spring(i=i, j=j, ke=float(ke[idx]), kd=float(kd[idx]), control=0.0)
         builder.spring_rest_length[-1] = float(rest[idx])
 
+    probe_checks: dict = {}
+    _add_probe_ground_plane(builder, ir, cfg, probe_checks)
+
     obj_center = x0[:n_obj].mean(axis=0)
     body_pos = obj_center + np.asarray(cfg.rigid_probe_offset, dtype=np.float32)
+    body_quat = wp.quat_identity()
+    if cfg.rigid_probe_shape == "bunny":
+        # Keep bunny upright under reverse-z gravity:
+        # map mesh local +Y (asset up) -> world -Z (simulation up when reverse_z=True).
+        # This is Rx(-90 deg) in xyzw convention.
+        body_quat = wp.quat(-0.70710678, 0.0, 0.0, 0.70710678)
     body = builder.add_body(
-        xform=wp.transform(wp.vec3(*body_pos.tolist()), wp.quat_identity()),
+        xform=wp.transform(wp.vec3(*body_pos.tolist()), body_quat),
         mass=float(cfg.rigid_probe_mass),
         inertia=wp.mat33(
             float(cfg.rigid_probe_inertia_diag),
@@ -1378,29 +1537,86 @@ def _build_rigid_probe_model(
             float(cfg.rigid_probe_inertia_diag),
         ),
         lock_inertia=True,
-        label="rigid_probe_box",
+        label=f"rigid_probe_{cfg.rigid_probe_shape}",
     )
     rigid_cfg = builder.default_shape_cfg.copy()
     rigid_cfg.mu = float(cfg.rigid_probe_mu)
     rigid_cfg.ke = float(cfg.rigid_probe_ke)
     rigid_cfg.kd = float(cfg.rigid_probe_kd)
-    builder.add_shape_box(
-        body=body,
-        hx=float(cfg.rigid_probe_hx),
-        hy=float(cfg.rigid_probe_hy),
-        hz=float(cfg.rigid_probe_hz),
-        cfg=rigid_cfg,
-    )
+
+    probe_meta: dict = {
+        "shape_kind": "box",
+        "rigid_hx": float(cfg.rigid_probe_hx),
+        "rigid_hy": float(cfg.rigid_probe_hy),
+        "rigid_hz": float(cfg.rigid_probe_hz),
+    }
+
+    if cfg.rigid_probe_shape == "box":
+        builder.add_shape_box(
+            body=body,
+            hx=float(cfg.rigid_probe_hx),
+            hy=float(cfg.rigid_probe_hy),
+            hz=float(cfg.rigid_probe_hz),
+            cfg=rigid_cfg,
+        )
+    elif cfg.rigid_probe_shape == "bunny":
+        mesh, mesh_vertices_local, mesh_indices, mesh_render_edges, mesh_asset_path = (
+            _load_probe_bunny_geometry(cfg)
+        )
+        scale = float(cfg.rigid_probe_bunny_scale)
+        builder.add_shape_mesh(
+            body=body,
+            mesh=mesh,
+            scale=(scale, scale, scale),
+            cfg=rigid_cfg,
+        )
+        scaled_vertices = mesh_vertices_local * scale
+        min_v = np.min(scaled_vertices, axis=0)
+        max_v = np.max(scaled_vertices, axis=0)
+        half = 0.5 * (max_v - min_v)
+        probe_meta.update(
+            {
+                "shape_kind": "bunny_mesh",
+                "rigid_hx": float(half[0]),
+                "rigid_hy": float(half[1]),
+                "rigid_hz": float(half[2]),
+                "rigid_mesh_vertices_local": mesh_vertices_local.astype(np.float32, copy=False),
+                "rigid_mesh_indices": mesh_indices.astype(np.int32, copy=False),
+                "rigid_mesh_render_edges": mesh_render_edges.astype(np.int32, copy=False),
+                "rigid_mesh_scale": float(scale),
+                "rigid_mesh_asset_path": str(mesh_asset_path),
+                "rigid_mesh_prim_path": str(cfg.rigid_probe_bunny_prim),
+            }
+        )
+    else:
+        raise ValueError(
+            f"Unsupported --rigid-probe-shape={cfg.rigid_probe_shape!r}; expected box or bunny"
+        )
 
     model = builder.finalize(device=device)
-    model.set_gravity((0.0, 0.0, 0.0))
-    return model, n_obj, mass
+    if cfg.rigid_probe_use_scene_gravity:
+        gravity_scalar, gravity_vec = resolve_gravity(cfg, ir)
+        model.set_gravity(gravity_vec)
+    else:
+        gravity_scalar, gravity_vec = 0.0, (0.0, 0.0, 0.0)
+        model.set_gravity(gravity_vec)
+
+    probe_meta.update(
+        {
+            "ground_plane_added": bool(probe_checks.get("ground_plane_added", False)),
+            "ground_mu": float(probe_checks.get("ground_mu", 0.0)),
+            "ground_restitution": float(probe_checks.get("ground_restitution", 0.0)),
+            "gravity_scalar": float(gravity_scalar),
+            "gravity_vector": tuple(float(v) for v in gravity_vec),
+        }
+    )
+    return model, n_obj, mass, probe_meta
 
 
 def run_rigid_probe(cfg: SimConfig, ir: dict, device: str) -> dict:
     """Run importer-integrated rigid probe mode and write diagnostics files."""
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    model, n_obj, particle_mass = _build_rigid_probe_model(ir, cfg, device)
+    model, n_obj, particle_mass, probe_meta = _build_rigid_probe_model(ir, cfg, device)
 
     solver = newton.solvers.SolverSemiImplicit(
         model,
@@ -1550,17 +1766,34 @@ def run_rigid_probe(cfg: SimConfig, ir: dict, device: str) -> dict:
         sim_dt=np.float32(sim_dt),
         substeps_per_frame=np.int32(substeps),
     )
-    np.savez_compressed(
-        out_scene_npz,
-        particle_q_object=obj_q_frames,
-        body_q=body_q_frames,
-        num_object_points=np.int32(n_obj),
-        rigid_hx=np.float32(cfg.rigid_probe_hx),
-        rigid_hy=np.float32(cfg.rigid_probe_hy),
-        rigid_hz=np.float32(cfg.rigid_probe_hz),
-        sim_dt=np.float32(sim_dt),
-        substeps_per_frame=np.int32(substeps),
-    )
+    scene_payload: dict = {
+        "particle_q_object": obj_q_frames,
+        "body_q": body_q_frames,
+        "num_object_points": np.int32(n_obj),
+        "rigid_hx": np.float32(float(probe_meta.get("rigid_hx", cfg.rigid_probe_hx))),
+        "rigid_hy": np.float32(float(probe_meta.get("rigid_hy", cfg.rigid_probe_hy))),
+        "rigid_hz": np.float32(float(probe_meta.get("rigid_hz", cfg.rigid_probe_hz))),
+        "rigid_shape_kind": np.asarray(str(probe_meta.get("shape_kind", "box"))),
+        "sim_dt": np.float32(sim_dt),
+        "substeps_per_frame": np.int32(substeps),
+        "gravity_scalar": np.float32(float(probe_meta.get("gravity_scalar", 0.0))),
+        "gravity_vector": np.asarray(probe_meta.get("gravity_vector", (0.0, 0.0, 0.0)), dtype=np.float32),
+    }
+    if "rigid_mesh_vertices_local" in probe_meta:
+        scene_payload["rigid_mesh_vertices_local"] = np.asarray(
+            probe_meta["rigid_mesh_vertices_local"], dtype=np.float32
+        )
+    if "rigid_mesh_indices" in probe_meta:
+        scene_payload["rigid_mesh_indices"] = np.asarray(
+            probe_meta["rigid_mesh_indices"], dtype=np.int32
+        )
+    if "rigid_mesh_render_edges" in probe_meta:
+        scene_payload["rigid_mesh_render_edges"] = np.asarray(
+            probe_meta["rigid_mesh_render_edges"], dtype=np.int32
+        )
+    if "rigid_mesh_scale" in probe_meta:
+        scene_payload["rigid_mesh_scale"] = np.float32(float(probe_meta["rigid_mesh_scale"]))
+    np.savez_compressed(out_scene_npz, **scene_payload)
 
     with out_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -1602,8 +1835,18 @@ def run_rigid_probe(cfg: SimConfig, ir: dict, device: str) -> dict:
         "sim_dt": float(sim_dt),
         "object_mass_set_to": float(cfg.rigid_probe_object_mass),
         "rigid_mass": float(cfg.rigid_probe_mass),
+        "rigid_shape": str(probe_meta.get("shape_kind", cfg.rigid_probe_shape)),
+        "rigid_probe_offset": [float(v) for v in cfg.rigid_probe_offset],
+        "rigid_probe_velocity": [float(v) for v in cfg.rigid_probe_velocity],
         "drop_controller_springs": bool(cfg.rigid_probe_drop_controller_springs),
         "freeze_controllers": bool(cfg.rigid_probe_freeze_controllers),
+        "ground_plane_added": bool(probe_meta.get("ground_plane_added", False)),
+        "ground_mu": float(probe_meta.get("ground_mu", 0.0)),
+        "ground_restitution": float(probe_meta.get("ground_restitution", 0.0)),
+        "gravity_scalar": float(probe_meta.get("gravity_scalar", 0.0)),
+        "gravity_vector": [float(v) for v in probe_meta.get("gravity_vector", (0.0, 0.0, 0.0))],
+        "use_scene_gravity": bool(cfg.rigid_probe_use_scene_gravity),
+        "probe_add_ground_plane": bool(cfg.rigid_probe_add_ground_plane),
         "initial_total_momentum_norm": p0_norm,
         "final_total_momentum_norm": float(np.linalg.norm(p1)),
         "momentum_delta_norm": p_delta_norm,
@@ -1619,6 +1862,12 @@ def run_rigid_probe(cfg: SimConfig, ir: dict, device: str) -> dict:
             "scene_npz": str(out_scene_npz),
         },
     }
+    if "rigid_mesh_asset_path" in probe_meta:
+        summary["rigid_mesh_asset_path"] = str(probe_meta["rigid_mesh_asset_path"])
+    if "rigid_mesh_prim_path" in probe_meta:
+        summary["rigid_mesh_prim_path"] = str(probe_meta["rigid_mesh_prim_path"])
+    if "rigid_mesh_scale" in probe_meta:
+        summary["rigid_mesh_scale"] = float(probe_meta["rigid_mesh_scale"])
 
     with out_json.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
