@@ -104,7 +104,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Pass-through to importer: run Newton collision detection each substep to enable "
-            "particle-vs-shape contacts (e.g. ground plane)."
+            "particle-vs-shape contacts (e.g. ground plane). Ground-plane contacts also enable "
+            "this pipeline automatically when --add-ground-plane is set."
         ),
     )
     parser.add_argument(
@@ -112,8 +113,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Pass-through to importer: add a ground plane shape. Requires shape contacts (or IR self_collision=True) "
-            "for forces to be applied."
+            "Pass-through to importer: add a ground plane shape. Importer will automatically "
+            "enable collision pipeline so plane contact forces are applied."
         ),
     )
     parser.add_argument(
@@ -155,6 +156,10 @@ def parse_args() -> argparse.Namespace:
         "--strict-physics-checks",
         action=argparse.BooleanOptionalAction,
         default=True,
+        help=(
+            "Pass-through to importer: enforce PhysTwin-parity validation and disallow "
+            "silent fallback for required parity fields."
+        ),
     )
 
     # ── Drag ──
@@ -162,7 +167,10 @@ def parse_args() -> argparse.Namespace:
         "--apply-drag",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable PhysTwin-style drag in the importer.",
+        help=(
+            "Pass-through to importer. Defaults to ON and applies PhysTwin-style "
+            "drag correction to spring-mass object particles only."
+        ),
     )
     parser.add_argument("--drag-damping-scale", type=float, default=1.0)
 

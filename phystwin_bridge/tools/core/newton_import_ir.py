@@ -25,6 +25,7 @@ They will automatically interact through Newton's collision system.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import time
 from dataclasses import dataclass, field
@@ -117,6 +118,7 @@ class SimConfig:
     strict_physics_checks: bool = True
 
     # Drag
+    # Bridge-side PhysTwin drag emulation (applied to spring-mass object particles only).
     apply_drag: bool = True
     drag_damping_scale: float = 1.0
 
@@ -127,6 +129,22 @@ class SimConfig:
 
     # Baseline
     inference_path: Path | None = None
+
+    # Optional two-way interaction probe (importer-native CLI mode).
+    rigid_probe: bool = False
+    rigid_probe_object_mass: float = 1.0
+    rigid_probe_drop_controller_springs: bool = True
+    rigid_probe_freeze_controllers: bool = True
+    rigid_probe_mass: float = 5.0
+    rigid_probe_inertia_diag: float = 0.05
+    rigid_probe_hx: float = 0.02
+    rigid_probe_hy: float = 0.02
+    rigid_probe_hz: float = 0.02
+    rigid_probe_offset: tuple[float, float, float] = (-0.18, 0.0, 0.02)
+    rigid_probe_velocity: tuple[float, float, float] = (1.2, 0.0, 0.0)
+    rigid_probe_mu: float = 0.4
+    rigid_probe_ke: float = 5.0e4
+    rigid_probe_kd: float = 5.0e2
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> SimConfig:
@@ -163,6 +181,20 @@ class SimConfig:
             ground_mu_scale=args.ground_mu_scale,
             ground_restitution_scale=args.ground_restitution_scale,
             inference_path=args.inference,
+            rigid_probe=args.rigid_probe,
+            rigid_probe_object_mass=args.rigid_probe_object_mass,
+            rigid_probe_drop_controller_springs=args.rigid_probe_drop_controller_springs,
+            rigid_probe_freeze_controllers=args.rigid_probe_freeze_controllers,
+            rigid_probe_mass=args.rigid_probe_mass,
+            rigid_probe_inertia_diag=args.rigid_probe_inertia_diag,
+            rigid_probe_hx=args.rigid_probe_hx,
+            rigid_probe_hy=args.rigid_probe_hy,
+            rigid_probe_hz=args.rigid_probe_hz,
+            rigid_probe_offset=tuple(args.rigid_probe_offset),
+            rigid_probe_velocity=tuple(args.rigid_probe_velocity),
+            rigid_probe_mu=args.rigid_probe_mu,
+            rigid_probe_ke=args.rigid_probe_ke,
+            rigid_probe_kd=args.rigid_probe_kd,
         )
 
 
@@ -244,7 +276,8 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Enable particle-vs-shape contacts (e.g. ground plane) by running Newton "
-            "collision detection each substep."
+            "collision detection each substep. Ground-plane contacts also enable this "
+            "pipeline automatically when --add-ground-plane is set."
         ),
     )
     p.add_argument(
@@ -253,7 +286,8 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "Add a ground plane shape to the model. Particle-vs-plane forces require running the "
-            "collision pipeline (see --shape-contacts; also enabled by IR self_collision=True)."
+            "collision pipeline; this importer enables that pipeline automatically when a ground "
+            "plane is present (or when --shape-contacts / IR self_collision is enabled)."
         ),
     )
     p.add_argument(
@@ -306,9 +340,23 @@ def parse_args() -> argparse.Namespace:
         "--interpolate-controls", action=argparse.BooleanOptionalAction, default=True
     )
     p.add_argument(
-        "--strict-physics-checks", action=argparse.BooleanOptionalAction, default=True
+        "--strict-physics-checks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable PhysTwin-parity validation (missing parity fields cause errors). "
+            "Use --no-strict-physics-checks for explicit native-Newton experimentation."
+        ),
     )
-    p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--apply-drag",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply PhysTwin-style drag damping on spring-mass object particles only. "
+            "Use --no-apply-drag to disable."
+        ),
+    )
     p.add_argument("--drag-damping-scale", type=float, default=1.0)
 
     # Friction / restitution
@@ -318,6 +366,52 @@ def parse_args() -> argparse.Namespace:
 
     # Baseline
     p.add_argument("--inference", type=Path, default=None)
+
+    # Optional rigid-body two-way probe (integrated in importer CLI).
+    p.add_argument(
+        "--rigid-probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run built-in two-way interaction probe mode: imported spring-mass object "
+            "vs one native Newton rigid box. Outputs probe diagnostics instead of parity baseline files."
+        ),
+    )
+    p.add_argument("--rigid-probe-object-mass", type=float, default=1.0)
+    p.add_argument(
+        "--rigid-probe-drop-controller-springs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop springs connected to controller particles in probe mode.",
+    )
+    p.add_argument(
+        "--rigid-probe-freeze-controllers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze controller particles at frame-0 targets in probe mode.",
+    )
+    p.add_argument("--rigid-probe-mass", type=float, default=5.0)
+    p.add_argument("--rigid-probe-inertia-diag", type=float, default=0.05)
+    p.add_argument("--rigid-probe-hx", type=float, default=0.02)
+    p.add_argument("--rigid-probe-hy", type=float, default=0.02)
+    p.add_argument("--rigid-probe-hz", type=float, default=0.02)
+    p.add_argument(
+        "--rigid-probe-offset",
+        type=float,
+        nargs=3,
+        default=(-0.18, 0.0, 0.02),
+        metavar=("DX", "DY", "DZ"),
+    )
+    p.add_argument(
+        "--rigid-probe-velocity",
+        type=float,
+        nargs=3,
+        default=(1.2, 0.0, 0.0),
+        metavar=("VX", "VY", "VZ"),
+    )
+    p.add_argument("--rigid-probe-mu", type=float, default=0.4)
+    p.add_argument("--rigid-probe-ke", type=float, default=5e4)
+    p.add_argument("--rigid-probe-kd", type=float, default=5e2)
 
     return p.parse_args()
 
@@ -457,6 +551,22 @@ def _validate_config_ranges(cfg: SimConfig) -> None:
         raise ValueError(
             f"--particle-contact-ke must be > 0 when provided, got {cfg.particle_contact_ke}"
         )
+    if cfg.rigid_probe:
+        if cfg.rigid_probe_object_mass <= 0.0:
+            raise ValueError(
+                f"--rigid-probe-object-mass must be > 0, got {cfg.rigid_probe_object_mass}"
+            )
+        if cfg.rigid_probe_mass <= 0.0:
+            raise ValueError(f"--rigid-probe-mass must be > 0, got {cfg.rigid_probe_mass}")
+        if cfg.rigid_probe_inertia_diag <= 0.0:
+            raise ValueError(
+                f"--rigid-probe-inertia-diag must be > 0, got {cfg.rigid_probe_inertia_diag}"
+            )
+        if cfg.rigid_probe_hx <= 0.0 or cfg.rigid_probe_hy <= 0.0 or cfg.rigid_probe_hz <= 0.0:
+            raise ValueError(
+                "Rigid probe box half extents must be > 0 "
+                f"(got hx={cfg.rigid_probe_hx}, hy={cfg.rigid_probe_hy}, hz={cfg.rigid_probe_hz})"
+            )
 
 
 def validate_ir_physics(ir: dict, cfg: SimConfig) -> dict:
@@ -532,6 +642,54 @@ def validate_ir_physics(ir: dict, cfg: SimConfig) -> dict:
     if "self_collision" in ir:
         checks["self_collision"] = ir_bool(ir, "self_collision")
 
+    # Ground-plane parity fields (PhysTwin uses an implicit z=0 plane with
+    # collide_elas/collide_fric and reverse_z).
+    if "reverse_z" in ir:
+        checks["reverse_z"] = ir_bool(ir, "reverse_z")
+    elif strict:
+        raise ValueError("Strict mode requires reverse_z for ground-plane orientation.")
+
+    if "contact_collide_elas" in ir:
+        ground_e = ir_scalar(ir, "contact_collide_elas")
+        if not np.isfinite(ground_e):
+            raise ValueError(f"Non-finite contact_collide_elas: {ground_e}")
+        checks["ground_contact_elas_raw"] = float(ground_e)
+    elif strict:
+        raise ValueError(
+            "Strict mode requires contact_collide_elas (PhysTwin ground restitution)."
+        )
+
+    if "contact_collide_fric" in ir:
+        ground_mu = ir_scalar(ir, "contact_collide_fric")
+        if not np.isfinite(ground_mu):
+            raise ValueError(f"Non-finite contact_collide_fric: {ground_mu}")
+        checks["ground_contact_fric_raw"] = float(ground_mu)
+    elif strict:
+        raise ValueError(
+            "Strict mode requires contact_collide_fric (PhysTwin ground friction)."
+        )
+
+    # PhysTwin particle-particle collision coefficients (exported even when kernel disabled).
+    if "contact_collide_object_elas" in ir:
+        obj_e = ir_scalar(ir, "contact_collide_object_elas")
+        if not np.isfinite(obj_e):
+            raise ValueError(f"Non-finite contact_collide_object_elas: {obj_e}")
+        checks["object_contact_elas_raw"] = float(obj_e)
+    elif strict:
+        raise ValueError(
+            "Strict mode requires contact_collide_object_elas in IR."
+        )
+
+    if "contact_collide_object_fric" in ir:
+        obj_mu = ir_scalar(ir, "contact_collide_object_fric")
+        if not np.isfinite(obj_mu):
+            raise ValueError(f"Non-finite contact_collide_object_fric: {obj_mu}")
+        checks["object_contact_fric_raw"] = float(obj_mu)
+    elif strict:
+        raise ValueError(
+            "Strict mode requires contact_collide_object_fric in IR."
+        )
+
     return checks
 
 
@@ -568,6 +726,16 @@ def _resolve_particle_contacts(cfg: SimConfig, ir: dict) -> bool:
     if cfg.particle_contacts is not None:
         return cfg.particle_contacts
     return ir_bool(ir, "self_collision")
+
+
+def _use_collision_pipeline(cfg: SimConfig, ir: dict) -> bool:
+    """Decide whether to run Newton's shape-collision pipeline this rollout.
+
+    PhysTwin always applies ground-plane collision in its integrator, independent
+    of `self_collision`. To preserve parity, we must run the collision pipeline
+    whenever a ground plane is present, not only when self-collision is enabled.
+    """
+    return bool(cfg.shape_contacts or cfg.add_ground_plane or ir_bool(ir, "self_collision"))
 
 
 def _add_particles(
@@ -728,14 +896,18 @@ def _apply_ps_object_collision_mapping(
     - PhysTwin uses impulse-style pairwise collision response.
     - Newton SemiImplicit uses penalty-force particle contacts.
     """
-    if (
-        "contact_collide_object_elas" not in ir
-        and "contact_collide_object_fric" not in ir
-    ):
+    has_elas = "contact_collide_object_elas" in ir
+    has_fric = "contact_collide_object_fric" in ir
+    if (not has_elas) and (not has_fric):
         return False
+    if has_elas != has_fric:
+        raise ValueError(
+            "IR must provide both contact_collide_object_elas and "
+            "contact_collide_object_fric together for PS object-contact mapping."
+        )
 
-    elas_raw = ir_scalar(ir, "contact_collide_object_elas", default=0.7)
-    fric_raw = ir_scalar(ir, "contact_collide_object_fric", default=0.3)
+    elas_raw = ir_scalar(ir, "contact_collide_object_elas")
+    fric_raw = ir_scalar(ir, "contact_collide_object_fric")
 
     # 1) Friction coefficient maps directly.
     mu = float(np.clip(fric_raw, 0.0, MU_MAX))
@@ -864,15 +1036,9 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
     state_in = model.state()
     state_out = model.state()
     control = model.control()
-    # Shape contacts (particles vs rigid shapes) require running Newton's collision pipeline.
-    #
-    # We run the collision pipeline when either:
-    # - the user explicitly requests it (--shape-contacts), or
-    # - the IR indicates PhysTwin collisions were enabled (self_collision=True).
-    #
-    # This preserves parity/performance characteristics of existing cases:
-    # contact-heavy cases run collisions; others skip the expensive pipeline.
-    collision_pipeline_enabled = bool(cfg.shape_contacts or ir_bool(ir, "self_collision"))
+    # Shape contacts (including the ground plane) require running Newton's
+    # collision pipeline each substep.
+    collision_pipeline_enabled = _use_collision_pipeline(cfg, ir)
     contacts = model.contacts() if collision_pipeline_enabled else None
 
     # Controller arrays
@@ -975,6 +1141,8 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
             if drag > 0.0:
                 # PhysTwin drag is a post-step velocity damping; Newton doesn't have
                 # an equivalent built-in knob, so we apply it explicitly here.
+                # Important: this is limited to the first n_obj spring-mass object
+                # particles (controllers and any other non-object entities are untouched).
                 wp.launch(
                     _apply_drag_correction,
                     dim=n_obj,
@@ -1107,7 +1275,7 @@ def save_results(
         },
         "contacts": {
             "shape_contacts_requested": bool(cfg.shape_contacts),
-            "collision_pipeline_enabled": bool(cfg.shape_contacts or ir_bool(ir, "self_collision")),
+            "collision_pipeline_enabled": _use_collision_pipeline(cfg, ir),
             "ground_plane": bool(cfg.add_ground_plane),
             "particle_contacts": model_result.checks.get(
                 "particle_contacts_enabled", False
@@ -1128,6 +1296,336 @@ def save_results(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Optional rigid probe mode (two-way coupling diagnostics)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _to_body_translation(body_q: np.ndarray) -> np.ndarray:
+    if body_q.ndim != 2 or body_q.shape[1] < 3:
+        raise ValueError(f"Unexpected body_q shape: {body_q.shape}")
+    return body_q[:, :3]
+
+
+def _build_rigid_probe_model(
+    ir: dict, cfg: SimConfig, device: str
+) -> tuple[newton.Model, int, np.ndarray]:
+    """Build a probe model: imported spring-mass object + one native rigid box."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.from_any(cfg.up_axis), gravity=0.0)
+
+    x0 = np.asarray(ir["x0"], dtype=np.float32)
+    v0 = np.asarray(ir["v0"], dtype=np.float32)
+    mass = np.asarray(ir["mass"], dtype=np.float32).copy()
+    n_total = x0.shape[0]
+    n_obj = int(np.asarray(ir["num_object_points"]).ravel()[0])
+    if n_obj <= 0 or n_obj > n_total:
+        raise ValueError(f"Invalid num_object_points={n_obj} for total={n_total}")
+
+    # Probe requirement: use a known object-particle mass for momentum diagnostics.
+    mass[:n_obj] = float(cfg.rigid_probe_object_mass)
+
+    radius, _, _ = resolve_collision_radius(ir, n_total)
+    if "contact_collision_dist" in ir:
+        collision_dist = ir_scalar(ir, "contact_collision_dist")
+        radius[:n_obj] = max(collision_dist * 0.5, EPSILON)
+    if "controller_idx" in ir:
+        ctrl_idx = np.asarray(ir["controller_idx"], dtype=np.int64).ravel()
+        if ctrl_idx.size:
+            radius[ctrl_idx] = float(cfg.particle_contact_radius)
+
+    flags = np.full(n_total, int(newton.ParticleFlags.ACTIVE), dtype=np.int32)
+    builder.add_particles(
+        pos=[tuple(row.tolist()) for row in x0],
+        vel=[tuple(row.tolist()) for row in v0],
+        mass=mass.astype(float).tolist(),
+        radius=radius.astype(float).tolist(),
+        flags=flags.astype(int).tolist(),
+    )
+
+    edges = np.asarray(ir["spring_edges"], dtype=np.int32)
+    rest = np.asarray(ir["spring_rest_length"], dtype=np.float32).ravel()
+    ke = np.asarray(ir["spring_ke"], dtype=np.float32).ravel() * cfg.spring_ke_scale
+    kd = np.asarray(ir["spring_kd"], dtype=np.float32).ravel() * cfg.spring_kd_scale
+    if not (edges.shape[0] == rest.shape[0] == ke.shape[0] == kd.shape[0]):
+        raise ValueError("Spring arrays have inconsistent lengths.")
+
+    if cfg.rigid_probe_drop_controller_springs:
+        keep = (edges[:, 0] < n_obj) & (edges[:, 1] < n_obj)
+        edges = edges[keep]
+        rest = rest[keep]
+        ke = ke[keep]
+        kd = kd[keep]
+
+    for idx in range(edges.shape[0]):
+        i = int(edges[idx, 0])
+        j = int(edges[idx, 1])
+        builder.add_spring(i=i, j=j, ke=float(ke[idx]), kd=float(kd[idx]), control=0.0)
+        builder.spring_rest_length[-1] = float(rest[idx])
+
+    obj_center = x0[:n_obj].mean(axis=0)
+    body_pos = obj_center + np.asarray(cfg.rigid_probe_offset, dtype=np.float32)
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(*body_pos.tolist()), wp.quat_identity()),
+        mass=float(cfg.rigid_probe_mass),
+        inertia=wp.mat33(
+            float(cfg.rigid_probe_inertia_diag),
+            0.0,
+            0.0,
+            0.0,
+            float(cfg.rigid_probe_inertia_diag),
+            0.0,
+            0.0,
+            0.0,
+            float(cfg.rigid_probe_inertia_diag),
+        ),
+        lock_inertia=True,
+        label="rigid_probe_box",
+    )
+    rigid_cfg = builder.default_shape_cfg.copy()
+    rigid_cfg.mu = float(cfg.rigid_probe_mu)
+    rigid_cfg.ke = float(cfg.rigid_probe_ke)
+    rigid_cfg.kd = float(cfg.rigid_probe_kd)
+    builder.add_shape_box(
+        body=body,
+        hx=float(cfg.rigid_probe_hx),
+        hy=float(cfg.rigid_probe_hy),
+        hz=float(cfg.rigid_probe_hz),
+        cfg=rigid_cfg,
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+    return model, n_obj, mass
+
+
+def run_rigid_probe(cfg: SimConfig, ir: dict, device: str) -> dict:
+    """Run importer-integrated rigid probe mode and write diagnostics files."""
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    model, n_obj, particle_mass = _build_rigid_probe_model(ir, cfg, device)
+
+    solver = newton.solvers.SolverSemiImplicit(
+        model,
+        angular_damping=cfg.angular_damping,
+        friction_smoothing=cfg.friction_smoothing,
+        enable_tri_contact=cfg.enable_tri_contact,
+    )
+    contacts = model.contacts()
+    control = model.control()
+    state_in = model.state()
+    state_out = model.state()
+
+    ctrl_idx = np.asarray(
+        ir.get("controller_idx", np.zeros((0,), dtype=np.int32)), dtype=np.int32
+    ).ravel()
+    ctrl_idx_wp = None
+    ctrl_target_wp = None
+    ctrl_vel_wp = None
+    if cfg.rigid_probe_freeze_controllers and ctrl_idx.size:
+        ctrl_traj = np.asarray(ir["controller_traj"], dtype=np.float32)
+        ctrl_target_wp = wp.array(ctrl_traj[0], dtype=wp.vec3, device=device)
+        ctrl_idx_wp = wp.array(ctrl_idx, dtype=wp.int32, device=device)
+        ctrl_vel_wp = wp.zeros(ctrl_idx.size, dtype=wp.vec3, device=device)
+
+    body_qd = state_in.body_qd.numpy()
+    if body_qd.shape[0] < 1:
+        raise RuntimeError("Rigid probe requires one rigid body.")
+    body_qd[0, 0:3] = np.asarray(cfg.rigid_probe_velocity, dtype=np.float32)
+    body_qd[0, 3:6] = 0.0
+    state_in.body_qd.assign(body_qd.astype(np.float32))
+
+    sim_dt = cfg.sim_dt if cfg.sim_dt is not None else ir_scalar(ir, "sim_dt")
+    substeps = cfg.substeps_per_frame or int(ir_scalar(ir, "sim_substeps"))
+    substeps = max(1, substeps)
+    n_frames = max(2, int(cfg.num_frames))
+
+    drag = 0.0
+    if cfg.apply_drag and "drag_damping" in ir:
+        drag = ir_scalar(ir, "drag_damping") * cfg.drag_damping_scale
+
+    body_pos_hist: list[np.ndarray] = []
+    body_vel_hist: list[np.ndarray] = []
+    obj_com_hist: list[np.ndarray] = []
+    p_obj_hist: list[np.ndarray] = []
+    p_body_hist: list[np.ndarray] = []
+    p_total_hist: list[np.ndarray] = []
+    # Scene capture for visualization (particles + rigid body).
+    # We capture per-frame snapshots (not per-substep) to keep size manageable.
+    obj_q_hist: list[np.ndarray] = []
+    body_q_hist: list[np.ndarray] = []
+
+    t0 = time.perf_counter()
+    for _frame in range(n_frames):
+        q = state_in.particle_q.numpy().astype(np.float32)
+        qd = state_in.particle_qd.numpy().astype(np.float32)
+        body_q_raw = state_in.body_q.numpy().astype(np.float32)
+        bq = _to_body_translation(body_q_raw)[0]
+        bqd = state_in.body_qd.numpy().astype(np.float32)[0, 0:3]
+
+        obj_q = q[:n_obj]
+        obj_qd = qd[:n_obj]
+        obj_mass = particle_mass[:n_obj].astype(np.float32)
+        obj_com = (obj_q * obj_mass[:, None]).sum(axis=0) / max(float(obj_mass.sum()), EPSILON)
+        p_obj = (obj_qd * obj_mass[:, None]).sum(axis=0)
+        p_body = bqd * float(cfg.rigid_probe_mass)
+        p_total = p_obj + p_body
+
+        body_pos_hist.append(bq.copy())
+        body_vel_hist.append(bqd.copy())
+        obj_com_hist.append(obj_com.copy())
+        p_obj_hist.append(p_obj.copy())
+        p_body_hist.append(p_body.copy())
+        p_total_hist.append(p_total.copy())
+        obj_q_hist.append(obj_q.copy())
+        body_q_hist.append(body_q_raw[0].copy())
+
+        for _sub in range(substeps):
+            state_in.clear_forces()
+
+            if ctrl_idx_wp is not None and ctrl_target_wp is not None and ctrl_vel_wp is not None:
+                wp.launch(
+                    _write_kinematic_state,
+                    dim=ctrl_idx.size,
+                    inputs=[
+                        state_in.particle_q,
+                        state_in.particle_qd,
+                        ctrl_idx_wp,
+                        ctrl_target_wp,
+                        ctrl_vel_wp,
+                    ],
+                    device=device,
+                )
+
+            model.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, sim_dt)
+            state_in, state_out = state_out, state_in
+
+            if drag > 0.0:
+                wp.launch(
+                    _apply_drag_correction,
+                    dim=n_obj,
+                    inputs=[
+                        state_in.particle_q,
+                        state_in.particle_qd,
+                        n_obj,
+                        sim_dt,
+                        drag,
+                    ],
+                    device=device,
+                )
+
+    wall_time = time.perf_counter() - t0
+
+    body_pos = np.asarray(body_pos_hist, dtype=np.float32)
+    body_vel = np.asarray(body_vel_hist, dtype=np.float32)
+    obj_com = np.asarray(obj_com_hist, dtype=np.float32)
+    p_obj = np.asarray(p_obj_hist, dtype=np.float32)
+    p_body = np.asarray(p_body_hist, dtype=np.float32)
+    p_total = np.asarray(p_total_hist, dtype=np.float32)
+    obj_q_frames = np.asarray(obj_q_hist, dtype=np.float32)
+    body_q_frames = np.asarray(body_q_hist, dtype=np.float32)
+
+    p0 = p_total[0]
+    p1 = p_total[-1]
+    p_delta = p1 - p0
+    p_delta_norm = float(np.linalg.norm(p_delta))
+    p0_norm = float(np.linalg.norm(p0))
+    p_rel = float(p_delta_norm / max(p0_norm, EPSILON))
+    body_speed0 = float(np.linalg.norm(body_vel[0]))
+    body_speed_min = float(np.min(np.linalg.norm(body_vel, axis=1)))
+    body_speed_end = float(np.linalg.norm(body_vel[-1]))
+    min_body_obj_dist = float(np.min(np.linalg.norm(body_pos - obj_com, axis=1)))
+
+    out_npz = cfg.out_dir / f"{cfg.output_prefix}.npz"
+    out_csv = cfg.out_dir / f"{cfg.output_prefix}_timeseries.csv"
+    out_json = cfg.out_dir / f"{cfg.output_prefix}.json"
+    out_scene_npz = cfg.out_dir / f"{cfg.output_prefix}_scene.npz"
+
+    np.savez_compressed(
+        out_npz,
+        body_pos=body_pos,
+        body_vel=body_vel,
+        object_com=obj_com,
+        p_obj=p_obj,
+        p_body=p_body,
+        p_total=p_total,
+        sim_dt=np.float32(sim_dt),
+        substeps_per_frame=np.int32(substeps),
+    )
+    np.savez_compressed(
+        out_scene_npz,
+        particle_q_object=obj_q_frames,
+        body_q=body_q_frames,
+        num_object_points=np.int32(n_obj),
+        rigid_hx=np.float32(cfg.rigid_probe_hx),
+        rigid_hy=np.float32(cfg.rigid_probe_hy),
+        rigid_hz=np.float32(cfg.rigid_probe_hz),
+        sim_dt=np.float32(sim_dt),
+        substeps_per_frame=np.int32(substeps),
+    )
+
+    with out_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "frame",
+                "body_x",
+                "body_y",
+                "body_z",
+                "obj_x",
+                "obj_y",
+                "obj_z",
+                "body_vx",
+                "body_vy",
+                "body_vz",
+                "p_total_x",
+                "p_total_y",
+                "p_total_z",
+            ]
+        )
+        for i in range(body_pos.shape[0]):
+            writer.writerow(
+                [
+                    i,
+                    *body_pos[i].tolist(),
+                    *obj_com[i].tolist(),
+                    *body_vel[i].tolist(),
+                    *p_total[i].tolist(),
+                ]
+            )
+
+    summary = {
+        "mode": "rigid_probe",
+        "ir_path": str(cfg.ir_path),
+        "device_requested": cfg.device,
+        "device_used": str(model.device),
+        "frames": int(n_frames),
+        "substeps_per_frame": int(substeps),
+        "sim_dt": float(sim_dt),
+        "object_mass_set_to": float(cfg.rigid_probe_object_mass),
+        "rigid_mass": float(cfg.rigid_probe_mass),
+        "drop_controller_springs": bool(cfg.rigid_probe_drop_controller_springs),
+        "freeze_controllers": bool(cfg.rigid_probe_freeze_controllers),
+        "initial_total_momentum_norm": p0_norm,
+        "final_total_momentum_norm": float(np.linalg.norm(p1)),
+        "momentum_delta_norm": p_delta_norm,
+        "momentum_delta_relative": p_rel,
+        "body_speed_initial": body_speed0,
+        "body_speed_min": body_speed_min,
+        "body_speed_final": body_speed_end,
+        "min_body_object_com_distance": min_body_obj_dist,
+        "wall_time_sec": wall_time,
+        "outputs": {
+            "npz": str(out_npz),
+            "csv": str(out_csv),
+            "scene_npz": str(out_scene_npz),
+        },
+    }
+
+    with out_json.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    return summary
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1137,10 +1635,14 @@ def main() -> int:
     ir = load_ir(cfg.ir_path)
     device = resolve_device(cfg.device)
     wp.init()
+    _validate_config_ranges(cfg)
 
-    model_result = build_model(ir, cfg, device)
-    sim_result = simulate(model_result.model, ir, cfg, device)
-    summary = save_results(cfg, ir, model_result, sim_result)
+    if cfg.rigid_probe:
+        summary = run_rigid_probe(cfg, ir, device)
+    else:
+        model_result = build_model(ir, cfg, device)
+        sim_result = simulate(model_result.model, ir, cfg, device)
+        summary = save_results(cfg, ir, model_result, sim_result)
 
     print(json.dumps(summary, indent=2))
     return 0

@@ -6,19 +6,19 @@ This script is the "PhysTwin -> Newton bridge" entry point.
 Inputs (from a PhysTwin case directory):
 - `final_data.pkl`: point clouds + controller trajectories (and various metadata)
 - `optimal_params.pkl`: CMA-ES results (used to overwrite config defaults)
-- `best.pth`: trained checkpoint containing per-spring parameters (and, in new runs, topology)
+- `best.pth`: trained checkpoint containing per-spring parameters (`spring_Y`)
+- `topology.npz`: standalone topology sidecar (the only topology source)
 - a config file (`.yaml`): training-time hyperparameters / simulation timing
 
 Output:
 - IR v2 `.npz` bundle (plus a small `.json` summary) consumed by `newton_import_ir.py`.
 
 Design notes:
-- Checkpoint-first topology: when available, we read `spring_edges` and
-  `spring_rest_lengths` directly from `best.pth` so learned `spring_Y[i]` stays
-  aligned with spring edge ordering.
-- Topology is mandatory: checkpoints without stored topology are rejected. In
-  that case you must rerun PhysTwin optimize/train/infer to produce a new
-  checkpoint that stores topology directly.
+- Topology source is sidecar-only: we read `spring_edges` and
+  `spring_rest_lengths` from `topology.npz` and ignore checkpoint topology
+  fields even if they exist.
+- This enforces a single source of truth for topology and keeps export behavior
+  forward-compatible with lean checkpoints.
 - IR schema: we export an explicit per-particle `collision_radius` field and avoid
   ambiguous legacy conventions where a single `radius` could refer to topology vs
   contact radius.
@@ -129,6 +129,35 @@ def resolve_scalar_from_sources(
     return float(default), "default"
 
 
+def resolve_scalar_checkpoint_strict(
+    key: str, checkpoint: dict, default: float
+) -> tuple[float, str]:
+    """Resolve a scalar strictly from checkpoint (PhysTwin inference parity mode).
+
+    PhysTwin inference loads collision coefficients from the selected checkpoint.
+    In strict export mode we mirror that behavior and fail fast if fields are missing.
+    """
+    if key not in checkpoint:
+        raise KeyError(
+            f"Strict PhysTwin export requires {key!r} in checkpoint (best.pth). "
+            "Refusing to fall back to optimal_params/config/default."
+        )
+    value = to_scalar(checkpoint[key], default)
+    if not np.isfinite(value):
+        raise ValueError(f"Checkpoint value for {key!r} is non-finite: {value}")
+    return float(value), "checkpoint"
+
+
+def require_config_keys(config: dict, keys: list[str], context: str) -> None:
+    """Fail fast when required config keys are missing."""
+    missing = [key for key in keys if key not in config]
+    if missing:
+        raise KeyError(
+            f"{context}: missing required config keys: {missing}. "
+            "Add them to YAML/optimal_params or run with --no-strict-phystwin."
+        )
+
+
 def to_array(value, dtype: np.dtype | type | None = None) -> np.ndarray:
     """Convert tensor/ndarray/list -> numpy array (optionally casting dtype)."""
     if isinstance(value, torch.Tensor):
@@ -163,6 +192,34 @@ def build_structure_points(final_data: dict) -> tuple[np.ndarray, np.ndarray]:
     return structure_points, controller_points
 
 
+def load_topology_sidecar(topology_path: Path) -> dict:
+    """Load topology arrays from a standalone topology.npz file."""
+    if not topology_path.exists():
+        raise FileNotFoundError(f"Topology sidecar not found: {topology_path}")
+    with np.load(topology_path, allow_pickle=False) as bundle:
+        if "spring_edges" not in bundle:
+            raise KeyError(f"{topology_path} missing required key: spring_edges")
+        rest_key = (
+            "spring_rest_lengths"
+            if "spring_rest_lengths" in bundle
+            else "spring_rest_length"
+            if "spring_rest_length" in bundle
+            else None
+        )
+        if rest_key is None:
+            raise KeyError(
+                f"{topology_path} missing required key: spring_rest_lengths"
+            )
+        loaded: dict[str, np.ndarray] = {
+            "spring_edges": np.asarray(bundle["spring_edges"]),
+            "spring_rest_lengths": np.asarray(bundle[rest_key]),
+        }
+        for key in ["init_vertices", "init_masses", "num_object_springs"]:
+            if key in bundle:
+                loaded[key] = np.asarray(bundle[key])
+    return loaded
+
+
 def parse_args() -> argparse.Namespace:
     """CLI for exporting an IR bundle."""
     parser = argparse.ArgumentParser(
@@ -172,12 +229,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
+        "--topology",
+        type=Path,
+        default=None,
+        help=(
+            "Topology sidecar path (.npz). "
+            "If omitted, defaults to <case-dir>/topology.npz."
+        ),
+    )
+    parser.add_argument(
         "--strict-phystwin",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Compatibility flag kept for pipeline parity. "
-            "When spring-ke-mode is unset, strict mode defaults to y_over_rest."
+            "Enforce PhysTwin-parity export (no silent fallback for critical fields). "
+            "When spring-ke-mode is unset, strict mode defaults to y_over_rest. "
+            "Use --no-strict-phystwin to allow explicit native-Newton fallback behavior."
         ),
     )
     parser.add_argument(
@@ -203,12 +270,18 @@ def main() -> int:
     case_dir = args.case_dir.resolve()
     config_path = args.config.resolve()
     output_path = args.out.resolve()
+    topology_path = (
+        args.topology.resolve()
+        if args.topology is not None
+        else (case_dir / "topology.npz").resolve()
+    )
 
     required_files = [
         case_dir / "final_data.pkl",
         case_dir / "optimal_params.pkl",
         case_dir / "best.pth",
         config_path,
+        topology_path,
     ]
     for path in required_files:
         if not path.exists():
@@ -227,18 +300,44 @@ def main() -> int:
         optimal_params["init_spring_Y"] = optimal_params.pop("global_spring_Y")
     config.update(optimal_params)
 
-    # Topology radii from PhysTwin config. Topology itself must be loaded from checkpoint.
-    topology_object_radius = float(config.get("object_radius", 0.02))
-    topology_controller_radius = float(config.get("controller_radius", 0.04))
+    if args.strict_phystwin:
+        require_config_keys(
+            config,
+            [
+                "object_radius",
+                "controller_radius",
+                "collision_dist",
+                "dashpot_damping",
+                "drag_damping",
+                "dt",
+                "num_substeps",
+                "FPS",
+                "reverse_z",
+                "self_collision",
+                "spring_Y_min",
+                "spring_Y_max",
+            ],
+            context="strict PhysTwin export",
+        )
+
+    # Topology radii from PhysTwin config (topology data itself is loaded separately).
+    topology_object_radius = float(config["object_radius"]) if args.strict_phystwin else float(config.get("object_radius", 0.02))
+    topology_controller_radius = float(config["controller_radius"]) if args.strict_phystwin else float(config.get("controller_radius", 0.04))
 
     # Collision radii: used by Newton importer to decide contact radii (separate from topology radii).
-    collision_dist = float(config.get("collision_dist", topology_object_radius))
-    collision_object_radius = float(
-        config.get("collision_object_radius", collision_dist)
-    )
-    collision_controller_radius = float(
-        config.get("collision_controller_radius", collision_dist)
-    )
+    collision_dist = float(config["collision_dist"]) if args.strict_phystwin else float(config.get("collision_dist", topology_object_radius))
+    if "collision_object_radius" in config:
+        collision_object_radius = float(config["collision_object_radius"])
+        collision_object_radius_source = "config"
+    else:
+        collision_object_radius = collision_dist
+        collision_object_radius_source = "derived_from_collision_dist"
+    if "collision_controller_radius" in config:
+        collision_controller_radius = float(config["collision_controller_radius"])
+        collision_controller_radius_source = "config"
+    else:
+        collision_controller_radius = collision_dist
+        collision_controller_radius_source = "derived_from_collision_dist"
 
     structure_points, controller_traj = build_structure_points(final_data)
     controller_points_0 = controller_traj[0] if controller_traj.shape[1] > 0 else None
@@ -249,38 +348,45 @@ def main() -> int:
         spring_y = spring_y.detach().cpu().numpy()
     spring_y = np.asarray(spring_y, dtype=np.float32).reshape(-1)
 
-    # Resolve topology strictly from checkpoint.
+    # Topology is sidecar-only by design.
     checkpoint_mass: np.ndarray | None = None
-    if "spring_edges" not in checkpoint or "spring_rest_lengths" not in checkpoint:
-        raise ValueError(
-            "Checkpoint is missing required topology fields ('spring_edges', 'spring_rest_lengths'). "
-            "Do not reconstruct topology from legacy checkpoints. "
-            "Rerun PhysTwin optimize/train/infer and use the new checkpoint."
+    topology_source_file = str(topology_path)
+    topo = load_topology_sidecar(topology_path)
+    edges = np.asarray(topo["spring_edges"], dtype=np.int32)
+    rest_lengths = np.asarray(topo["spring_rest_lengths"], dtype=np.float32).reshape(-1)
+    num_object_springs = int(
+        np.asarray(topo.get("num_object_springs", edges.shape[0])).reshape(-1)[0]
+    )
+    if args.strict_phystwin and "init_vertices" not in topo:
+        raise KeyError(
+            "strict PhysTwin export requires topology.npz to contain init_vertices."
+        )
+    if args.strict_phystwin and "init_masses" not in topo:
+        raise KeyError(
+            "strict PhysTwin export requires topology.npz to contain init_masses."
         )
 
-    edges = to_array(checkpoint["spring_edges"], np.int32)
-    rest_lengths = to_array(checkpoint["spring_rest_lengths"], np.float32).reshape(-1)
+    if "init_vertices" in topo:
+        points_all = np.asarray(topo["init_vertices"], dtype=np.float32)
+    else:
+        points_all = (
+            np.concatenate([structure_points, controller_points_0], axis=0).astype(np.float32)
+            if controller_points_0 is not None
+            else structure_points.astype(np.float32)
+        )
+    if "init_masses" in topo:
+        checkpoint_mass = np.asarray(topo["init_masses"], dtype=np.float32).reshape(-1)
+    used_topology_method = "topology_sidecar"
+
     if edges.ndim != 2 or edges.shape[1] != 2:
-        raise ValueError(f"Expected checkpoint spring_edges shape [N, 2], got {edges.shape}")
+        raise ValueError(f"Expected spring_edges shape [N, 2], got {edges.shape}")
     if rest_lengths.shape[0] != edges.shape[0]:
         raise ValueError(
-            "Checkpoint spring_rest_lengths length mismatch: "
+            "spring_rest_lengths length mismatch: "
             f"rest={rest_lengths.shape[0]}, edges={edges.shape[0]}"
         )
-    num_object_springs = int(checkpoint.get("num_object_springs", edges.shape[0]))
-    if "init_vertices" in checkpoint:
-        points_all = to_array(checkpoint["init_vertices"], np.float32)
-        if points_all.ndim != 2 or points_all.shape[1] != 3:
-            raise ValueError(
-                f"Expected checkpoint init_vertices shape [N, 3], got {points_all.shape}"
-            )
-    else:
-        points_all = np.concatenate(
-            [structure_points, controller_points_0], axis=0
-        ).astype(np.float32) if controller_points_0 is not None else structure_points.astype(np.float32)
-    if "init_masses" in checkpoint:
-        checkpoint_mass = to_array(checkpoint["init_masses"], np.float32).reshape(-1)
-    used_topology_method = "checkpoint_direct"
+    if points_all.ndim != 2 or points_all.shape[1] != 3:
+        raise ValueError(f"Expected init_vertices shape [N, 3], got {points_all.shape}")
     if spring_y.shape[0] != edges.shape[0]:
         raise ValueError(
             f"Spring count mismatch: checkpoint={spring_y.shape[0]}, topology={edges.shape[0]}"
@@ -316,13 +422,6 @@ def main() -> int:
     if not np.all(np.isfinite(spring_ke)):
         raise ValueError("Non-finite spring_ke values generated.")
 
-    checkpoint_num_object_springs = int(checkpoint.get("num_object_springs", num_object_springs))
-    if checkpoint_num_object_springs != num_object_springs:
-        raise ValueError(
-            "Object spring count mismatch: "
-            f"checkpoint={checkpoint_num_object_springs}, topology={num_object_springs}"
-        )
-
     num_object_points = structure_points.shape[0]
     num_particles = points_all.shape[0]
     num_control_points = num_particles - num_object_points
@@ -357,52 +456,77 @@ def main() -> int:
     # Dashpot damping (Newton spring `kd`). PhysTwin uses a global `dashpot_damping` in config.
     spring_kd = np.full(
         (edges.shape[0],),
-        float(config.get("dashpot_damping", 0.0)),
+        float(config["dashpot_damping"]) if args.strict_phystwin else float(config.get("dashpot_damping", 0.0)),
         dtype=np.float32,
     )
     # Clamp range for PhysTwin spring Y (kept for diagnostics; checkpoint may already be clamped).
-    spring_y_min = float(config.get("spring_Y_min", 0.0))
-    spring_y_max = float(config.get("spring_Y_max", 1.0e5))
+    spring_y_min = float(config["spring_Y_min"]) if args.strict_phystwin else float(config.get("spring_Y_min", 0.0))
+    spring_y_max = float(config["spring_Y_max"]) if args.strict_phystwin else float(config.get("spring_Y_max", 1.0e5))
     # Global drag damping used in PhysTwin (optional). Newton importer can emulate this.
-    drag_damping = float(config.get("drag_damping", 0.0))
+    drag_damping = float(config["drag_damping"]) if args.strict_phystwin else float(config.get("drag_damping", 0.0))
 
     # Timing / stepping parameters (used by importer defaults).
-    sim_dt = float(config.get("dt", 5e-5))
-    sim_substeps = int(config.get("num_substeps", 1))
-    sim_fps = float(config.get("FPS", 30))
-    self_collision = bool(config.get("self_collision", False))
+    sim_dt = float(config["dt"]) if args.strict_phystwin else float(config.get("dt", 5e-5))
+    sim_substeps = int(config["num_substeps"]) if args.strict_phystwin else int(config.get("num_substeps", 1))
+    sim_fps = float(config["FPS"]) if args.strict_phystwin else float(config.get("FPS", 30))
+    self_collision = bool(config["self_collision"]) if args.strict_phystwin else bool(config.get("self_collision", False))
+    reverse_z = bool(config["reverse_z"]) if args.strict_phystwin else bool(config.get("reverse_z", True))
 
-    collide_elas, collide_elas_source = resolve_scalar_from_sources(
-        key="collide_elas",
-        checkpoint=checkpoint,
-        optimal_params=optimal_params,
-        config=config,
-        default=0.5,
-    )
-    collide_fric, collide_fric_source = resolve_scalar_from_sources(
-        key="collide_fric",
-        checkpoint=checkpoint,
-        optimal_params=optimal_params,
-        config=config,
-        default=0.3,
-    )
+    if args.strict_phystwin:
+        collide_elas, collide_elas_source = resolve_scalar_checkpoint_strict(
+            key="collide_elas",
+            checkpoint=checkpoint,
+            default=0.5,
+        )
+        collide_fric, collide_fric_source = resolve_scalar_checkpoint_strict(
+            key="collide_fric",
+            checkpoint=checkpoint,
+            default=0.3,
+        )
+    else:
+        collide_elas, collide_elas_source = resolve_scalar_from_sources(
+            key="collide_elas",
+            checkpoint=checkpoint,
+            optimal_params=optimal_params,
+            config=config,
+            default=0.5,
+        )
+        collide_fric, collide_fric_source = resolve_scalar_from_sources(
+            key="collide_fric",
+            checkpoint=checkpoint,
+            optimal_params=optimal_params,
+            config=config,
+            default=0.3,
+        )
     # PhysTwin particle-particle collision parameters (impulse model).
     # Keep them as optional IR fields so Newton-side experiments can map them
     # to SemiImplicit particle-contact coefficients when explicitly enabled.
-    collide_object_elas, collide_object_elas_source = resolve_scalar_from_sources(
-        key="collide_object_elas",
-        checkpoint=checkpoint,
-        optimal_params=optimal_params,
-        config=config,
-        default=0.7,
-    )
-    collide_object_fric, collide_object_fric_source = resolve_scalar_from_sources(
-        key="collide_object_fric",
-        checkpoint=checkpoint,
-        optimal_params=optimal_params,
-        config=config,
-        default=0.3,
-    )
+    if args.strict_phystwin:
+        collide_object_elas, collide_object_elas_source = resolve_scalar_checkpoint_strict(
+            key="collide_object_elas",
+            checkpoint=checkpoint,
+            default=0.7,
+        )
+        collide_object_fric, collide_object_fric_source = resolve_scalar_checkpoint_strict(
+            key="collide_object_fric",
+            checkpoint=checkpoint,
+            default=0.3,
+        )
+    else:
+        collide_object_elas, collide_object_elas_source = resolve_scalar_from_sources(
+            key="collide_object_elas",
+            checkpoint=checkpoint,
+            optimal_params=optimal_params,
+            config=config,
+            default=0.7,
+        )
+        collide_object_fric, collide_object_fric_source = resolve_scalar_from_sources(
+            key="collide_object_fric",
+            checkpoint=checkpoint,
+            optimal_params=optimal_params,
+            config=config,
+            default=0.3,
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -433,7 +557,7 @@ def main() -> int:
         # ---- Simulation timing / contact knobs ----
         sim_dt=np.asarray(sim_dt, dtype=np.float32),
         sim_substeps=np.asarray(sim_substeps, dtype=np.int32),
-        reverse_z=np.asarray(bool(config.get("reverse_z", True))),
+        reverse_z=np.asarray(reverse_z),
         self_collision=np.asarray(self_collision),
         contact_collide_elas=np.asarray(collide_elas, dtype=np.float32),
         contact_collide_fric=np.asarray(collide_fric, dtype=np.float32),
@@ -448,6 +572,7 @@ def main() -> int:
         "case_name": case_dir.name,
         "output": str(output_path),
         "topology_method": used_topology_method,
+        "topology_source_file": topology_source_file,
         "num_particles": int(num_particles),
         "num_object_points": int(num_object_points),
         "num_control_points": int(num_control_points),
@@ -467,9 +592,12 @@ def main() -> int:
         "topology_controller_radius": float(topology_controller_radius),
         "collision_object_radius": float(collision_object_radius),
         "collision_controller_radius": float(collision_controller_radius),
+        "collision_object_radius_source": collision_object_radius_source,
+        "collision_controller_radius_source": collision_controller_radius_source,
         "sim_dt": sim_dt,
         "sim_substeps": sim_substeps,
         "sim_fps": sim_fps,
+        "reverse_z": bool(reverse_z),
         "self_collision": bool(self_collision),
         "contact_collide_elas_source": collide_elas_source,
         "contact_collide_fric_source": collide_fric_source,

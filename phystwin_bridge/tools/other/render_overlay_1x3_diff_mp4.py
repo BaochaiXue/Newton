@@ -105,6 +105,36 @@ def _parse_rgb(value: str) -> np.ndarray:
     return rgb.astype(np.uint8)
 
 
+def _rgb_to_color_name(rgb_u8: np.ndarray) -> str:
+    """Map an RGB triplet to a short, human-readable color name.
+
+    The goal is to keep video labels short (avoid printing numeric RGB values).
+    We use a small palette and pick the nearest color by L2 distance.
+    """
+
+    rgb = np.asarray(rgb_u8, dtype=np.int32).reshape(3)
+    palette = {
+        "Cyan": np.asarray([0, 255, 255], dtype=np.int32),
+        "Orange": np.asarray([255, 180, 0], dtype=np.int32),
+        "Red": np.asarray([255, 0, 0], dtype=np.int32),
+        "Green": np.asarray([0, 255, 0], dtype=np.int32),
+        "Blue": np.asarray([0, 0, 255], dtype=np.int32),
+        "Magenta": np.asarray([255, 0, 255], dtype=np.int32),
+        "Yellow": np.asarray([255, 255, 0], dtype=np.int32),
+        "White": np.asarray([255, 255, 255], dtype=np.int32),
+        "Black": np.asarray([0, 0, 0], dtype=np.int32),
+        "Gray": np.asarray([128, 128, 128], dtype=np.int32),
+    }
+    best_name = "Custom"
+    best_dist = None
+    for name, ref in palette.items():
+        dist = int(np.sum((rgb - ref) ** 2))
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_name = name
+    return best_name
+
+
 def _project_points(
     points_world: np.ndarray,
     w2c: np.ndarray,
@@ -395,7 +425,11 @@ def main() -> int:
     tmp_dir.mkdir(parents=True, exist_ok=False)
 
     panel_mp4s: list[Path] = []
-    label_text = f"{args.newton_label} ({args.newton_color}) vs {args.phystwin_label} ({args.phystwin_color})"
+    newton_color_name = _rgb_to_color_name(newton_color)
+    phystwin_color_name = _rgb_to_color_name(phystwin_color)
+    # Keep the label short so it doesn't overflow the panel width.
+    # (Users asked to avoid printing numeric RGB values.)
+    label_text = f"{newton_color_name}=Newton, {phystwin_color_name}=PhysTwin"
 
     try:
         for cam in camera_indices:
