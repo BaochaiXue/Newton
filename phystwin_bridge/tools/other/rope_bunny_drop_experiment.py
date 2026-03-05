@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import Any
 from pathlib import Path
 
 import numpy as np
@@ -80,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=path_defaults.default_device())
 
     # Timing
-    p.add_argument("--frames", type=int, default=300,
+    p.add_argument("--frames", type=int, default=600,
                     help="Total number of rendered frames.")
     p.add_argument("--sim-dt", type=float, default=None,
                     help="Override sim dt (default: from IR).")
@@ -111,7 +112,7 @@ def parse_args() -> argparse.Namespace:
         "--bunny-quat-xyzw",
         type=float,
         nargs=4,
-        default=(0.0, 0.0, 0.0, 1.0),
+        default=(0.70710678, 0.0, 0.0, 0.70710678),
         metavar=("X", "Y", "Z", "W"),
         help="Bunny world orientation as quaternion (xyzw).",
     )
@@ -128,8 +129,8 @@ def parse_args() -> argparse.Namespace:
 
     # Rendering
     p.add_argument("--render-fps", type=float, default=30.0)
-    p.add_argument("--slowdown", type=float, default=4.0,
-                    help="Slow-motion factor (e.g. 4 = 4x slower).")
+    p.add_argument("--slowdown", type=float, default=2.0,
+                    help="Slow-motion factor (e.g. 2 = 2x slower).")
     p.add_argument("--render-backend", choices=["newton_gl", "matplotlib"],
                     default="newton_gl",
                     help="Renderer backend. 'newton_gl' uses Newton built-in ViewerGL.")
@@ -232,6 +233,10 @@ def transform_mesh_verts(pos, quat_xyzw, verts_local):
     """Transform mesh vertices to world frame."""
     R = quat_to_rotmat(quat_xyzw)
     return verts_local @ R.T + np.asarray(pos).reshape(1, 3)
+
+
+def _output_stem(args: argparse.Namespace) -> str:
+    return f"{args.prefix}_m{int(args.rigid_mass)}"
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +596,7 @@ def render_video_newton_gl(model, sim_data, ir, meta, args, n_obj, device):
     height = int(args.screen_height)
     slowdown = max(float(args.slowdown), 1e-6)
     fps_out = float(args.render_fps) / slowdown
-    out_mp4 = Path(args.out_dir) / f"{args.prefix}_m{int(args.rigid_mass)}.mp4"
+    out_mp4 = Path(args.out_dir) / f"{_output_stem(args)}.mp4"
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
 
     ffmpeg_cmd = [
@@ -768,7 +773,7 @@ def render_video_newton_gl(model, sim_data, ir, meta, args, n_obj, device):
     return str(out_mp4)
 
 
-def render_video(sim_data, meta, args):
+def render_video_matplotlib(sim_data, meta, args):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -894,7 +899,7 @@ def render_video(sim_data, meta, args):
     )
 
     # Render
-    out_mp4 = Path(args.out_dir) / f"{args.prefix}_m{int(args.rigid_mass)}.mp4"
+    out_mp4 = Path(args.out_dir) / f"{_output_stem(args)}.mp4"
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
 
     writer = FFMpegWriter(fps=effective_fps, codec="libx264", bitrate=8000)
@@ -935,25 +940,15 @@ def render_video(sim_data, meta, args):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Outputs / summary
 # ---------------------------------------------------------------------------
-def main() -> int:
-    args = parse_args()
-    args.out_dir = Path(args.out_dir).resolve()
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    wp.init()
-    device = newton_import_ir.resolve_device(args.device)
-    ir = newton_import_ir.load_ir(args.ir.resolve())
-
-    print(f"Building model: rope drops {args.drop_height}m onto bunny (mass={args.rigid_mass})")
-    model, n_obj, mass, meta, x0_shifted = build_model(ir, args, device)
-
-    print("Running simulation...")
-    sim_data = simulate(model, ir, args, n_obj, mass, x0_shifted, device)
-
-    # Save scene NPZ
-    scene_npz = args.out_dir / f"{args.prefix}_m{int(args.rigid_mass)}_scene.npz"
+def save_scene_npz(
+    args: argparse.Namespace,
+    sim_data: dict[str, Any],
+    meta: dict[str, Any],
+    n_obj: int,
+) -> Path:
+    scene_npz = args.out_dir / f"{_output_stem(args)}_scene.npz"
     np.savez_compressed(
         scene_npz,
         particle_q_all=sim_data["particle_q_all"],
@@ -969,10 +964,17 @@ def main() -> int:
         drop_height=np.float32(args.drop_height),
         num_object_points=np.int32(n_obj),
     )
-    print(f"  Scene NPZ: {scene_npz}")
+    return scene_npz
 
-    # Save summary JSON
-    summary = {
+
+def build_summary(
+    args: argparse.Namespace,
+    ir: dict[str, Any],
+    sim_data: dict[str, Any],
+    meta: dict[str, Any],
+    n_obj: int,
+) -> dict[str, Any]:
+    return {
         "experiment": "rope_bunny_drop",
         "ir_path": str(args.ir.resolve()),
         "drop_height_m": float(args.drop_height),
@@ -1003,16 +1005,26 @@ def main() -> int:
         "camera_distance_scale": float(args.camera_distance_scale),
         "auto_frame_camera": bool(args.auto_frame_camera),
     }
-    summary_path = args.out_dir / f"{args.prefix}_m{int(args.rigid_mass)}_summary.json"
+
+
+def save_summary_json(args: argparse.Namespace, summary: dict[str, Any]) -> Path:
+    summary_path = args.out_dir / f"{_output_stem(args)}_summary.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"  Summary: {summary_path}")
-    print(json.dumps(summary, indent=2))
+    return summary_path
 
-    # Render video
-    print("Rendering video...")
+
+def render_experiment_video(
+    args: argparse.Namespace,
+    model,
+    sim_data: dict[str, Any],
+    ir: dict[str, Any],
+    meta: dict[str, Any],
+    n_obj: int,
+    device: str,
+) -> str:
     if args.render_backend == "newton_gl":
-        video_path = render_video_newton_gl(
+        return render_video_newton_gl(
             model=model,
             sim_data=sim_data,
             ir=ir,
@@ -1021,9 +1033,37 @@ def main() -> int:
             n_obj=n_obj,
             device=device,
         )
-    else:
-        video_path = render_video(sim_data, meta, args)
+    return render_video_matplotlib(sim_data, meta, args)
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    args = parse_args()
+    args.out_dir = Path(args.out_dir).resolve()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    wp.init()
+    device = newton_import_ir.resolve_device(args.device)
+    ir = newton_import_ir.load_ir(args.ir.resolve())
+
+    print(f"Building model: rope drops {args.drop_height}m onto bunny (mass={args.rigid_mass})")
+    model, n_obj, mass, meta, x0_shifted = build_model(ir, args, device)
+
+    print("Running simulation...")
+    sim_data = simulate(model, ir, args, n_obj, mass, x0_shifted, device)
+
+    scene_npz = save_scene_npz(args, sim_data, meta, n_obj)
+    print(f"  Scene NPZ: {scene_npz}")
+
+    summary = build_summary(args, ir, sim_data, meta, n_obj)
+    summary_path = save_summary_json(args, summary)
+    print(f"  Summary: {summary_path}")
+    print(json.dumps(summary, indent=2))
+
+    print("Rendering video...")
+    _ = render_experiment_video(args, model, sim_data, ir, meta, n_obj, device)
     return 0
 
 
