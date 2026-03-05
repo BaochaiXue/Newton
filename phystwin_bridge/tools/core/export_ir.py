@@ -402,13 +402,40 @@ def main() -> int:
         min_rest = float(np.min(rest_lengths))
         raise ValueError(f"Non-positive rest lengths detected (min={min_rest}).")
 
+    # PhysTwin clamps spring_Y at runtime; export the same effective values so Newton
+    # consumes the actual spring field used by the source simulator.
+    spring_y_min = (
+        float(config["spring_Y_min"])
+        if args.strict_phystwin
+        else float(config.get("spring_Y_min", 0.0))
+    )
+    spring_y_max = (
+        float(config["spring_Y_max"])
+        if args.strict_phystwin
+        else float(config.get("spring_Y_max", 1.0e5))
+    )
+    if not np.isfinite(spring_y_min) or not np.isfinite(spring_y_max):
+        raise ValueError(
+            f"Non-finite spring_Y clamp bounds: min={spring_y_min}, max={spring_y_max}"
+        )
+    if spring_y_min > spring_y_max:
+        raise ValueError(
+            f"Invalid spring_Y clamp bounds: min={spring_y_min} > max={spring_y_max}"
+        )
+
+    spring_y_raw = spring_y.astype(np.float32, copy=True)
+    spring_y_below_min = spring_y_raw < spring_y_min
+    spring_y_above_max = spring_y_raw > spring_y_max
+    spring_y = np.clip(spring_y_raw, spring_y_min, spring_y_max).astype(
+        np.float32, copy=False
+    )
+
     spring_ke_mode = args.spring_ke_mode
     if spring_ke_mode is None:
         spring_ke_mode = "y_over_rest" if args.strict_phystwin else "raw"
 
     if spring_ke_mode == "raw":
-        # Directly treat PhysTwin's spring_Y as Newton spring_ke.
-        # Only valid if the force forms are already aligned upstream.
+        # Directly treat PhysTwin's effective spring_Y as Newton spring_ke.
         spring_ke = spring_y.copy()
     elif spring_ke_mode == "y_over_rest":
         # PhysTwin force: F = Y * (l/rest - 1) * n_hat
@@ -459,9 +486,6 @@ def main() -> int:
         float(config["dashpot_damping"]) if args.strict_phystwin else float(config.get("dashpot_damping", 0.0)),
         dtype=np.float32,
     )
-    # Clamp range for PhysTwin spring Y (kept for diagnostics; checkpoint may already be clamped).
-    spring_y_min = float(config["spring_Y_min"]) if args.strict_phystwin else float(config.get("spring_Y_min", 0.0))
-    spring_y_max = float(config["spring_Y_max"]) if args.strict_phystwin else float(config.get("spring_Y_max", 1.0e5))
     # Global drag damping used in PhysTwin (optional). Newton importer can emulate this.
     drag_damping = float(config["drag_damping"]) if args.strict_phystwin else float(config.get("drag_damping", 0.0))
 
@@ -549,9 +573,24 @@ def main() -> int:
         # ---- Springs ----
         spring_edges=edges.astype(np.int32),
         spring_rest_length=rest_lengths.astype(np.float32),
+        spring_y_raw=spring_y_raw.astype(np.float32),
         spring_y=spring_y.astype(np.float32),
         spring_ke=spring_ke.astype(np.float32),
         spring_kd=spring_kd,
+        spring_y_clamp_min=np.asarray(spring_y_min, dtype=np.float32),
+        spring_y_clamp_max=np.asarray(spring_y_max, dtype=np.float32),
+        spring_y_clamp_count=np.asarray(
+            int(np.count_nonzero(spring_y_below_min | spring_y_above_max)),
+            dtype=np.int32,
+        ),
+        spring_y_clamp_below_count=np.asarray(
+            int(np.count_nonzero(spring_y_below_min)),
+            dtype=np.int32,
+        ),
+        spring_y_clamp_above_count=np.asarray(
+            int(np.count_nonzero(spring_y_above_max)),
+            dtype=np.int32,
+        ),
         drag_damping=np.asarray(drag_damping, dtype=np.float32),
         num_object_points=np.asarray(num_object_points, dtype=np.int32),
         # ---- Simulation timing / contact knobs ----
@@ -582,6 +621,15 @@ def main() -> int:
         "controller_points_per_frame": int(controller_traj.shape[1]),
         "strict_phystwin_export": bool(args.strict_phystwin),
         "spring_ke_mode": spring_ke_mode,
+        "spring_y_raw_min": float(np.min(spring_y_raw)),
+        "spring_y_raw_max": float(np.max(spring_y_raw)),
+        "spring_y_effective_min": float(np.min(spring_y)),
+        "spring_y_effective_max": float(np.max(spring_y)),
+        "spring_y_clamp_count": int(
+            np.count_nonzero(spring_y_below_min | spring_y_above_max)
+        ),
+        "spring_y_clamp_below_count": int(np.count_nonzero(spring_y_below_min)),
+        "spring_y_clamp_above_count": int(np.count_nonzero(spring_y_above_max)),
         "spring_ke_min": float(np.min(spring_ke)),
         "spring_ke_max": float(np.max(spring_ke)),
         "spring_ke_mean": float(np.mean(spring_ke)),
