@@ -229,6 +229,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--water-grid-step", type=float, default=0.18)
     p.add_argument("--water-slab-thickness", type=float, default=0.08)
     p.add_argument("--water-line-width", type=float, default=0.01)
+    p.add_argument("--water-wave-amp", type=float, default=0.022)
+    p.add_argument("--water-wave-amp-2", type=float, default=0.012)
+    p.add_argument("--water-ripple-amp", type=float, default=0.010)
+    p.add_argument("--water-ripple-radius", type=float, default=0.36)
     p.add_argument("--spring-line-width", type=float, default=0.008)
     p.add_argument("--render-edge-stride", type=int, default=14)
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.2)
@@ -877,6 +881,143 @@ def _build_water_grid(extent: float, step: float, z: float) -> tuple[np.ndarray,
     return np.asarray(starts, dtype=np.float32), np.asarray(ends, dtype=np.float32)
 
 
+def _build_water_surface_mesh(extent: float, step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    resolution = max(8, int(round((2.0 * extent) / max(step, 1.0e-4))) + 1)
+    coords = np.linspace(-extent, extent, resolution, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(coords, coords, indexing="xy")
+    points = np.stack(
+        [
+            grid_x.reshape(-1),
+            grid_y.reshape(-1),
+            np.zeros(grid_x.size, dtype=np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+    uvs = np.stack(
+        [
+            ((grid_x + extent) / max(2.0 * extent, 1.0e-6)).reshape(-1),
+            ((grid_y + extent) / max(2.0 * extent, 1.0e-6)).reshape(-1),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+    tris: list[tuple[int, int, int]] = []
+    for j in range(resolution - 1):
+        row0 = j * resolution
+        row1 = (j + 1) * resolution
+        for i in range(resolution - 1):
+            a = row0 + i
+            b = a + 1
+            c = row1 + i
+            d = c + 1
+            tris.append((a, c, b))
+            tris.append((b, c, d))
+    return points, np.asarray(tris, dtype=np.int32).reshape(-1), uvs
+
+
+def _make_water_texture(size: int = 512) -> np.ndarray:
+    coords = np.linspace(0.0, 1.0, size, dtype=np.float32)
+    uu, vv = np.meshgrid(coords, coords, indexing="xy")
+    waves_a = 0.5 + 0.5 * np.sin(18.0 * uu + 2.4 * np.sin(11.0 * vv))
+    waves_b = 0.5 + 0.5 * np.sin(16.0 * vv + 1.7 * np.sin(13.0 * uu))
+    waves = waves_a * waves_b
+    flow = 0.5 + 0.5 * np.sin(28.0 * (0.82 * uu + 0.31 * vv) + 1.3 * np.sin(9.0 * vv))
+    crest = np.clip((flow - 0.82) / 0.18, 0.0, 1.0)
+    caustic = np.clip(0.55 * waves + 0.45 * np.sin(24.0 * (uu + vv)), -1.0, 1.0)
+    caustic = 0.5 + 0.5 * caustic
+    deep = np.array([14.0, 68.0, 110.0], dtype=np.float32)
+    mid = np.array([34.0, 150.0, 198.0], dtype=np.float32)
+    shallow = np.array([122.0, 235.0, 246.0], dtype=np.float32)
+    rgb = deep[None, None, :] * (1.0 - caustic[..., None]) + mid[None, None, :] * caustic[..., None]
+    rgb = rgb * (1.0 - 0.35 * crest[..., None]) + shallow[None, None, :] * (0.35 * crest[..., None])
+    spec = np.clip((0.5 + 0.5 * np.sin(44.0 * (uu - 0.24 * vv))) - 0.78, 0.0, 1.0) / 0.22
+    rgb += 42.0 * spec[..., None]
+    rgb[..., 2] = np.clip(rgb[..., 2] + 14.0 * np.sin(10.0 * uu - 7.0 * vv), 0.0, 255.0)
+    return np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+
+
+def _update_water_surface_points(
+    base_points: np.ndarray,
+    *,
+    water_level: float,
+    time_s: float,
+    body_xy: np.ndarray,
+    wave_amp: float,
+    wave_amp_2: float,
+    ripple_amp: float,
+    ripple_radius: float,
+) -> np.ndarray:
+    points = base_points.copy()
+    x = points[:, 0]
+    y = points[:, 1]
+
+    z = np.full_like(x, float(water_level), dtype=np.float32)
+    z += np.float32(wave_amp) * np.sin(2.4 * x + 0.8 * y + 1.7 * float(time_s))
+    z += np.float32(wave_amp_2) * np.sin(-1.5 * x + 2.2 * y - 1.1 * float(time_s) + 0.6)
+
+    if body_xy.size:
+        for idx, center in enumerate(body_xy):
+            dx = x - np.float32(center[0])
+            dy = y - np.float32(center[1])
+            r = np.sqrt(dx * dx + dy * dy) + 1.0e-6
+            envelope = np.exp(-((r / max(float(ripple_radius), 1.0e-4)) ** 2)).astype(np.float32)
+            z += np.float32(ripple_amp) * envelope * np.sin(10.0 * r - 2.8 * float(time_s) - 0.7 * idx)
+
+    points[:, 2] = z
+    return points.astype(np.float32, copy=False)
+
+
+def _build_water_ripple_lines(
+    body_xy: np.ndarray,
+    *,
+    water_level: float,
+    time_s: float,
+    max_radius: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if body_xy.size == 0:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        return empty, empty
+
+    starts: list[tuple[float, float, float]] = []
+    ends: list[tuple[float, float, float]] = []
+    num_segments = 36
+    for idx, center in enumerate(body_xy):
+        for ring in range(2):
+            phase = (0.38 * ring + 0.27 * idx + 0.55 * float(time_s)) % 1.0
+            radius = 0.05 + phase * max(float(max_radius), 0.05)
+            z = float(water_level) + 0.006 + 0.002 * ring
+            angles = np.linspace(0.0, 2.0 * math.pi, num_segments + 1, dtype=np.float32)
+            circle_x = np.float32(center[0]) + np.float32(radius) * np.cos(angles)
+            circle_y = np.float32(center[1]) + np.float32(radius) * np.sin(angles)
+            for seg in range(num_segments):
+                starts.append((float(circle_x[seg]), float(circle_y[seg]), z))
+                ends.append((float(circle_x[seg + 1]), float(circle_y[seg + 1]), z))
+
+    return np.asarray(starts, dtype=np.float32), np.asarray(ends, dtype=np.float32)
+
+
+def _build_water_highlight_lines(
+    *,
+    extent: float,
+    water_level: float,
+    time_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    starts: list[tuple[float, float, float]] = []
+    ends: list[tuple[float, float, float]] = []
+    line_count = 7
+    seg_count = 28
+    base_y = np.linspace(-0.62 * extent, 0.62 * extent, line_count, dtype=np.float32)
+    xs = np.linspace(-0.82 * extent, 0.82 * extent, seg_count + 1, dtype=np.float32)
+    for idx, y0 in enumerate(base_y):
+        phase = 0.65 * float(time_s) + 0.45 * idx
+        ys = y0 + 0.07 * np.sin(1.45 * xs + phase)
+        zs = float(water_level) + 0.01 + 0.004 * np.sin(2.1 * xs - 1.6 * phase)
+        for seg in range(seg_count):
+            starts.append((float(xs[seg]), float(ys[seg]), float(zs[seg])))
+            ends.append((float(xs[seg + 1]), float(ys[seg + 1]), float(zs[seg + 1])))
+    return np.asarray(starts, dtype=np.float32), np.asarray(ends, dtype=np.float32)
+
+
 def _view_specs() -> list[ViewSpec]:
     return [
         ViewSpec("wide", "Establishing Wide", yaw_deg=-34.0, pitch_deg=-11.0, distance=3.9),
@@ -935,22 +1076,32 @@ def render_view_mp4(
         str(out_mp4),
     ]
 
-    water_starts_np, water_ends_np = _build_water_grid(
+    water_surface_points_base, water_surface_indices_np, water_surface_uvs_np = _build_water_surface_mesh(
         extent=float(args.water_grid_extent),
         step=float(args.water_grid_step),
-        z=float(args.water_level),
     )
-    water_starts_wp = wp.array(water_starts_np, dtype=wp.vec3, device=device)
-    water_ends_wp = wp.array(water_ends_np, dtype=wp.vec3, device=device)
-    water_color = (0.22, 0.76, 0.94)
-    water_slab_half = 0.5 * float(args.water_slab_thickness)
-    water_box_xforms = wp.array(
-        [wp.transform(wp.vec3(0.0, 0.0, float(args.water_level - water_slab_half)), wp.quat_identity())],
+    water_surface_points_wp = wp.array(water_surface_points_base, dtype=wp.vec3, device=device)
+    water_surface_indices_wp = wp.array(
+        water_surface_indices_np.astype(np.int32, copy=False),
+        dtype=wp.int32,
+        device=device,
+    )
+    water_surface_uvs_wp = wp.array(water_surface_uvs_np.astype(np.float32, copy=False), dtype=wp.vec2, device=device)
+    water_surface_texture = _make_water_texture()
+    water_surface_xforms = wp.array(
+        [wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity())],
         dtype=wp.transform,
         device=device,
     )
-    water_box_colors = wp.array([wp.vec3(0.10, 0.54, 0.82)], dtype=wp.vec3, device=device)
-    water_box_materials = wp.array([wp.vec4(0.08, 0.0, 0.0, 0.0)], dtype=wp.vec4, device=device)
+    water_surface_scales = wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device)
+    water_surface_colors = wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device)
+    water_surface_materials = wp.array([[0.18, 0.0, 0.0, 1.0]], dtype=wp.vec4, device=device)
+    ripple_starts_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    ripple_ends_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    highlight_starts_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    highlight_ends_wp = wp.empty(0, dtype=wp.vec3, device=device)
+    ripple_color = (0.72, 0.94, 1.0)
+    highlight_color = (0.93, 0.99, 1.0)
     bunny_mesh_points = wp.array(
         (meta.mesh_verts_local * float(meta.mesh_scale)).astype(np.float32, copy=False),
         dtype=wp.vec3,
@@ -1071,11 +1222,61 @@ def render_view_mp4(
 
             viewer.begin_frame(float(frame_idx) * float(sim_data["sim_dt"]) * float(sim_data["substeps"]))
             viewer.log_state(state)
+            sim_t = float(frame_idx) * float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+            body_xy = bq[:, :2].astype(np.float32, copy=False) if bq.size else np.zeros((0, 2), dtype=np.float32)
+            water_points_np = _update_water_surface_points(
+                water_surface_points_base,
+                water_level=float(args.water_level),
+                time_s=sim_t,
+                body_xy=body_xy,
+                wave_amp=float(args.water_wave_amp),
+                wave_amp_2=float(args.water_wave_amp_2),
+                ripple_amp=float(args.water_ripple_amp),
+                ripple_radius=float(args.water_ripple_radius),
+            )
+            water_surface_points_wp.assign(water_points_np)
+
+            ripple_starts_np, ripple_ends_np = _build_water_ripple_lines(
+                body_xy,
+                water_level=float(args.water_level),
+                time_s=sim_t,
+                max_radius=float(args.water_ripple_radius),
+            )
+            ripple_starts_wp = wp.array(ripple_starts_np, dtype=wp.vec3, device=device)
+            ripple_ends_wp = wp.array(ripple_ends_np, dtype=wp.vec3, device=device)
+            highlight_starts_np, highlight_ends_np = _build_water_highlight_lines(
+                extent=float(args.water_grid_extent),
+                water_level=float(args.water_level),
+                time_s=sim_t,
+            )
+            highlight_starts_wp = wp.array(highlight_starts_np, dtype=wp.vec3, device=device)
+            highlight_ends_wp = wp.array(highlight_ends_np, dtype=wp.vec3, device=device)
+
+            viewer.log_mesh(
+                "/demo/water_surface_mesh",
+                water_surface_points_wp,
+                water_surface_indices_wp,
+                normals=None,
+                uvs=water_surface_uvs_wp,
+                texture=water_surface_texture,
+                hidden=True,
+                backface_culling=False,
+            )
+            viewer.log_instances(
+                "/demo/water_surface",
+                "/demo/water_surface_mesh",
+                water_surface_xforms,
+                water_surface_scales,
+                water_surface_colors,
+                water_surface_materials,
+                hidden=False,
+            )
+
             viewer.log_mesh(
                 "/demo/bunny_mesh",
                 bunny_mesh_points,
                 bunny_mesh_indices,
-                hidden=False,
+                hidden=True,
                 backface_culling=True,
             )
             viewer.log_instances(
@@ -1087,25 +1288,30 @@ def render_view_mp4(
                 bunny_instance_materials,
                 hidden=False,
             )
-            viewer.log_shapes(
-                "/demo/water_slab",
-                newton.GeoType.BOX,
-                (
-                    float(args.water_grid_extent),
-                    float(args.water_grid_extent),
-                    water_slab_half,
-                ),
-                water_box_xforms,
-                colors=water_box_colors,
-                materials=water_box_materials,
-                hidden=False,
-            )
+            if len(ripple_starts_np):
+                viewer.log_lines(
+                    "/demo/water_ripples",
+                    ripple_starts_wp,
+                    ripple_ends_wp,
+                    ripple_color,
+                    width=float(args.water_line_width),
+                    hidden=False,
+                )
+            else:
+                viewer.log_lines(
+                    "/demo/water_ripples",
+                    ripple_starts_wp,
+                    ripple_ends_wp,
+                    ripple_color,
+                    width=float(args.water_line_width),
+                    hidden=True,
+                )
             viewer.log_lines(
-                "/demo/water_grid",
-                water_starts_wp,
-                water_ends_wp,
-                water_color,
-                width=float(args.water_line_width),
+                "/demo/water_highlights",
+                highlight_starts_wp,
+                highlight_ends_wp,
+                highlight_color,
+                width=float(args.water_line_width) * 0.72,
                 hidden=False,
             )
 
@@ -1139,7 +1345,6 @@ def render_view_mp4(
             viewer.end_frame()
             frame = viewer.get_frame(render_ui=False).numpy()
             if args.overlay_label:
-                sim_t = float(frame_idx) * float(sim_data["sim_dt"]) * float(sim_data["substeps"])
                 frame = _overlay_text_lines_rgb(
                     frame,
                     [
