@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Dramatic Newton demo: PhysTwin sloth/zebra drop onto floating rigid bunnies.
+"""Dramatic Newton demo: PhysTwin sloth/zebra drop onto native-water bunny rigids.
 
 Scene
 -----
-- Four native Newton bunny rigid bodies float on a stylized water surface.
+- Four native Newton bunny rigid bodies interact with a native Newton MPM water bed.
 - Two PhysTwin soft bodies (sloth + zebra) are imported from IR, dropped from
-  rest roughly 1 m above the water, and collide with the floating rigids.
+  rest roughly 1 m above the water, and collide with the bunny rigids below.
 - The script renders four camera views and composes them into one labeled 2x2 MP4.
 
 Design constraints
@@ -13,8 +13,8 @@ Design constraints
 - Soft-body spring parameters are loaded from PhysTwin IR without hard-coded rewrites.
 - Internal spring semantics remain the exported PhysTwin->Newton mapping:
   ``spring_ke = spring_Y / rest_length`` and ``spring_kd`` from IR.
-- Scene-specific forces are limited to the native Newton rigid "water float"
-  approximation and to rendering/camera setup.
+- Scene-specific additions are limited to the native Newton MPM water setup and
+  to rendering/camera layout.
 """
 from __future__ import annotations
 
@@ -95,9 +95,31 @@ class DemoMeta:
     rigid_cluster_center: np.ndarray
     water_level: float
     hidden_floor_z: float
-    float_target_submersion: list[float]
-    float_radius: list[float]
-    water_plane_shape_label: str
+
+
+@dataclass
+class WaterSystem:
+    model: newton.Model
+    solver: Any
+    state_0: newton.State
+    state_1: newton.State
+    render_points: wp.array
+    render_radii: wp.array
+    render_colors: wp.array
+    collider_impulses: wp.array
+    collider_impulse_pos: wp.array
+    collider_impulse_ids: wp.array
+    collider_body_id: wp.array
+    body_water_forces: wp.array
+    frame_dt: float
+    active_impulse_count: int
+
+
+def _water_soft_direct_coupling_supported() -> bool:
+    # Newton's current implicit MPM collider path is shape-based. The imported
+    # PhysTwin soft objects are particles + springs without collision shapes, so
+    # they are not direct MPM colliders in this demo.
+    return False
 
 
 @wp.kernel
@@ -120,55 +142,54 @@ def _apply_drag_range(
 
 
 @wp.kernel
-def _apply_floating_body_forces(
+def _compute_body_forces_from_water(
+    dt: float,
+    collider_ids: wp.array(dtype=int),
+    collider_impulses: wp.array(dtype=wp.vec3),
+    collider_impulse_pos: wp.array(dtype=wp.vec3),
+    body_ids: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    body_f: wp.array(dtype=wp.spatial_vector),
+):
+    tid = wp.tid()
+    cid = collider_ids[tid]
+    if cid < 0 or cid >= body_ids.shape[0]:
+        return
+    body_index = body_ids[cid]
+    if body_index == -1:
+        return
+    f_world = collider_impulses[tid] / dt
+    X_wb = body_q[body_index]
+    r = collider_impulse_pos[tid] - wp.transform_point(X_wb, body_com[body_index])
+    wp.atomic_add(body_f, body_index, wp.spatial_vector(f_world, wp.cross(r, f_world)))
+
+
+@wp.kernel
+def _subtract_body_force_for_water_step(
+    dt: float,
     body_q: wp.array(dtype=wp.transform),
     body_qd: wp.array(dtype=wp.spatial_vector),
     body_f: wp.array(dtype=wp.spatial_vector),
-    body_com: wp.array(dtype=wp.vec3),
-    body_mass: wp.array(dtype=float),
-    float_radius: wp.array(dtype=float),
-    target_submersion: wp.array(dtype=float),
-    water_level: float,
-    gravity_mag: float,
-    max_lift_mult: float,
-    linear_drag: float,
-    angular_drag: float,
-    righting_ke: float,
+    body_inv_inertia: wp.array(dtype=wp.mat33),
+    body_inv_mass: wp.array(dtype=float),
+    body_q_res: wp.array(dtype=wp.transform),
+    body_qd_res: wp.array(dtype=wp.spatial_vector),
 ):
-    tid = wp.tid()
-    mass = body_mass[tid]
-    if mass <= 0.0:
-        return
-
-    X_wb = body_q[tid]
-    q = wp.transform_get_rotation(X_wb)
-    com_w = wp.transform_point(X_wb, body_com[tid])
-    v_s = body_qd[tid]
-    v_lin = wp.spatial_top(v_s)
-    v_ang = wp.spatial_bottom(v_s)
-
-    radius = wp.max(float_radius[tid], 1.0e-6)
-    sub_target = wp.max(target_submersion[tid], 1.0e-6)
-    bottom = com_w[2] - radius
-    submersion = wp.clamp(water_level - bottom, 0.0, 2.0 * radius)
-    if submersion <= 0.0:
-        return
-
-    lift_mult = wp.min(submersion / sub_target, max_lift_mult)
-    f_buoy = wp.vec3(0.0, 0.0, gravity_mag * mass * lift_mult)
-    f_drag = -v_lin * (linear_drag * lift_mult)
-
-    body_up = wp.quat_rotate(q, wp.vec3(0.0, 0.0, 1.0))
-    t_right = wp.cross(body_up, wp.vec3(0.0, 0.0, 1.0)) * (righting_ke * lift_mult)
-    t_drag = -v_ang * (angular_drag * lift_mult)
-    wp.atomic_add(body_f, tid, wp.spatial_vector(f_buoy + f_drag, t_right + t_drag))
+    body_id = wp.tid()
+    f = body_f[body_id]
+    delta_v = dt * body_inv_mass[body_id] * wp.spatial_top(f)
+    r = wp.transform_get_rotation(body_q[body_id])
+    delta_w = dt * wp.quat_rotate(r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f)))
+    body_q_res[body_id] = body_q[body_id]
+    body_qd_res[body_id] = body_qd[body_id] - wp.spatial_vector(delta_v, delta_w)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Create a dramatic multi-view Newton demo: sloth + zebra from PhysTwin "
-            "drop onto floating native bunny rigid bodies."
+            "drop onto native bunny rigid bodies in MPM water."
         )
     )
     p.add_argument(
@@ -215,24 +236,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bunny-asset", default="bunny.usd")
     p.add_argument("--bunny-prim", default="/root/bunny")
 
-    p.add_argument("--float-max-lift-mult", type=float, default=2.2)
-    p.add_argument("--float-linear-drag", type=float, default=120.0)
-    p.add_argument("--float-angular-drag", type=float, default=18.0)
-    p.add_argument("--float-righting-ke", type=float, default=140.0)
     p.add_argument("--float-submerge-fraction", type=float, default=0.46)
+
+    p.add_argument("--water-extent", type=float, default=1.45)
+    p.add_argument("--water-depth", type=float, default=0.34)
+    p.add_argument("--water-wall-thickness", type=float, default=0.08)
+    p.add_argument("--water-wall-height", type=float, default=0.28)
+    p.add_argument("--water-voxel-size", type=float, default=0.14)
+    p.add_argument("--water-particles-per-cell", type=int, default=2)
+    p.add_argument("--water-density", type=float, default=950.0)
+    p.add_argument("--water-young-modulus", type=float, default=3.0e4)
+    p.add_argument("--water-poisson-ratio", type=float, default=0.49)
+    p.add_argument("--water-damping", type=float, default=8.0)
+    p.add_argument("--water-hardening", type=float, default=0.0)
+    p.add_argument("--water-friction", type=float, default=0.0)
+    p.add_argument("--water-yield-pressure", type=float, default=1.0e10)
+    p.add_argument("--water-tensile-yield-ratio", type=float, default=1.0)
+    p.add_argument("--water-yield-stress", type=float, default=0.0)
+    p.add_argument("--water-air-drag", type=float, default=1.0)
+    p.add_argument("--water-grid-type", choices=["fixed", "sparse"], default="fixed")
+    p.add_argument("--water-max-iterations", type=int, default=40)
+    p.add_argument("--water-points-per-particle", type=int, default=4)
 
     p.add_argument("--angular-damping", type=float, default=0.05)
     p.add_argument("--friction-smoothing", type=float, default=1.0)
     p.add_argument("--enable-tri-contact", action=argparse.BooleanOptionalAction, default=True)
-
-    p.add_argument("--water-grid-extent", type=float, default=1.75)
-    p.add_argument("--water-grid-step", type=float, default=0.18)
-    p.add_argument("--water-slab-thickness", type=float, default=0.08)
-    p.add_argument("--water-line-width", type=float, default=0.01)
-    p.add_argument("--water-wave-amp", type=float, default=0.022)
-    p.add_argument("--water-wave-amp-2", type=float, default=0.012)
-    p.add_argument("--water-ripple-amp", type=float, default=0.010)
-    p.add_argument("--water-ripple-radius", type=float, default=0.36)
     p.add_argument("--spring-line-width", type=float, default=0.008)
     p.add_argument("--render-edge-stride", type=int, default=14)
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.2)
@@ -652,35 +680,71 @@ def build_model(
     )
     particle_start += object_specs[-1].particle_count
 
-    floor_cfg = builder.default_shape_cfg.copy()
-    floor_cfg.mu = 0.55
-    floor_cfg.ke = 1.5e4
-    floor_cfg.kd = 6.0e2
-    floor_cfg.kf = 3.0e2
-    floor_cfg.is_visible = False
+    basin_cfg = builder.default_shape_cfg.copy()
+    basin_cfg.mu = 0.35
+    basin_cfg.ke = 1.5e4
+    basin_cfg.kd = 6.0e2
+    basin_cfg.kf = 3.0e2
+    basin_cfg.is_visible = False
+
+    water_extent = float(args.water_extent)
+    water_depth = float(args.water_depth)
+    wall_thickness = float(args.water_wall_thickness)
+    wall_height = float(args.water_wall_height)
+    basin_floor_z = float(args.water_level - water_depth - 0.5 * wall_thickness)
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, basin_floor_z), wp.quat_identity()),
+        hx=water_extent + wall_thickness,
+        hy=water_extent + wall_thickness,
+        hz=0.5 * wall_thickness,
+        cfg=basin_cfg,
+        label="water_basin_floor",
+    )
+    wall_z = float(args.water_level - 0.5 * water_depth + 0.5 * wall_height)
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(water_extent + 0.5 * wall_thickness, 0.0, wall_z), wp.quat_identity()),
+        hx=0.5 * wall_thickness,
+        hy=water_extent + wall_thickness,
+        hz=0.5 * wall_height,
+        cfg=basin_cfg,
+        label="water_wall_pos_x",
+    )
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(-(water_extent + 0.5 * wall_thickness), 0.0, wall_z), wp.quat_identity()),
+        hx=0.5 * wall_thickness,
+        hy=water_extent + wall_thickness,
+        hz=0.5 * wall_height,
+        cfg=basin_cfg,
+        label="water_wall_neg_x",
+    )
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, water_extent + 0.5 * wall_thickness, wall_z), wp.quat_identity()),
+        hx=water_extent + wall_thickness,
+        hy=0.5 * wall_thickness,
+        hz=0.5 * wall_height,
+        cfg=basin_cfg,
+        label="water_wall_pos_y",
+    )
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, -(water_extent + 0.5 * wall_thickness), wall_z), wp.quat_identity()),
+        hx=water_extent + wall_thickness,
+        hy=0.5 * wall_thickness,
+        hz=0.5 * wall_height,
+        cfg=basin_cfg,
+        label="water_wall_neg_y",
+    )
     builder.add_shape_plane(
         xform=wp.transform(wp.vec3(0.0, 0.0, float(args.hidden_floor_z)), wp.quat_identity()),
         width=0.0,
         length=0.0,
         body=-1,
-        cfg=floor_cfg,
+        cfg=basin_cfg,
         label="hidden_floor",
-    )
-
-    water_cfg = builder.default_shape_cfg.copy()
-    water_cfg.has_shape_collision = False
-    water_cfg.has_particle_collision = False
-    water_cfg.is_visible = True
-    water_cfg.collision_group = 0
-    water_extent = float(args.water_grid_extent)
-    water_label = "water_surface"
-    builder.add_shape_plane(
-        xform=wp.transform(wp.vec3(0.0, 0.0, float(args.water_level)), wp.quat_identity()),
-        width=2.0 * water_extent,
-        length=2.0 * water_extent,
-        body=-1,
-        cfg=water_cfg,
-        label=water_label,
     )
 
     mesh, mesh_verts_local, mesh_tri_indices, mesh_render_edges, mesh_asset_path = load_bunny_mesh(
@@ -691,8 +755,7 @@ def build_model(
     mesh_scaled = mesh_verts_local * mesh_scale
     mesh_extent = np.ptp(mesh_scaled, axis=0)
     bunny_half_height = float(0.5 * mesh_extent[2])
-    float_radius = float(max(0.48 * np.linalg.norm(mesh_extent), bunny_half_height))
-    target_sub = float(max(args.float_submerge_fraction * mesh_extent[2], 0.04))
+    target_sub = float(max(args.float_submerge_fraction * mesh_extent[2], 0.03))
     target_bottom = float(args.water_level - target_sub)
 
     rigid_cfg = builder.default_shape_cfg.copy()
@@ -711,7 +774,7 @@ def build_model(
         z_min = float(rotated[:, 2].min())
         z_max = float(rotated[:, 2].max())
         pos_z = float(target_bottom - z_min)
-        label = f"float_bunny_{idx}"
+        label = f"water_bunny_{idx}"
         body = builder.add_body(
             xform=wp.transform(wp.vec3(float(px), float(py), pos_z), q),
             mass=float(args.rigid_mass),
@@ -736,8 +799,6 @@ def build_model(
             cfg=rigid_cfg,
         )
         rigid_labels.append(label)
-        # Keep target_sub tied to the actual initial submersion implied by orientation.
-        target_sub = max(float(args.water_level - (pos_z + z_min)), 0.04)
 
     model = builder.finalize(device=device)
     model.set_gravity((0.0, 0.0, -float(args.gravity_mag)))
@@ -755,12 +816,6 @@ def build_model(
         dtype=np.float32,
     )
 
-    body_count = int(model.body_count)
-    model.float_radius = wp.array(np.full(body_count, float_radius, dtype=np.float32), dtype=wp.float32, device=device)
-    model.float_target_sub = wp.array(
-        np.full(body_count, target_sub, dtype=np.float32), dtype=wp.float32, device=device
-    )
-
     meta = DemoMeta(
         mesh_verts_local=mesh_verts_local.astype(np.float32),
         mesh_tri_indices=mesh_tri_indices.astype(np.int32),
@@ -772,11 +827,148 @@ def build_model(
         rigid_cluster_center=cluster_center,
         water_level=float(args.water_level),
         hidden_floor_z=float(args.hidden_floor_z),
-        float_target_submersion=[float(target_sub)] * body_count,
-        float_radius=[float(float_radius)] * body_count,
-        water_plane_shape_label=water_label,
     )
     return model, meta
+
+
+def _spawn_mpm_particle_block(
+    builder: newton.ModelBuilder,
+    *,
+    bounds_lo: np.ndarray,
+    bounds_hi: np.ndarray,
+    voxel_size: float,
+    particles_per_cell: int,
+    density: float,
+    flags: int,
+) -> np.ndarray:
+    res = np.array(
+        np.ceil(max(1, int(particles_per_cell)) * (bounds_hi - bounds_lo) / max(voxel_size, 1.0e-4)),
+        dtype=int,
+    )
+    cell_size = (bounds_hi - bounds_lo) / res
+    cell_volume = float(np.prod(cell_size))
+    radius = float(np.max(cell_size) * 0.5)
+    mass = float(cell_volume * density)
+    begin_id = len(builder.particle_q)
+    builder.add_particle_grid(
+        pos=wp.vec3(bounds_lo),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=int(res[0]) + 1,
+        dim_y=int(res[1]) + 1,
+        dim_z=int(res[2]) + 1,
+        cell_x=float(cell_size[0]),
+        cell_y=float(cell_size[1]),
+        cell_z=float(cell_size[2]),
+        mass=mass,
+        jitter=1.25 * radius,
+        radius_mean=radius,
+        flags=flags,
+    )
+    end_id = len(builder.particle_q)
+    return np.arange(begin_id, end_id, dtype=np.int32)
+
+
+def build_water_system(model: newton.Model, args: argparse.Namespace, device: str) -> WaterSystem:
+    water_builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
+    newton.solvers.SolverImplicitMPM.register_custom_attributes(water_builder)
+
+    extent = float(args.water_extent)
+    depth = float(args.water_depth)
+    lo = np.array([-extent, -extent, float(args.water_level - depth)], dtype=np.float32)
+    hi = np.array([extent, extent, float(args.water_level)], dtype=np.float32)
+    water_ids = _spawn_mpm_particle_block(
+        water_builder,
+        bounds_lo=lo,
+        bounds_hi=hi,
+        voxel_size=float(args.water_voxel_size),
+        particles_per_cell=int(args.water_particles_per_cell),
+        density=float(args.water_density),
+        flags=int(newton.ParticleFlags.ACTIVE),
+    )
+
+    water_model = water_builder.finalize(device=device)
+    water_model.set_gravity((0.0, 0.0, -float(args.gravity_mag)))
+
+    water_sel = wp.array(water_ids, dtype=int, device=device)
+    water_model.mpm.young_modulus[water_sel].fill_(float(args.water_young_modulus))
+    water_model.mpm.poisson_ratio[water_sel].fill_(float(args.water_poisson_ratio))
+    water_model.mpm.damping[water_sel].fill_(float(args.water_damping))
+    water_model.mpm.hardening[water_sel].fill_(float(args.water_hardening))
+    water_model.mpm.friction[water_sel].fill_(float(args.water_friction))
+    water_model.mpm.yield_pressure[water_sel].fill_(float(args.water_yield_pressure))
+    water_model.mpm.tensile_yield_ratio[water_sel].fill_(float(args.water_tensile_yield_ratio))
+    water_model.mpm.yield_stress[water_sel].fill_(float(args.water_yield_stress))
+
+    mpm_options = newton.solvers.SolverImplicitMPM.Options()
+    mpm_options.voxel_size = float(args.water_voxel_size)
+    mpm_options.tolerance = 1.0e-5
+    mpm_options.transfer_scheme = "pic"
+    mpm_options.grid_type = str(args.water_grid_type)
+    mpm_options.grid_padding = 50 if args.water_grid_type == "fixed" else 0
+    mpm_options.max_active_cell_count = (1 << 16) if args.water_grid_type == "fixed" else -1
+    mpm_options.strain_basis = "P0"
+    mpm_options.max_iterations = int(args.water_max_iterations)
+    mpm_options.critical_fraction = 0.0
+    mpm_options.air_drag = float(args.water_air_drag)
+    mpm_options.collider_velocity_mode = "finite_difference"
+
+    water_solver = newton.solvers.SolverImplicitMPM(water_model, mpm_options)
+    water_solver.setup_collider(model=model)
+
+    combined_state_template = model.state()
+    water_state_0 = water_model.state()
+    water_state_1 = water_model.state()
+    water_state_0.body_q = wp.empty_like(combined_state_template.body_q)
+    water_state_0.body_qd = wp.empty_like(combined_state_template.body_qd)
+    water_state_0.body_f = wp.empty_like(combined_state_template.body_f)
+    water_state_1.body_q = wp.empty_like(combined_state_template.body_q)
+    water_state_1.body_qd = wp.empty_like(combined_state_template.body_qd)
+    water_state_1.body_f = wp.empty_like(combined_state_template.body_f)
+
+    grains = water_solver.sample_render_grains(water_state_0, int(args.water_points_per_particle))
+    grain_radius = float(args.water_voxel_size) / max(3.0 * float(args.water_points_per_particle), 1.0)
+    grain_radii = wp.full(grains.size, value=grain_radius, dtype=float, device=device)
+    grain_colors = wp.full(grains.size, value=wp.vec3(0.34, 0.84, 0.98), dtype=wp.vec3, device=device)
+
+    max_nodes = 1 << 20
+    collider_impulses = wp.zeros(max_nodes, dtype=wp.vec3, device=device)
+    collider_impulse_pos = wp.zeros(max_nodes, dtype=wp.vec3, device=device)
+    collider_impulse_ids = wp.full(max_nodes, value=-1, dtype=int, device=device)
+    collider_body_id = water_solver.collider_body_index
+    body_water_forces = wp.zeros_like(combined_state_template.body_f)
+
+    frame_dt = float(args.sim_dt) * float(args.substeps) if args.sim_dt is not None and args.substeps is not None else 0.0
+    if frame_dt <= 0.0:
+        frame_dt = 0.0
+
+    return WaterSystem(
+        model=water_model,
+        solver=water_solver,
+        state_0=water_state_0,
+        state_1=water_state_1,
+        render_points=grains,
+        render_radii=grain_radii,
+        render_colors=grain_colors,
+        collider_impulses=collider_impulses,
+        collider_impulse_pos=collider_impulse_pos,
+        collider_impulse_ids=collider_impulse_ids,
+        collider_body_id=collider_body_id,
+        body_water_forces=body_water_forces,
+        frame_dt=frame_dt,
+        active_impulse_count=0,
+    )
+
+
+def _collect_water_impulses(water: WaterSystem) -> None:
+    impulses, pos, ids = water.solver.collect_collider_impulses(water.state_0)
+    n = min(int(impulses.shape[0]), int(water.collider_impulses.shape[0]))
+    water.collider_impulse_ids.fill_(-1)
+    if n > 0:
+        water.collider_impulses[:n].assign(impulses[:n])
+        water.collider_impulse_pos[:n].assign(pos[:n])
+        water.collider_impulse_ids[:n].assign(ids[:n])
+    water.active_impulse_count = n
 
 
 def simulate(
@@ -784,6 +976,7 @@ def simulate(
     meta: DemoMeta,
     args: argparse.Namespace,
     sloth_ir: dict[str, np.ndarray],
+    water: WaterSystem,
     device: str,
 ) -> dict[str, Any]:
     solver = newton.solvers.SolverSemiImplicit(
@@ -805,35 +998,36 @@ def simulate(
     q_hist: list[np.ndarray] = []
     body_q_hist: list[np.ndarray] = []
     body_qd_hist: list[np.ndarray] = []
+    water_points_hist: list[np.ndarray] = []
+
+    frame_dt = float(sim_dt) * float(substeps)
+    water.frame_dt = frame_dt
 
     t0 = time.perf_counter()
     for frame in range(frames):
         q_hist.append(state_in.particle_q.numpy().astype(np.float32))
         body_q_hist.append(state_in.body_q.numpy().astype(np.float32))
         body_qd_hist.append(state_in.body_qd.numpy().astype(np.float32))
+        water_points_hist.append(water.render_points.numpy().reshape(-1, 3).astype(np.float32))
 
         for _ in range(substeps):
             state_in.clear_forces()
-            wp.launch(
-                _apply_floating_body_forces,
-                dim=model.body_count,
-                inputs=[
-                    state_in.body_q,
-                    state_in.body_qd,
-                    state_in.body_f,
-                    model.body_com,
-                    model.body_mass,
-                    model.float_radius,
-                    model.float_target_sub,
-                    float(args.water_level),
-                    float(args.gravity_mag),
-                    float(args.float_max_lift_mult),
-                    float(args.float_linear_drag),
-                    float(args.float_angular_drag),
-                    float(args.float_righting_ke),
-                ],
-                device=device,
-            )
+            if water.active_impulse_count > 0:
+                wp.launch(
+                    _compute_body_forces_from_water,
+                    dim=water.active_impulse_count,
+                    inputs=[
+                        frame_dt,
+                        water.collider_impulse_ids,
+                        water.collider_impulses,
+                        water.collider_impulse_pos,
+                        water.collider_body_id,
+                        state_in.body_q,
+                        model.body_com,
+                        state_in.body_f,
+                    ],
+                    device=device,
+                )
             model.collide(state_in, contacts)
             solver.step(state_in, state_out, control, contacts, sim_dt)
             state_in, state_out = state_out, state_in
@@ -854,6 +1048,28 @@ def simulate(
                         device=device,
                     )
 
+        water.body_water_forces.assign(state_in.body_f)
+        wp.launch(
+            _subtract_body_force_for_water_step,
+            dim=model.body_count,
+            inputs=[
+                frame_dt,
+                state_in.body_q,
+                state_in.body_qd,
+                water.body_water_forces,
+                model.body_inv_inertia,
+                model.body_inv_mass,
+                water.state_0.body_q,
+                water.state_0.body_qd,
+            ],
+            device=device,
+        )
+        water.solver.step(water.state_0, water.state_1, None, None, frame_dt)
+        water.solver.update_particle_frames(water.state_0, water.state_1, frame_dt)
+        water.solver.update_render_grains(water.state_0, water.state_1, water.render_points, frame_dt)
+        water.state_0, water.state_1 = water.state_1, water.state_0
+        _collect_water_impulses(water)
+
         if frame == 0 or (frame + 1) % 10 == 0 or frame + 1 == frames:
             print(f"  frame {frame + 1}/{frames}", flush=True)
 
@@ -862,161 +1078,13 @@ def simulate(
         "particle_q_all": np.stack(q_hist),
         "body_q": np.stack(body_q_hist),
         "body_qd": np.stack(body_qd_hist),
+        "water_points_all": np.stack(water_points_hist),
+        "water_point_radii": water.render_radii.numpy().astype(np.float32),
+        "water_point_colors": water.render_colors.numpy().astype(np.float32),
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
         "wall_time_sec": float(wall),
     }
-
-
-def _build_water_grid(extent: float, step: float, z: float) -> tuple[np.ndarray, np.ndarray]:
-    coords = np.arange(-extent, extent + 0.5 * step, step, dtype=np.float32)
-    starts = []
-    ends = []
-    for x in coords:
-        starts.append((x, -extent, z))
-        ends.append((x, extent, z))
-    for y in coords:
-        starts.append((-extent, y, z))
-        ends.append((extent, y, z))
-    return np.asarray(starts, dtype=np.float32), np.asarray(ends, dtype=np.float32)
-
-
-def _build_water_surface_mesh(extent: float, step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    resolution = max(8, int(round((2.0 * extent) / max(step, 1.0e-4))) + 1)
-    coords = np.linspace(-extent, extent, resolution, dtype=np.float32)
-    grid_x, grid_y = np.meshgrid(coords, coords, indexing="xy")
-    points = np.stack(
-        [
-            grid_x.reshape(-1),
-            grid_y.reshape(-1),
-            np.zeros(grid_x.size, dtype=np.float32),
-        ],
-        axis=1,
-    ).astype(np.float32, copy=False)
-    uvs = np.stack(
-        [
-            ((grid_x + extent) / max(2.0 * extent, 1.0e-6)).reshape(-1),
-            ((grid_y + extent) / max(2.0 * extent, 1.0e-6)).reshape(-1),
-        ],
-        axis=1,
-    ).astype(np.float32, copy=False)
-
-    tris: list[tuple[int, int, int]] = []
-    for j in range(resolution - 1):
-        row0 = j * resolution
-        row1 = (j + 1) * resolution
-        for i in range(resolution - 1):
-            a = row0 + i
-            b = a + 1
-            c = row1 + i
-            d = c + 1
-            tris.append((a, c, b))
-            tris.append((b, c, d))
-    return points, np.asarray(tris, dtype=np.int32).reshape(-1), uvs
-
-
-def _make_water_texture(size: int = 512) -> np.ndarray:
-    coords = np.linspace(0.0, 1.0, size, dtype=np.float32)
-    uu, vv = np.meshgrid(coords, coords, indexing="xy")
-    waves_a = 0.5 + 0.5 * np.sin(18.0 * uu + 2.4 * np.sin(11.0 * vv))
-    waves_b = 0.5 + 0.5 * np.sin(16.0 * vv + 1.7 * np.sin(13.0 * uu))
-    waves = waves_a * waves_b
-    flow = 0.5 + 0.5 * np.sin(28.0 * (0.82 * uu + 0.31 * vv) + 1.3 * np.sin(9.0 * vv))
-    crest = np.clip((flow - 0.82) / 0.18, 0.0, 1.0)
-    caustic = np.clip(0.55 * waves + 0.45 * np.sin(24.0 * (uu + vv)), -1.0, 1.0)
-    caustic = 0.5 + 0.5 * caustic
-    deep = np.array([14.0, 68.0, 110.0], dtype=np.float32)
-    mid = np.array([34.0, 150.0, 198.0], dtype=np.float32)
-    shallow = np.array([122.0, 235.0, 246.0], dtype=np.float32)
-    rgb = deep[None, None, :] * (1.0 - caustic[..., None]) + mid[None, None, :] * caustic[..., None]
-    rgb = rgb * (1.0 - 0.35 * crest[..., None]) + shallow[None, None, :] * (0.35 * crest[..., None])
-    spec = np.clip((0.5 + 0.5 * np.sin(44.0 * (uu - 0.24 * vv))) - 0.78, 0.0, 1.0) / 0.22
-    rgb += 42.0 * spec[..., None]
-    rgb[..., 2] = np.clip(rgb[..., 2] + 14.0 * np.sin(10.0 * uu - 7.0 * vv), 0.0, 255.0)
-    return np.clip(rgb, 0.0, 255.0).astype(np.uint8)
-
-
-def _update_water_surface_points(
-    base_points: np.ndarray,
-    *,
-    water_level: float,
-    time_s: float,
-    body_xy: np.ndarray,
-    wave_amp: float,
-    wave_amp_2: float,
-    ripple_amp: float,
-    ripple_radius: float,
-) -> np.ndarray:
-    points = base_points.copy()
-    x = points[:, 0]
-    y = points[:, 1]
-
-    z = np.full_like(x, float(water_level), dtype=np.float32)
-    z += np.float32(wave_amp) * np.sin(2.4 * x + 0.8 * y + 1.7 * float(time_s))
-    z += np.float32(wave_amp_2) * np.sin(-1.5 * x + 2.2 * y - 1.1 * float(time_s) + 0.6)
-
-    if body_xy.size:
-        for idx, center in enumerate(body_xy):
-            dx = x - np.float32(center[0])
-            dy = y - np.float32(center[1])
-            r = np.sqrt(dx * dx + dy * dy) + 1.0e-6
-            envelope = np.exp(-((r / max(float(ripple_radius), 1.0e-4)) ** 2)).astype(np.float32)
-            z += np.float32(ripple_amp) * envelope * np.sin(10.0 * r - 2.8 * float(time_s) - 0.7 * idx)
-
-    points[:, 2] = z
-    return points.astype(np.float32, copy=False)
-
-
-def _build_water_ripple_lines(
-    body_xy: np.ndarray,
-    *,
-    water_level: float,
-    time_s: float,
-    max_radius: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    if body_xy.size == 0:
-        empty = np.zeros((0, 3), dtype=np.float32)
-        return empty, empty
-
-    starts: list[tuple[float, float, float]] = []
-    ends: list[tuple[float, float, float]] = []
-    num_segments = 36
-    for idx, center in enumerate(body_xy):
-        for ring in range(2):
-            phase = (0.38 * ring + 0.27 * idx + 0.55 * float(time_s)) % 1.0
-            radius = 0.05 + phase * max(float(max_radius), 0.05)
-            z = float(water_level) + 0.006 + 0.002 * ring
-            angles = np.linspace(0.0, 2.0 * math.pi, num_segments + 1, dtype=np.float32)
-            circle_x = np.float32(center[0]) + np.float32(radius) * np.cos(angles)
-            circle_y = np.float32(center[1]) + np.float32(radius) * np.sin(angles)
-            for seg in range(num_segments):
-                starts.append((float(circle_x[seg]), float(circle_y[seg]), z))
-                ends.append((float(circle_x[seg + 1]), float(circle_y[seg + 1]), z))
-
-    return np.asarray(starts, dtype=np.float32), np.asarray(ends, dtype=np.float32)
-
-
-def _build_water_highlight_lines(
-    *,
-    extent: float,
-    water_level: float,
-    time_s: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    starts: list[tuple[float, float, float]] = []
-    ends: list[tuple[float, float, float]] = []
-    line_count = 7
-    seg_count = 28
-    base_y = np.linspace(-0.62 * extent, 0.62 * extent, line_count, dtype=np.float32)
-    xs = np.linspace(-0.82 * extent, 0.82 * extent, seg_count + 1, dtype=np.float32)
-    for idx, y0 in enumerate(base_y):
-        phase = 0.65 * float(time_s) + 0.45 * idx
-        ys = y0 + 0.07 * np.sin(1.45 * xs + phase)
-        zs = float(water_level) + 0.01 + 0.004 * np.sin(2.1 * xs - 1.6 * phase)
-        for seg in range(seg_count):
-            starts.append((float(xs[seg]), float(ys[seg]), float(zs[seg])))
-            ends.append((float(xs[seg + 1]), float(ys[seg + 1]), float(zs[seg + 1])))
-    return np.asarray(starts, dtype=np.float32), np.asarray(ends, dtype=np.float32)
-
 
 def _view_specs() -> list[ViewSpec]:
     return [
@@ -1076,32 +1144,9 @@ def render_view_mp4(
         str(out_mp4),
     ]
 
-    water_surface_points_base, water_surface_indices_np, water_surface_uvs_np = _build_water_surface_mesh(
-        extent=float(args.water_grid_extent),
-        step=float(args.water_grid_step),
-    )
-    water_surface_points_wp = wp.array(water_surface_points_base, dtype=wp.vec3, device=device)
-    water_surface_indices_wp = wp.array(
-        water_surface_indices_np.astype(np.int32, copy=False),
-        dtype=wp.int32,
-        device=device,
-    )
-    water_surface_uvs_wp = wp.array(water_surface_uvs_np.astype(np.float32, copy=False), dtype=wp.vec2, device=device)
-    water_surface_texture = _make_water_texture()
-    water_surface_xforms = wp.array(
-        [wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity())],
-        dtype=wp.transform,
-        device=device,
-    )
-    water_surface_scales = wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device)
-    water_surface_colors = wp.array([[1.0, 1.0, 1.0]], dtype=wp.vec3, device=device)
-    water_surface_materials = wp.array([[0.18, 0.0, 0.0, 1.0]], dtype=wp.vec4, device=device)
-    ripple_starts_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    ripple_ends_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    highlight_starts_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    highlight_ends_wp = wp.empty(0, dtype=wp.vec3, device=device)
-    ripple_color = (0.72, 0.94, 1.0)
-    highlight_color = (0.93, 0.99, 1.0)
+    water_points_wp = wp.empty(sim_data["water_points_all"].shape[1], dtype=wp.vec3, device=device)
+    water_radii_wp = wp.array(sim_data["water_point_radii"].astype(np.float32, copy=False), dtype=wp.float32, device=device)
+    water_colors_wp = wp.array(sim_data["water_point_colors"].astype(np.float32, copy=False), dtype=wp.vec3, device=device)
     bunny_mesh_points = wp.array(
         (meta.mesh_verts_local * float(meta.mesh_scale)).astype(np.float32, copy=False),
         dtype=wp.vec3,
@@ -1187,11 +1232,9 @@ def render_view_mp4(
             ]
             for idx, label in enumerate(list(model.shape_label)):
                 name = str(label).lower()
-                if "float_bunny_" in name:
+                if "water_bunny_" in name:
                     bunny_id = int(name.rsplit("_", 1)[1])
                     shape_colors[idx] = palette[bunny_id % len(palette)]
-                elif name == str(meta.water_plane_shape_label).lower():
-                    shape_colors[idx] = (0.08, 0.36, 0.58)
             if shape_colors:
                 viewer.update_shape_colors(shape_colors)
         except Exception:
@@ -1223,52 +1266,12 @@ def render_view_mp4(
             viewer.begin_frame(float(frame_idx) * float(sim_data["sim_dt"]) * float(sim_data["substeps"]))
             viewer.log_state(state)
             sim_t = float(frame_idx) * float(sim_data["sim_dt"]) * float(sim_data["substeps"])
-            body_xy = bq[:, :2].astype(np.float32, copy=False) if bq.size else np.zeros((0, 2), dtype=np.float32)
-            water_points_np = _update_water_surface_points(
-                water_surface_points_base,
-                water_level=float(args.water_level),
-                time_s=sim_t,
-                body_xy=body_xy,
-                wave_amp=float(args.water_wave_amp),
-                wave_amp_2=float(args.water_wave_amp_2),
-                ripple_amp=float(args.water_ripple_amp),
-                ripple_radius=float(args.water_ripple_radius),
-            )
-            water_surface_points_wp.assign(water_points_np)
-
-            ripple_starts_np, ripple_ends_np = _build_water_ripple_lines(
-                body_xy,
-                water_level=float(args.water_level),
-                time_s=sim_t,
-                max_radius=float(args.water_ripple_radius),
-            )
-            ripple_starts_wp = wp.array(ripple_starts_np, dtype=wp.vec3, device=device)
-            ripple_ends_wp = wp.array(ripple_ends_np, dtype=wp.vec3, device=device)
-            highlight_starts_np, highlight_ends_np = _build_water_highlight_lines(
-                extent=float(args.water_grid_extent),
-                water_level=float(args.water_level),
-                time_s=sim_t,
-            )
-            highlight_starts_wp = wp.array(highlight_starts_np, dtype=wp.vec3, device=device)
-            highlight_ends_wp = wp.array(highlight_ends_np, dtype=wp.vec3, device=device)
-
-            viewer.log_mesh(
-                "/demo/water_surface_mesh",
-                water_surface_points_wp,
-                water_surface_indices_wp,
-                normals=None,
-                uvs=water_surface_uvs_wp,
-                texture=water_surface_texture,
-                hidden=True,
-                backface_culling=False,
-            )
-            viewer.log_instances(
-                "/demo/water_surface",
-                "/demo/water_surface_mesh",
-                water_surface_xforms,
-                water_surface_scales,
-                water_surface_colors,
-                water_surface_materials,
+            water_points_wp.assign(sim_data["water_points_all"][frame_idx].astype(np.float32, copy=False))
+            viewer.log_points(
+                "/demo/water_particles",
+                water_points_wp,
+                water_radii_wp,
+                water_colors_wp,
                 hidden=False,
             )
 
@@ -1288,33 +1291,6 @@ def render_view_mp4(
                 bunny_instance_materials,
                 hidden=False,
             )
-            if len(ripple_starts_np):
-                viewer.log_lines(
-                    "/demo/water_ripples",
-                    ripple_starts_wp,
-                    ripple_ends_wp,
-                    ripple_color,
-                    width=float(args.water_line_width),
-                    hidden=False,
-                )
-            else:
-                viewer.log_lines(
-                    "/demo/water_ripples",
-                    ripple_starts_wp,
-                    ripple_ends_wp,
-                    ripple_color,
-                    width=float(args.water_line_width),
-                    hidden=True,
-                )
-            viewer.log_lines(
-                "/demo/water_highlights",
-                highlight_starts_wp,
-                highlight_ends_wp,
-                highlight_color,
-                width=float(args.water_line_width) * 0.72,
-                hidden=False,
-            )
-
             for spec, pts_wp, radii_wp, colors_wp in point_batches:
                 pts_np = q_all[spec.particle_start : spec.particle_start + spec.particle_count]
                 pts_wp.assign(pts_np)
@@ -1349,7 +1325,7 @@ def render_view_mp4(
                     frame,
                     [
                         view_spec.label,
-                        "Scene: sloth + zebra drop onto floating bunny rigids",
+                        "Scene: sloth + zebra drop onto bunny rigids in MPM water",
                         f"frame {frame_idx + 1:03d}/{n_frames:03d}  t={sim_t:.3f}s",
                     ],
                     font_size=int(args.label_font_size),
@@ -1384,8 +1360,12 @@ def save_scene_npz(out_dir: Path, prefix: str, sim_data: dict[str, Any], meta: D
         particle_q_all=sim_data["particle_q_all"],
         body_q=sim_data["body_q"],
         body_qd=sim_data["body_qd"],
+        water_points_all=sim_data["water_points_all"],
+        water_point_radii=sim_data["water_point_radii"],
+        water_point_colors=sim_data["water_point_colors"],
         sim_dt=np.float32(sim_data["sim_dt"]),
         substeps=np.int32(sim_data["substeps"]),
+        wall_time_sec=np.float32(sim_data["wall_time_sec"]),
         water_level=np.float32(meta.water_level),
         hidden_floor_z=np.float32(meta.hidden_floor_z),
         rigid_mesh_vertices_local=meta.mesh_verts_local,
@@ -1406,6 +1386,9 @@ def load_scene_npz(path: Path) -> dict[str, Any]:
             "particle_q_all": np.asarray(data["particle_q_all"], dtype=np.float32),
             "body_q": np.asarray(data["body_q"], dtype=np.float32),
             "body_qd": np.asarray(data["body_qd"], dtype=np.float32),
+            "water_points_all": np.asarray(data["water_points_all"], dtype=np.float32),
+            "water_point_radii": np.asarray(data["water_point_radii"], dtype=np.float32),
+            "water_point_colors": np.asarray(data["water_point_colors"], dtype=np.float32),
             "sim_dt": float(np.asarray(data["sim_dt"]).ravel()[0]),
             "substeps": int(np.asarray(data["substeps"]).ravel()[0]),
             "wall_time_sec": float(np.asarray(data["wall_time_sec"]).ravel()[0])
@@ -1421,6 +1404,7 @@ def build_summary(
     panel_paths: list[Path],
     composed_path: Path | None,
 ) -> dict[str, Any]:
+    frame_count = int(sim_data["particle_q_all"].shape[0])
     wall_time_sec = float(sim_data.get("wall_time_sec", 0.0))
     if wall_time_sec <= 0.0:
         existing_summary_path = args.out_dir / f"{_output_stem(args.prefix)}_summary.json"
@@ -1436,7 +1420,7 @@ def build_summary(
         "experiment": "sloth_zebra_water_impact_demo",
         "sloth_ir": str(args.sloth_ir.resolve()),
         "zebra_ir": str(args.zebra_ir.resolve()),
-        "frames": int(args.frames),
+        "frames": frame_count,
         "sim_dt": float(sim_data["sim_dt"]),
         "substeps": int(sim_data["substeps"]),
         "frame_dt": float(sim_data["sim_dt"]) * float(sim_data["substeps"]),
@@ -1449,10 +1433,28 @@ def build_summary(
         "rigid_mass": float(args.rigid_mass),
         "rigid_scale": float(args.rigid_scale),
         "rigid_shape": str(args.rigid_shape),
-        "float_linear_drag": float(args.float_linear_drag),
-        "float_angular_drag": float(args.float_angular_drag),
-        "float_righting_ke": float(args.float_righting_ke),
-        "float_submerge_fraction": float(args.float_submerge_fraction),
+        "initial_rigid_submerge_fraction": float(args.float_submerge_fraction),
+        "water_extent": float(args.water_extent),
+        "water_depth": float(args.water_depth),
+        "water_voxel_size": float(args.water_voxel_size),
+        "water_particles_per_cell": int(args.water_particles_per_cell),
+        "water_points_per_particle": int(args.water_points_per_particle),
+        "water_density": float(args.water_density),
+        "water_young_modulus": float(args.water_young_modulus),
+        "water_poisson_ratio": float(args.water_poisson_ratio),
+        "water_damping": float(args.water_damping),
+        "water_hardening": float(args.water_hardening),
+        "water_friction": float(args.water_friction),
+        "water_yield_pressure": float(args.water_yield_pressure),
+        "water_tensile_yield_ratio": float(args.water_tensile_yield_ratio),
+        "water_yield_stress": float(args.water_yield_stress),
+        "water_air_drag": float(args.water_air_drag),
+        "water_grid_type": str(args.water_grid_type),
+        "water_soft_direct_coupling": _water_soft_direct_coupling_supported(),
+        "water_soft_direct_coupling_reason": (
+            "MPM collider setup reads collision shapes/meshes only; imported PhysTwin soft objects "
+            "are particle-spring systems without collider shapes in this demo."
+        ),
         "mesh_asset_path": meta.mesh_asset_path,
         "views": [view.label for view in _view_specs()],
         "panel_videos": [str(p) for p in panel_paths],
@@ -1532,26 +1534,50 @@ def _render_subprocess_cmd(
         str(args.bunny_asset),
         "--bunny-prim",
         str(args.bunny_prim),
-        "--float-max-lift-mult",
-        str(args.float_max_lift_mult),
-        "--float-linear-drag",
-        str(args.float_linear_drag),
-        "--float-angular-drag",
-        str(args.float_angular_drag),
-        "--float-righting-ke",
-        str(args.float_righting_ke),
         "--float-submerge-fraction",
         str(args.float_submerge_fraction),
+        "--water-extent",
+        str(args.water_extent),
+        "--water-depth",
+        str(args.water_depth),
+        "--water-wall-thickness",
+        str(args.water_wall_thickness),
+        "--water-wall-height",
+        str(args.water_wall_height),
+        "--water-voxel-size",
+        str(args.water_voxel_size),
+        "--water-particles-per-cell",
+        str(args.water_particles_per_cell),
+        "--water-density",
+        str(args.water_density),
+        "--water-young-modulus",
+        str(args.water_young_modulus),
+        "--water-poisson-ratio",
+        str(args.water_poisson_ratio),
+        "--water-damping",
+        str(args.water_damping),
+        "--water-hardening",
+        str(args.water_hardening),
+        "--water-friction",
+        str(args.water_friction),
+        "--water-yield-pressure",
+        str(args.water_yield_pressure),
+        "--water-tensile-yield-ratio",
+        str(args.water_tensile_yield_ratio),
+        "--water-yield-stress",
+        str(args.water_yield_stress),
+        "--water-air-drag",
+        str(args.water_air_drag),
+        "--water-grid-type",
+        str(args.water_grid_type),
+        "--water-max-iterations",
+        str(args.water_max_iterations),
+        "--water-points-per-particle",
+        str(args.water_points_per_particle),
         "--angular-damping",
         str(args.angular_damping),
         "--friction-smoothing",
         str(args.friction_smoothing),
-        "--water-grid-extent",
-        str(args.water_grid_extent),
-        "--water-grid-step",
-        str(args.water_grid_step),
-        "--water-line-width",
-        str(args.water_line_width),
         "--spring-line-width",
         str(args.spring_line_width),
         "--render-edge-stride",
@@ -1601,14 +1627,22 @@ def main() -> int:
 
     print("Building combined model...", flush=True)
     model, meta = build_model(sloth_ir, zebra_ir, args, device)
+    if not _water_soft_direct_coupling_supported():
+        print(
+            "Note: MPM water couples directly to rigid/static collider shapes only; "
+            "the imported PhysTwin soft objects do not directly collide with water in this demo.",
+            flush=True,
+        )
 
     if args.render_only_scene is not None:
         sim_data = load_scene_npz(args.render_only_scene.resolve())
         scene_npz = args.render_only_scene.resolve()
         print(f"Using existing scene NPZ: {scene_npz}", flush=True)
     else:
+        print("Building native MPM water system...", flush=True)
+        water = build_water_system(model, args, device)
         print("Simulating impact scene...", flush=True)
-        sim_data = simulate(model, meta, args, sloth_ir, device)
+        sim_data = simulate(model, meta, args, sloth_ir, water, device)
         scene_npz = save_scene_npz(args.out_dir, args.prefix, sim_data, meta)
         print(f"  Scene NPZ: {scene_npz}", flush=True)
 
