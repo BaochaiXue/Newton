@@ -28,6 +28,7 @@ import argparse
 import csv
 import json
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,6 +55,10 @@ RESTITUTION_EPS = 1e-4  # avoid log(0) in restitution -> damping-ratio mapping
 # Contact clamping
 MU_MAX = 2.0
 RESTITUTION_MAX = 1.0
+
+# Ground restitution mapping modes
+GROUND_RESTITUTION_MODE_STRICT_NATIVE = "strict-native"
+GROUND_RESTITUTION_MODE_APPROXIMATE_NATIVE = "approximate-native"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -126,6 +131,7 @@ class SimConfig:
     particle_mu_override: float | None = None
     ground_mu_scale: float = 1.0
     ground_restitution_scale: float = 1.0
+    ground_restitution_mode: str = GROUND_RESTITUTION_MODE_STRICT_NATIVE
 
     # Baseline
     inference_path: Path | None = None
@@ -187,6 +193,7 @@ class SimConfig:
             particle_mu_override=args.particle_mu_override,
             ground_mu_scale=args.ground_mu_scale,
             ground_restitution_scale=args.ground_restitution_scale,
+            ground_restitution_mode=args.ground_restitution_mode,
             inference_path=args.inference,
             rigid_probe=args.rigid_probe,
             rigid_probe_object_mass=args.rigid_probe_object_mass,
@@ -377,6 +384,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--particle-mu-override", type=float, default=None)
     p.add_argument("--ground-mu-scale", type=float, default=1.0)
     p.add_argument("--ground-restitution-scale", type=float, default=1.0)
+    p.add_argument(
+        "--ground-restitution-mode",
+        choices=[
+            GROUND_RESTITUTION_MODE_STRICT_NATIVE,
+            GROUND_RESTITUTION_MODE_APPROXIMATE_NATIVE,
+        ],
+        default=GROUND_RESTITUTION_MODE_STRICT_NATIVE,
+        help=(
+            "How to handle PhysTwin ground collide_elas in native Newton SemiImplicit. "
+            "'strict-native' keeps native Newton ground contact defaults and treats "
+            "collide_elas as unsupported for parity. "
+            "'approximate-native' calibrates native ground damping from collide_elas "
+            "without changing Newton core."
+        ),
+    )
 
     # Baseline
     p.add_argument("--inference", type=Path, default=None)
@@ -883,20 +905,9 @@ def _add_ground_plane(
         return
 
     gcfg = builder.default_shape_cfg.copy()
-    if "contact_collide_fric" in ir:
-        gcfg.mu = float(
-            np.clip(
-                ir_scalar(ir, "contact_collide_fric") * cfg.ground_mu_scale, 0, MU_MAX
-            )
-        )
-    if "contact_collide_elas" in ir:
-        gcfg.restitution = float(
-            np.clip(
-                ir_scalar(ir, "contact_collide_elas") * cfg.ground_restitution_scale,
-                0,
-                RESTITUTION_MAX,
-            )
-        )
+    _configure_ground_contact_material(
+        gcfg, ir, cfg, checks, context="ground_plane"
+    )
 
     reverse_z = ir_bool(ir, "reverse_z")
     if cfg.up_axis == "Z" and reverse_z:
@@ -915,6 +926,9 @@ def _add_ground_plane(
     checks["ground_plane_added"] = True
     checks["ground_mu"] = float(gcfg.mu)
     checks["ground_restitution"] = float(gcfg.restitution)
+    checks["ground_contact_final_ke"] = float(gcfg.ke)
+    checks["ground_contact_final_kd"] = float(gcfg.kd)
+    checks["ground_contact_final_kf"] = float(gcfg.kf)
 
 
 def _restitution_to_damping_ratio(restitution: float) -> float:
@@ -940,6 +954,84 @@ def _resolve_object_mass_reference(ir: dict) -> float:
     if positive.size == 0:
         return 1.0
     return float(np.median(positive))
+
+
+def _configure_ground_contact_material(
+    gcfg,
+    ir: dict,
+    cfg: SimConfig,
+    checks: dict,
+    *,
+    context: str,
+) -> None:
+    """Configure native Newton ground contact material from PhysTwin IR.
+
+    Native Newton SemiImplicit uses `ke/kd/kf/mu` for particle-vs-shape contact.
+    PhysTwin ground collision uses an impulse-style restitution/friction update.
+    Therefore:
+    - `strict-native` records collide_elas as unsupported for parity and keeps the
+      native Newton ground `ke/kd/kf` defaults.
+    - `approximate-native` calibrates native `kd` from collide_elas while keeping
+      the native Newton contact model unchanged.
+    """
+    checks["ground_restitution_mode"] = cfg.ground_restitution_mode
+    checks["ground_contact_param_source"] = "native_newton_shape_material"
+    checks["ground_contact_context"] = context
+
+    if "contact_collide_fric" in ir:
+        fric_raw = ir_scalar(ir, "contact_collide_fric")
+        gcfg.mu = float(np.clip(fric_raw * cfg.ground_mu_scale, 0.0, MU_MAX))
+        checks["ground_contact_fric_raw"] = float(fric_raw)
+    checks["ground_contact_map_mu"] = float(gcfg.mu)
+
+    if "contact_collide_elas" not in ir:
+        checks["ground_contact_elas_supported"] = False
+        checks["ground_contact_map_ke"] = float(gcfg.ke)
+        checks["ground_contact_map_kd"] = float(gcfg.kd)
+        checks["ground_contact_map_kf"] = float(gcfg.kf)
+        return
+
+    elas_raw = ir_scalar(ir, "contact_collide_elas")
+    elas_effective = float(
+        np.clip(elas_raw * cfg.ground_restitution_scale, 0.0, RESTITUTION_MAX)
+    )
+    checks["ground_contact_elas_raw"] = float(elas_raw)
+    checks["ground_contact_elas_effective"] = float(elas_effective)
+
+    if cfg.ground_restitution_mode == GROUND_RESTITUTION_MODE_STRICT_NATIVE:
+        checks["ground_contact_elas_supported"] = False
+        checks["ground_contact_elas_mapping"] = "unsupported_in_native_semi_implicit"
+        checks["ground_contact_map_ke"] = float(gcfg.ke)
+        checks["ground_contact_map_kd"] = float(gcfg.kd)
+        checks["ground_contact_map_kf"] = float(gcfg.kf)
+        message = (
+            f"{context}: PhysTwin ground collide_elas is present in IR, but native "
+            "Newton SemiImplicit has no direct 1-to-1 restitution field for "
+            "particle-vs-shape contacts. Ground bounce will therefore use native "
+            "Newton ground ke/kd/kf defaults unless "
+            "--ground-restitution-mode=approximate-native is selected."
+        )
+        checks["ground_contact_warning"] = message
+        if cfg.strict_physics_checks:
+            raise ValueError(message)
+        warnings.warn(message)
+        return
+
+    # Approximate native calibration: use the native Newton contact model but tune
+    # damping so the bounce trend follows the target restitution coefficient.
+    m_eff_ref = max(_resolve_object_mass_reference(ir), EPSILON)
+    zeta = _restitution_to_damping_ratio(elas_effective)
+    ke = max(float(gcfg.ke), EPSILON)
+    kd = 2.0 * zeta * np.sqrt(ke * m_eff_ref)
+    gcfg.kd = float(max(kd, 0.0))
+
+    checks["ground_contact_elas_supported"] = True
+    checks["ground_contact_elas_mapping"] = "approximate_native_damping_calibration"
+    checks["ground_contact_map_zeta"] = float(zeta)
+    checks["ground_contact_map_m_eff_ref"] = float(m_eff_ref)
+    checks["ground_contact_map_ke"] = float(gcfg.ke)
+    checks["ground_contact_map_kd"] = float(gcfg.kd)
+    checks["ground_contact_map_kf"] = float(gcfg.kf)
 
 
 def _apply_ps_object_collision_mapping(
@@ -1312,6 +1404,7 @@ def save_results(
             "particle_mu_override": cfg.particle_mu_override,
             "ground_mu_scale": cfg.ground_mu_scale,
             "ground_restitution_scale": cfg.ground_restitution_scale,
+            "ground_restitution_mode": cfg.ground_restitution_mode,
         },
         "simulation": {
             "frames_run": int(sim_result.particle_q_all.shape[0]),
@@ -1422,20 +1515,9 @@ def _add_probe_ground_plane(
         return
 
     gcfg = builder.default_shape_cfg.copy()
-    if "contact_collide_fric" in ir:
-        gcfg.mu = float(
-            np.clip(
-                ir_scalar(ir, "contact_collide_fric") * cfg.ground_mu_scale, 0, MU_MAX
-            )
-        )
-    if "contact_collide_elas" in ir:
-        gcfg.restitution = float(
-            np.clip(
-                ir_scalar(ir, "contact_collide_elas") * cfg.ground_restitution_scale,
-                0,
-                RESTITUTION_MAX,
-            )
-        )
+    _configure_ground_contact_material(
+        gcfg, ir, cfg, checks, context="rigid_probe_ground_plane"
+    )
 
     reverse_z = ir_bool(ir, "reverse_z")
     if cfg.up_axis == "Z" and reverse_z:
@@ -1454,6 +1536,9 @@ def _add_probe_ground_plane(
     checks["ground_plane_added"] = True
     checks["ground_mu"] = float(gcfg.mu)
     checks["ground_restitution"] = float(gcfg.restitution)
+    checks["ground_contact_final_ke"] = float(gcfg.ke)
+    checks["ground_contact_final_kd"] = float(gcfg.kd)
+    checks["ground_contact_final_kf"] = float(gcfg.kf)
 
 
 def _build_rigid_probe_model(
@@ -1843,6 +1928,7 @@ def run_rigid_probe(cfg: SimConfig, ir: dict, device: str) -> dict:
         "ground_plane_added": bool(probe_meta.get("ground_plane_added", False)),
         "ground_mu": float(probe_meta.get("ground_mu", 0.0)),
         "ground_restitution": float(probe_meta.get("ground_restitution", 0.0)),
+        "ground_restitution_mode": str(cfg.ground_restitution_mode),
         "gravity_scalar": float(probe_meta.get("gravity_scalar", 0.0)),
         "gravity_vector": [float(v) for v in probe_meta.get("gravity_vector", (0.0, 0.0, 0.0))],
         "use_scene_gravity": bool(cfg.rigid_probe_use_scene_gravity),

@@ -178,6 +178,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--particle-mu-override", type=float, default=None)
     parser.add_argument("--ground-mu-scale", type=float, default=1.0)
     parser.add_argument("--ground-restitution-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--ground-restitution-mode",
+        choices=["strict-native", "approximate-native"],
+        default="strict-native",
+        help=(
+            "Pass-through to importer: handling mode for PhysTwin ground collide_elas. "
+            "'strict-native' treats it as unsupported in native Newton SemiImplicit; "
+            "'approximate-native' calibrates native ground damping from collide_elas."
+        ),
+    )
 
     # ── Baseline / GT ──
     parser.add_argument("--inference", type=Path, default=None)
@@ -463,6 +473,7 @@ def _build_importer_cmd(
         "--gravity-mag", str(args.gravity_mag),
         "--ground-mu-scale", str(args.ground_mu_scale),
         "--ground-restitution-scale", str(args.ground_restitution_scale),
+        "--ground-restitution-mode", str(args.ground_restitution_mode),
         "--drag-damping-scale", str(args.drag_damping_scale),
     ]
     if args.particle_contact_ke is not None:
