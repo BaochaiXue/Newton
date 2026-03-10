@@ -82,6 +82,7 @@ class SoftProxy:
     mesh: Any
     query_points_world: np.ndarray
     collider_thickness: float
+    collider_projection_threshold: float
     collider_mu: float
 
 
@@ -90,6 +91,7 @@ class DemoMeta:
     spec: SoftSpec
     tray_half_extent: float
     sand_height: float
+    tray_base_bottom_z: float
     tray_floor_top_z: float
     tray_wall_top_z: float
     scene_label: str
@@ -107,6 +109,7 @@ class SandSystem:
     collider_body_id: wp.array
     body_sand_forces: wp.array | None
     frame_dt: float
+    sim_dt: float
     active_impulse_count: int
     render_radii: wp.array
     render_colors: wp.array
@@ -170,9 +173,10 @@ def subtract_body_force(
 def add_dense_particle_forces(
     particle_f: wp.array(dtype=wp.vec3),
     external_f: wp.array(dtype=wp.vec3),
+    scale: float,
 ):
     tid = wp.tid()
-    particle_f[tid] = particle_f[tid] + external_f[tid]
+    particle_f[tid] = particle_f[tid] + external_f[tid] * scale
 
 
 @wp.kernel
@@ -238,6 +242,14 @@ def _camera_position(target: np.ndarray, yaw_deg: float, pitch_deg: float, dista
     )
     front /= max(float(np.linalg.norm(front)), 1.0e-6)
     return target.astype(np.float32) - front * float(distance)
+
+
+def _substep_feedback_scale(substep: int, substeps: int) -> float:
+    if substeps <= 1:
+        return 1.0
+    # Apply stale MPM feedback strongly at the beginning of the frame and fade it
+    # out across soft-body substeps to avoid injecting outdated impulses late.
+    return max(0.0, 1.0 - (float(substep) / float(substeps - 1)))
 
 
 def _alpha_shape_surface_mesh(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -322,12 +334,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sand-air-drag", type=float, default=1.0)
     p.add_argument("--sand-grid-type", choices=["fixed", "sparse"], default="fixed")
     p.add_argument("--sand-max-iterations", type=int, default=40)
+    p.add_argument("--sand-transfer-scheme", choices=["apic", "pic"], default="pic")
+    p.add_argument("--sand-critical-fraction", type=float, default=0.05)
 
     p.add_argument("--sloth-center-xy", type=float, nargs=2, default=(0.0, 0.0))
     p.add_argument("--sloth-center-z", type=float, default=3.0)
     p.add_argument("--particle-mass", type=float, default=0.001)
-    p.add_argument("--drag-damping-scale", type=float, default=0.0)
-    p.add_argument("--spring-k-scale", type=float, default=0.001)
+    p.add_argument("--drag-damping-scale", type=float, default=0.1)
+    p.add_argument("--spring-k-scale", type=float, default=0.0003)
     p.add_argument("--soft-mpm-force-scale", type=float, default=0.15)
     p.add_argument("--soft-mpm-max-dv-per-frame", type=float, default=0.01)
 
@@ -337,7 +351,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--screen-height", type=int, default=540)
     p.add_argument("--viewer-headless", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--views", default="close_a")
-    p.add_argument("--camera-fov", type=float, default=42.0)
+    p.add_argument("--camera-fov", type=float, default=50.0)
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--label-font-size", type=int, default=24)
     return p.parse_args()
@@ -366,76 +380,105 @@ def _load_surface_points(spec: SoftSpec) -> np.ndarray:
     return surface
 
 
-def _prepare_soft_object(builder: newton.ModelBuilder, ir: dict[str, np.ndarray], args: argparse.Namespace) -> SoftSpec:
-    reverse_z = newton_import_ir.ir_bool(ir, "reverse_z", default=False)
-    x0 = np.asarray(ir["x0"], dtype=np.float32).copy()
-    v0 = np.asarray(ir["v0"], dtype=np.float32).copy()
-    n_obj = int(np.asarray(ir["num_object_points"]).ravel()[0])
+def _copy_ir_for_demo(ir: dict[str, np.ndarray], args: argparse.Namespace) -> tuple[dict[str, Any], np.ndarray, bool]:
+    ir_demo: dict[str, Any] = {}
+    for key, value in ir.items():
+        if isinstance(value, np.ndarray):
+            ir_demo[key] = np.array(value, copy=True)
+        else:
+            ir_demo[key] = value
+
+    reverse_z = newton_import_ir.ir_bool(ir_demo, "reverse_z", default=False)
+    n_obj = int(np.asarray(ir_demo["num_object_points"]).ravel()[0])
+
+    x0 = np.asarray(ir_demo["x0"], dtype=np.float32).copy()[:n_obj]
+    v0 = np.zeros_like(np.asarray(ir_demo["v0"], dtype=np.float32), dtype=np.float32)[:n_obj]
     if reverse_z:
         x0[:, 2] *= -1.0
         v0[:, 2] *= -1.0
 
-    pos = x0[:n_obj].copy()
-    bbox_min = pos.min(axis=0)
-    bbox_max = pos.max(axis=0)
-    center_xy = 0.5 * (bbox_min[:2] + bbox_max[:2])
-    center_z = 0.5 * (bbox_min[2] + bbox_max[2])
-    target_center = np.array([float(args.sloth_center_xy[0]), float(args.sloth_center_xy[1]), float(args.sloth_center_z)], dtype=np.float32)
-    shift = target_center - np.array([float(center_xy[0]), float(center_xy[1]), float(center_z)], dtype=np.float32)
-    pos += shift
-
-    mass_obj = np.full(n_obj, float(args.particle_mass), dtype=np.float32)
-    radius_all, _, _ = newton_import_ir.resolve_collision_radius(ir, x0.shape[0])
-    radius_obj = radius_all[:n_obj].astype(np.float32, copy=True)
-    builder.add_particles(
-        pos=[tuple(row.tolist()) for row in pos],
-        vel=[(0.0, 0.0, 0.0)] * n_obj,
-        mass=mass_obj.astype(float).tolist(),
-        radius=radius_obj.astype(float).tolist(),
-        flags=[int(newton.ParticleFlags.ACTIVE)] * n_obj,
+    bbox_min = x0.min(axis=0)
+    bbox_max = x0.max(axis=0)
+    source_center = 0.5 * (bbox_min + bbox_max)
+    target_center = np.array(
+        [float(args.sloth_center_xy[0]), float(args.sloth_center_xy[1]), float(args.sloth_center_z)],
+        dtype=np.float32,
     )
+    shift = target_center - source_center
+    x0 += shift
+    ir_demo["x0"] = x0
+    ir_demo["v0"] = v0
 
-    edges = np.asarray(ir["spring_edges"], dtype=np.int32)
+    mass = np.asarray(ir_demo["mass"], dtype=np.float32).copy()
+    ir_demo["mass"] = np.full(n_obj, float(args.particle_mass), dtype=np.float32)
+    ir_demo["collision_radius"] = np.asarray(ir_demo["collision_radius"], dtype=np.float32).copy()[:n_obj]
+    ir_demo["num_object_points"] = np.asarray(n_obj, dtype=np.int32)
+
+    edges = np.asarray(ir_demo["spring_edges"], dtype=np.int32)
     keep = (edges[:, 0] < n_obj) & (edges[:, 1] < n_obj)
-    edges_obj = edges[keep].astype(np.int32, copy=True)
-    rest = np.asarray(ir["spring_rest_length"], dtype=np.float32).ravel()[keep]
-    ke = np.asarray(ir["spring_ke"], dtype=np.float32).ravel()[keep] * float(args.spring_k_scale)
-    kd = np.asarray(ir["spring_kd"], dtype=np.float32).ravel()[keep] * float(args.spring_k_scale)
-    for idx in range(edges_obj.shape[0]):
-        i, j = int(edges_obj[idx, 0]), int(edges_obj[idx, 1])
-        builder.add_spring(i=i, j=j, ke=float(ke[idx]), kd=float(kd[idx]), control=0.0)
-        builder.spring_rest_length[-1] = float(rest[idx])
+    ir_demo["spring_edges"] = edges[keep].astype(np.int32, copy=True)
+    for key in (
+        "spring_ke",
+        "spring_kd",
+        "spring_rest_length",
+        "spring_y",
+        "spring_y_raw",
+    ):
+        if key in ir_demo:
+            ir_demo[key] = np.asarray(ir_demo[key], dtype=np.float32).copy().ravel()[keep]
 
-    render_edges = edges_obj[::24].copy()
-    point_radius = np.maximum(radius_obj * 2.5, 0.008)
-    return SoftSpec(
-        name="sloth",
-        case_name=str(np.asarray(ir.get("case_name", np.array(["sloth"]))).ravel()[0]),
-        color_rgb=(0.98, 0.66, 0.18),
+    ir_demo.pop("controller_idx", None)
+    ir_demo.pop("controller_traj", None)
+    return ir_demo, shift.astype(np.float32), bool(reverse_z)
+
+
+def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, device: str) -> tuple[newton.Model, DemoMeta, dict[str, Any]]:
+    cfg_validate = newton_import_ir.SimConfig(
         ir_path=args.sloth_ir.resolve(),
-        particle_start=0,
-        particle_count=n_obj,
-        drag_damping=float(newton_import_ir.ir_scalar(ir, "drag_damping", default=0.0)) * float(args.drag_damping_scale),
-        render_edge_global=render_edges,
-        render_point_radius=point_radius.astype(np.float32),
-        mass_sum=float(mass_obj.sum()),
-        placement_shift=shift.astype(np.float32),
-        reverse_z=bool(reverse_z),
-        collision_radius_mean=float(np.mean(radius_obj)),
-        collider_mu=float(newton_import_ir.ir_scalar(ir, "contact_collide_object_fric", default=0.4)),
+        out_dir=args.out_dir.resolve(),
+        output_prefix=args.prefix,
+        spring_ke_scale=float(args.spring_k_scale),
+        spring_kd_scale=float(args.spring_k_scale),
+        angular_damping=0.05,
+        friction_smoothing=1.0,
+        enable_tri_contact=True,
+        disable_particle_contact_kernel=True,
+        shape_contacts=True,
+        add_ground_plane=False,
+        strict_physics_checks=True,
+        apply_drag=True,
+        drag_damping_scale=float(args.drag_damping_scale),
+        up_axis="Z",
+        device=device,
     )
-
-
-def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, device: str) -> tuple[newton.Model, DemoMeta]:
+    newton_import_ir.validate_ir_physics(ir, cfg_validate)
+    ir_demo, shift, reverse_z = _copy_ir_for_demo(ir, args)
+    cfg = newton_import_ir.SimConfig(
+        ir_path=args.sloth_ir.resolve(),
+        out_dir=args.out_dir.resolve(),
+        output_prefix=args.prefix,
+        spring_ke_scale=float(args.spring_k_scale),
+        spring_kd_scale=float(args.spring_k_scale),
+        angular_damping=0.05,
+        friction_smoothing=1.0,
+        enable_tri_contact=True,
+        disable_particle_contact_kernel=True,
+        shape_contacts=True,
+        add_ground_plane=False,
+        strict_physics_checks=False,
+        apply_drag=True,
+        drag_damping_scale=float(args.drag_damping_scale),
+        up_axis="Z",
+        device=device,
+    )
+    checks: dict[str, Any] = {}
+    particle_contacts = newton_import_ir._resolve_particle_contacts(cfg, ir_demo)
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
-    tray_cfg = builder.default_shape_cfg.copy()
-    tray_cfg.mu = 0.35
-    tray_cfg.ke = 1.5e4
-    tray_cfg.kd = 6.0e2
-    tray_cfg.kf = 3.0e2
-    tray_cfg.is_visible = False
+    radius_all, _, _ = newton_import_ir._add_particles(builder, ir_demo, cfg, particle_contacts)
+    newton_import_ir._add_springs(builder, ir_demo, cfg, checks)
 
-    hidden_cfg = tray_cfg.copy()
+    hidden_cfg = builder.default_shape_cfg.copy()
+    newton_import_ir._configure_ground_contact_material(hidden_cfg, ir_demo, cfg, checks, context="tray_container")
     hidden_cfg.is_visible = False
 
     extent = float(args.tray_half_extent)
@@ -459,11 +502,43 @@ def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, devic
     builder.add_shape_box(body=-1, xform=wp.transform(wp.vec3(0.0, 0.0, base_z), wp.quat_identity()), hx=extent + 2.0 * wall_t, hy=extent + 2.0 * wall_t, hz=0.5 * base_t, cfg=hidden_cfg, label="tray_base")
     builder.add_shape_plane(body=-1, xform=wp.transform(wp.vec3(0.0, 0.0, float(args.hidden_floor_z)), wp.quat_identity()), width=0.0, length=0.0, cfg=hidden_cfg, label="hidden_floor")
 
-    spec = _prepare_soft_object(builder, ir, args)
     model = builder.finalize(device=device)
+    if not (particle_contacts and (not cfg.disable_particle_contact_kernel)):
+        model.particle_grid = None
     model.set_gravity((0.0, 0.0, -float(args.gravity_mag)))
-    meta = DemoMeta(spec=spec, tray_half_extent=extent, sand_height=sand_height, tray_floor_top_z=floor_top_z, tray_wall_top_z=wall_top_z, scene_label="Scene: sloth softbody + native MPM sand")
-    return model, meta
+    newton_import_ir._apply_ps_object_collision_mapping(model, ir_demo, cfg, checks)
+
+    n_obj = int(np.asarray(ir_demo["num_object_points"]).ravel()[0])
+    edges = np.asarray(ir_demo["spring_edges"], dtype=np.int32)
+    render_keep = (edges[:, 0] < n_obj) & (edges[:, 1] < n_obj)
+    render_edges = edges[render_keep][::24].astype(np.int32, copy=True)
+    point_radius = np.maximum(radius_all[:n_obj].astype(np.float32) * 2.5, 0.008)
+    spec = SoftSpec(
+        name="sloth",
+        case_name=str(np.asarray(ir_demo.get("case_name", np.array(["sloth"]))).ravel()[0]),
+        color_rgb=(0.98, 0.66, 0.18),
+        ir_path=args.sloth_ir.resolve(),
+        particle_start=0,
+        particle_count=n_obj,
+        drag_damping=float(newton_import_ir.ir_scalar(ir_demo, "drag_damping", default=0.0)) * float(args.drag_damping_scale),
+        render_edge_global=render_edges,
+        render_point_radius=point_radius.astype(np.float32),
+        mass_sum=float(np.asarray(ir_demo["mass"], dtype=np.float32)[:n_obj].sum()),
+        placement_shift=shift.astype(np.float32),
+        reverse_z=bool(reverse_z),
+        collision_radius_mean=float(np.mean(radius_all[:n_obj])),
+        collider_mu=float(newton_import_ir.ir_scalar(ir_demo, "contact_collide_object_fric", default=0.4)),
+    )
+    meta = DemoMeta(
+        spec=spec,
+        tray_half_extent=extent,
+        sand_height=sand_height,
+        tray_base_bottom_z=base_bottom_z,
+        tray_floor_top_z=floor_top_z,
+        tray_wall_top_z=wall_top_z,
+        scene_label="Scene: sloth softbody + native MPM sand",
+    )
+    return model, meta, ir_demo
 
 
 def _model_particle_collider_body_ids(model: newton.Model) -> list[int]:
@@ -484,18 +559,14 @@ def _build_proxy(model: newton.Model, meta: DemoMeta, args: argparse.Namespace, 
     qd0 = state.particle_qd.numpy().astype(np.float32) if state.particle_qd is not None else np.zeros_like(q0, dtype=np.float32)
     spec = meta.spec
     obj_pts = q0[: spec.particle_count]
-    try:
-        surface_pts = _load_surface_points(spec)
-        proxy_vertices, tri_local = _alpha_shape_surface_mesh(surface_pts)
-    except Exception:
-        from scipy.spatial import ConvexHull
+    from scipy.spatial import ConvexHull
 
-        hull = ConvexHull(np.asarray(obj_pts, dtype=np.float64))
-        tri_local = np.asarray(hull.simplices, dtype=np.int32)
-        used = np.unique(tri_local.reshape(-1))
-        remap = {old: i for i, old in enumerate(used.tolist())}
-        proxy_vertices = obj_pts[used].astype(np.float32, copy=True)
-        tri_local = np.vectorize(remap.get, otypes=[np.int32])(tri_local).astype(np.int32, copy=False)
+    hull = ConvexHull(np.asarray(obj_pts, dtype=np.float64))
+    tri_local = np.asarray(hull.simplices, dtype=np.int32)
+    used = np.unique(tri_local.reshape(-1))
+    remap = {old: i for i, old in enumerate(used.tolist())}
+    proxy_vertices = obj_pts[used].astype(np.float32, copy=True)
+    tri_local = np.vectorize(remap.get, otypes=[np.int32])(tri_local).astype(np.int32, copy=False)
 
     from scipy.spatial import cKDTree
 
@@ -521,7 +592,8 @@ def _build_proxy(model: newton.Model, meta: DemoMeta, args: argparse.Namespace, 
         mesh_velocities=mesh_velocities,
         mesh=mesh,
         query_points_world=proxy_points.astype(np.float32, copy=True),
-        collider_thickness=max(spec.collision_radius_mean, 0.025 * float(args.sand_voxel_size)),
+        collider_thickness=max(4.0 * spec.collision_radius_mean, 1.5 * float(args.sand_voxel_size)),
+        collider_projection_threshold=max(2.0 * float(args.sand_voxel_size), 6.0 * spec.collision_radius_mean),
         collider_mu=spec.collider_mu,
     )
 
@@ -568,13 +640,13 @@ def _build_sand_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
     options = newton.solvers.SolverImplicitMPM.Options()
     options.voxel_size = float(args.sand_voxel_size)
     options.tolerance = 1.0e-5
-    options.transfer_scheme = "apic"
+    options.transfer_scheme = str(args.sand_transfer_scheme)
     options.grid_type = str(args.sand_grid_type)
     options.grid_padding = 50 if args.sand_grid_type == "fixed" else 0
     options.max_active_cell_count = (1 << 16) if args.sand_grid_type == "fixed" else -1
     options.strain_basis = "P0"
     options.max_iterations = int(args.sand_max_iterations)
-    options.critical_fraction = 0.0
+    options.critical_fraction = float(args.sand_critical_fraction)
     options.air_drag = float(args.sand_air_drag)
     options.collider_velocity_mode = "finite_difference"
     sand_solver = newton.solvers.SolverImplicitMPM(sand_model, options)
@@ -586,7 +658,7 @@ def _build_sand_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
     tray_thickness = max(float(args.wall_thickness), 0.75 * float(args.sand_voxel_size))
     tray_proj = 1.00 * float(args.sand_voxel_size)
     collider_thicknesses = [tray_thickness if body_id == -1 else None for body_id in body_collider_ids] + [proxy.collider_thickness]
-    collider_projection_thresholds = [tray_proj if body_id == -1 else None for body_id in body_collider_ids] + [None]
+    collider_projection_thresholds = [tray_proj if body_id == -1 else None for body_id in body_collider_ids] + [proxy.collider_projection_threshold]
     collider_friction = [None] * len(body_collider_ids) + [proxy.collider_mu]
     sand_solver.setup_collider(
         collider_meshes=collider_meshes,
@@ -622,6 +694,7 @@ def _build_sand_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
         collider_body_id=sand_solver.collider_body_index,
         body_sand_forces=None,
         frame_dt=float(args.sim_dt) * float(args.substeps),
+        sim_dt=float(args.sim_dt),
         active_impulse_count=0,
         render_radii=render_radii,
         render_colors=render_colors,
@@ -640,9 +713,9 @@ def _collect_sand_impulses(sand: SandSystem) -> None:
     sand.active_impulse_count = n
 
 
-def _update_proxy_from_soft_state(model: newton.Model, proxy: SoftProxy) -> None:
-    q = model.state().particle_q.numpy().astype(np.float32)
-    qd = model.state().particle_qd.numpy().astype(np.float32)
+def _update_proxy_from_soft_state(state: newton.State, proxy: SoftProxy) -> None:
+    q = state.particle_q.numpy().astype(np.float32)
+    qd = state.particle_qd.numpy().astype(np.float32)
     pts = np.sum(q[proxy.interp_particle_ids_global] * proxy.interp_particle_weights[:, :, None], axis=1)
     vel = np.sum(qd[proxy.interp_particle_ids_global] * proxy.interp_particle_weights[:, :, None], axis=1)
     valid = np.all(np.isfinite(pts), axis=1)
@@ -674,7 +747,7 @@ def _update_soft_particle_forces_from_sand(model: newton.Model, meta: DemoMeta, 
         return {"sample_count": 0.0, "impulse_norm_sum": 0.0, "force_norm_max": 0.0, "forces": forces}
 
     pts = positions[mask]
-    imp = impulses[mask] * float(args.soft_mpm_force_scale)
+    imp = impulses[mask] * (float(args.soft_mpm_force_scale) / max(float(sand.frame_dt), 1.0e-8))
     proxy_points = np.asarray(sand.proxy.query_points_world, dtype=np.float64)
     tree = cKDTree(proxy_points)
     k = min(4, proxy_points.shape[0])
@@ -709,7 +782,7 @@ def _update_soft_particle_forces_from_sand(model: newton.Model, meta: DemoMeta, 
 
 def _tray_outline(meta: DemoMeta, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     ext = float(meta.tray_half_extent) + float(args.wall_thickness)
-    z0 = float(meta.tray_floor_top_z)
+    z0 = float(meta.tray_base_bottom_z)
     z1 = float(meta.tray_wall_top_z)
     corners = np.asarray(
         [
@@ -730,6 +803,21 @@ def _tray_outline(meta: DemoMeta, args: argparse.Namespace) -> tuple[np.ndarray,
     ends = corners[edges[:, 1]]
     colors = np.tile(np.asarray([[0.90, 0.94, 1.00]], dtype=np.float32), (starts.shape[0], 1))
     return starts, ends, colors
+
+
+def _ground_grid(size: float = 3.0, steps: int = 12, z: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vals = np.linspace(-size, size, steps + 1, dtype=np.float32)
+    starts: list[list[float]] = []
+    ends: list[list[float]] = []
+    for v in vals:
+        starts.append([-size, float(v), z])
+        ends.append([size, float(v), z])
+        starts.append([float(v), -size, z])
+        ends.append([float(v), size, z])
+    starts_np = np.asarray(starts, dtype=np.float32)
+    ends_np = np.asarray(ends, dtype=np.float32)
+    colors_np = np.tile(np.asarray([[0.17, 0.24, 0.33]], dtype=np.float32), (starts_np.shape[0], 1))
+    return starts_np, ends_np, colors_np
 
 
 def render_view_mp4(
@@ -775,9 +863,9 @@ def render_view_mp4(
             pass
 
         state = model.state()
-        target = np.array([0.0, 0.0, meta.tray_floor_top_z + 0.55 * meta.sand_height], dtype=np.float32)
-        cpos = _camera_position(target, -18.0, -8.0, 2.2)
-        viewer.set_camera(wp.vec3(float(cpos[0]), float(cpos[1]), float(cpos[2])), -8.0, -18.0)
+        target = np.array([0.0, 0.0, max(meta.tray_floor_top_z + 0.55 * meta.sand_height, 1.45)], dtype=np.float32)
+        cpos = _camera_position(target, -24.0, -12.0, 4.9)
+        viewer.set_camera(wp.vec3(float(cpos[0]), float(cpos[1]), float(cpos[2])), -12.0, -24.0)
         sand_points_wp = wp.empty(sim_data["sand_points_all"].shape[1], dtype=wp.vec3, device=device)
         sand_radii_wp = wp.array(sim_data["sand_point_radii"], dtype=wp.float32, device=device)
         sand_colors_wp = wp.array(sim_data["sand_point_colors"], dtype=wp.vec3, device=device)
@@ -785,6 +873,10 @@ def render_view_mp4(
         tray_starts_wp = wp.array(tray_starts_np, dtype=wp.vec3, device=device)
         tray_ends_wp = wp.array(tray_ends_np, dtype=wp.vec3, device=device)
         tray_colors_wp = wp.array(tray_colors_np, dtype=wp.vec3, device=device)
+        ground_starts_np, ground_ends_np, ground_colors_np = _ground_grid(size=3.5, steps=14, z=float(meta.tray_base_bottom_z))
+        ground_starts_wp = wp.array(ground_starts_np, dtype=wp.vec3, device=device)
+        ground_ends_wp = wp.array(ground_ends_np, dtype=wp.vec3, device=device)
+        ground_colors_wp = wp.array(ground_colors_np, dtype=wp.vec3, device=device)
         ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         n_frames = int(sim_data["particle_q_all"].shape[0])
         for frame_idx in range(n_frames):
@@ -811,6 +903,7 @@ def render_view_mp4(
                     hidden=False,
                 )
             viewer.log_points("/demo/sand", sand_points_wp, sand_radii_wp, sand_colors_wp, hidden=False)
+            viewer.log_lines("/demo/ground", ground_starts_wp, ground_ends_wp, ground_colors_wp, width=1.0, hidden=False)
             viewer.log_lines("/demo/tray", tray_starts_wp, tray_ends_wp, tray_colors_wp, width=2.0, hidden=False)
             viewer.end_frame()
             frame = viewer.get_frame(render_ui=False).numpy()
@@ -845,7 +938,7 @@ class Example:
         wp.init()
         self.device = newton_import_ir.resolve_device(self.args.device)
         self.ir = _load_ir(self.args.sloth_ir)
-        self.model, self.meta = _build_soft_model(self.ir, self.args, self.device)
+        self.model, self.meta, self.demo_ir = _build_soft_model(self.ir, self.args, self.device)
         self.sand = _build_sand_system(self.model, self.meta, self.args, self.device)
         self.sim_data: dict[str, Any] | None = None
 
@@ -860,18 +953,25 @@ class Example:
         control = self.model.control()
         state_in = self.model.state()
         state_out = self.model.state()
-        q_hist: list[np.ndarray] = []
-        sand_hist: list[np.ndarray] = []
-        particle_mass = self.model.particle_mass.numpy().astype(np.float32)
+        q_hist: list[np.ndarray] = [state_in.particle_q.numpy().astype(np.float32)]
+        sand_hist: list[np.ndarray] = [self.sand.state_0.particle_q.numpy().astype(np.float32)]
+        coupling_sample_hist: list[int] = [0]
+        coupling_impulse_hist: list[float] = [0.0]
         t0 = time.perf_counter()
         _collect_sand_impulses(self.sand)
-        for frame in range(int(self.args.frames)):
-            q_hist.append(state_in.particle_q.numpy().astype(np.float32))
-            sand_hist.append(self.sand.state_0.particle_q.numpy().astype(np.float32))
-            for _ in range(int(self.args.substeps)):
+        frame_dt = float(self.args.sim_dt) * float(self.args.substeps)
+        for frame in range(1, int(self.args.frames)):
+            coupling = _update_soft_particle_forces_from_sand(self.model, self.meta, self.sand, self.args)
+            coupling_forces_wp = wp.array(coupling["forces"], dtype=wp.vec3, device=self.device)
+            for _sub in range(int(self.args.substeps)):
                 state_in.clear_forces()
-                coupling = _update_soft_particle_forces_from_sand(self.model, self.meta, self.sand, self.args)
-                wp.launch(add_dense_particle_forces, dim=self.model.particle_count, inputs=[state_in.particle_f, wp.array(coupling["forces"], dtype=wp.vec3, device=self.device)], device=self.device)
+                feedback_scale = float(_substep_feedback_scale(_sub, int(self.args.substeps)))
+                wp.launch(
+                    add_dense_particle_forces,
+                    dim=self.model.particle_count,
+                    inputs=[state_in.particle_f, coupling_forces_wp, feedback_scale],
+                    device=self.device,
+                )
                 self.model.collide(state_in, contacts)
                 solver.step(state_in, state_out, control, contacts, float(self.args.sim_dt))
                 state_in, state_out = state_out, state_in
@@ -882,17 +982,39 @@ class Example:
                         inputs=[state_in.particle_q, state_in.particle_qd, 0, self.meta.spec.particle_count, float(self.args.sim_dt), self.meta.spec.drag_damping],
                         device=self.device,
                     )
-                _update_proxy_from_soft_state(self.model, self.sand.proxy)
-                self.sand.solver.step(self.sand.state_0, self.sand.state_1, contacts=None, control=None, dt=self.sand.frame_dt)
-                self.sand.state_0, self.sand.state_1 = self.sand.state_1, self.sand.state_0
-                _collect_sand_impulses(self.sand)
-            if frame == 0 or (frame + 1) % 10 == 0 or frame + 1 == int(self.args.frames):
-                print(f"  frame {frame+1}/{int(self.args.frames)}", flush=True)
+            _update_proxy_from_soft_state(state_in, self.sand.proxy)
+            self.sand.solver.step(self.sand.state_0, self.sand.state_1, contacts=None, control=None, dt=frame_dt)
+            self.sand.state_0, self.sand.state_1 = self.sand.state_1, self.sand.state_0
+            _collect_sand_impulses(self.sand)
+
+            q_np = state_in.particle_q.numpy().astype(np.float32)
+            sand_np = self.sand.state_0.particle_q.numpy().astype(np.float32)
+            if not np.all(np.isfinite(q_np)):
+                raise RuntimeError(f"Softbody state contains non-finite values at frame {frame}")
+            if not np.all(np.isfinite(sand_np)):
+                raise RuntimeError(f"Sand state contains non-finite values at frame {frame}")
+            bbox_size = float(np.linalg.norm(np.max(q_np, axis=0) - np.min(q_np, axis=0)))
+            if bbox_size > 10.0:
+                raise RuntimeError(f"Softbody exploded at frame {frame}: bbox_size={bbox_size:.3f}")
+            q_hist.append(q_np)
+            sand_hist.append(sand_np)
+            coupling_sample_hist.append(int(coupling["sample_count"]))
+            coupling_impulse_hist.append(float(coupling["impulse_norm_sum"]))
+            if frame == 1 or (frame + 1) % 5 == 0 or frame + 1 == int(self.args.frames):
+                print(
+                    f"  frame {frame+1}/{int(self.args.frames)}"
+                    f"  z=[{q_np[:, 2].min():.3f}, {q_np[:, 2].max():.3f}]"
+                    f"  bbox={bbox_size:.3f}"
+                    f"  coupling_samples={int(coupling['sample_count'])}",
+                    flush=True,
+                )
         self.sim_data = {
             "particle_q_all": np.stack(q_hist),
             "sand_points_all": np.stack(sand_hist),
             "sand_point_radii": self.sand.render_radii.numpy().astype(np.float32),
             "sand_point_colors": self.sand.render_colors.numpy().astype(np.float32),
+            "coupling_sample_count": np.asarray(coupling_sample_hist, dtype=np.int32),
+            "coupling_impulse_norm_sum": np.asarray(coupling_impulse_hist, dtype=np.float32),
             "sim_dt": float(self.args.sim_dt),
             "substeps": int(self.args.substeps),
             "wall_time_sec": float(time.perf_counter() - t0),
@@ -909,6 +1031,8 @@ class Example:
             sand_points_all=self.sim_data["sand_points_all"],
             sand_point_radii=self.sim_data["sand_point_radii"],
             sand_point_colors=self.sim_data["sand_point_colors"],
+            coupling_sample_count=self.sim_data["coupling_sample_count"],
+            coupling_impulse_norm_sum=self.sim_data["coupling_impulse_norm_sum"],
             sim_dt=np.float32(self.sim_data["sim_dt"]),
             substeps=np.int32(self.sim_data["substeps"]),
             wall_time_sec=np.float32(self.sim_data["wall_time_sec"]),
@@ -923,6 +1047,9 @@ class Example:
             "tray_half_extent": float(self.args.tray_half_extent),
             "sand_height": float(self.args.sand_height),
             "particle_mass": float(self.args.particle_mass),
+            "frames_with_coupling": int(np.count_nonzero(self.sim_data["coupling_sample_count"])),
+            "coupling_samples_total": int(np.sum(self.sim_data["coupling_sample_count"])),
+            "coupling_impulse_norm_total": float(np.sum(self.sim_data["coupling_impulse_norm_sum"])),
             "panel_videos": [str(out_mp4)],
         }
         (self.args.out_dir / f"{self.args.prefix}_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
