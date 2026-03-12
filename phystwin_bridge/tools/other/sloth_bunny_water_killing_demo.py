@@ -10,10 +10,8 @@ Rules for this script:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import math
-import pickle
 import shutil
 import subprocess
 import sys
@@ -25,24 +23,28 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-BRIDGE_ROOT = Path(__file__).resolve().parents[2]
-CORE_DIR = BRIDGE_ROOT / "tools" / "core"
+from demo_common import (
+    CORE_DIR,
+    add_dense_particle_forces,
+    alpha_shape_surface_mesh,
+    apply_drag_range,
+    camera_position,
+    compute_body_forces,
+    ground_grid,
+    load_core_module,
+    load_ir_checked,
+    load_surface_points,
+    model_particle_collider_body_ids,
+    overlay_text_lines_rgb,
+    spawn_mpm_particle_block,
+    subtract_body_force,
+)
+
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
 
-
-def _load_core(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, str(path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load {name} from {path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-path_defaults = _load_core("path_defaults", CORE_DIR / "path_defaults.py")
-newton_import_ir = _load_core("newton_import_ir", CORE_DIR / "newton_import_ir.py")
+path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
+newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
 
 import newton  # noqa: E402
 
@@ -127,124 +129,6 @@ class ViewSpec:
     yaw_deg: float
     pitch_deg: float
     distance: float
-
-
-@wp.kernel
-def compute_body_forces(
-    dt: float,
-    collider_ids: wp.array(dtype=int),
-    collider_impulses: wp.array(dtype=wp.vec3),
-    collider_impulse_pos: wp.array(dtype=wp.vec3),
-    body_ids: wp.array(dtype=int),
-    body_q: wp.array(dtype=wp.transform),
-    body_com: wp.array(dtype=wp.vec3),
-    body_f: wp.array(dtype=wp.spatial_vector),
-):
-    tid = wp.tid()
-    cid = collider_ids[tid]
-    if cid < 0 or cid >= body_ids.shape[0]:
-        return
-    body_index = body_ids[cid]
-    if body_index == -1:
-        return
-    f_world = collider_impulses[tid] / dt
-    X_wb = body_q[body_index]
-    r = collider_impulse_pos[tid] - wp.transform_point(X_wb, body_com[body_index])
-    wp.atomic_add(body_f, body_index, wp.spatial_vector(f_world, wp.cross(r, f_world)))
-
-
-@wp.kernel
-def subtract_body_force(
-    dt: float,
-    body_q: wp.array(dtype=wp.transform),
-    body_qd: wp.array(dtype=wp.spatial_vector),
-    body_f: wp.array(dtype=wp.spatial_vector),
-    body_inv_inertia: wp.array(dtype=wp.mat33),
-    body_inv_mass: wp.array(dtype=float),
-    body_q_res: wp.array(dtype=wp.transform),
-    body_qd_res: wp.array(dtype=wp.spatial_vector),
-):
-    body_id = wp.tid()
-    f = body_f[body_id]
-    delta_v = dt * body_inv_mass[body_id] * wp.spatial_top(f)
-    r = wp.transform_get_rotation(body_q[body_id])
-    delta_w = dt * wp.quat_rotate(r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f)))
-    body_q_res[body_id] = body_q[body_id]
-    body_qd_res[body_id] = body_qd[body_id] - wp.spatial_vector(delta_v, delta_w)
-
-
-@wp.kernel
-def add_dense_particle_forces(
-    particle_f: wp.array(dtype=wp.vec3),
-    external_f: wp.array(dtype=wp.vec3),
-):
-    tid = wp.tid()
-    particle_f[tid] = particle_f[tid] + external_f[tid]
-
-
-@wp.kernel
-def apply_drag_range(
-    particle_q: wp.array(dtype=wp.vec3),
-    particle_qd: wp.array(dtype=wp.vec3),
-    particle_start: int,
-    particle_count: int,
-    dt: float,
-    damping: float,
-):
-    tid = wp.tid()
-    if tid >= particle_count:
-        return
-    i = particle_start + tid
-    v = particle_qd[i]
-    scale = wp.exp(-dt * damping)
-    particle_q[i] = particle_q[i] - v * dt * (1.0 - scale)
-    particle_qd[i] = v * scale
-
-
-def _overlay_text_lines_rgb(frame: np.ndarray, lines: list[str], font_size: int = 28) -> np.ndarray:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception:
-        return frame
-
-    img = Image.fromarray(frame, mode="RGB")
-    draw = ImageDraw.Draw(img, mode="RGBA")
-    font = None
-    for font_path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ):
-        try:
-            font = ImageFont.truetype(font_path, size=max(10, int(font_size)))
-            break
-        except Exception:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
-
-    x = 20
-    y = 18
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        draw.rectangle((x - 8, y - 4, x + bbox[2] + 8, y + bbox[3] + 4), fill=(0, 0, 0, 120))
-        draw.text((x, y), line, fill=(255, 255, 255, 255), font=font)
-        y += (bbox[3] - bbox[1]) + 8
-    return np.asarray(img, dtype=np.uint8)
-
-
-def _camera_position(target: np.ndarray, yaw_deg: float, pitch_deg: float, distance: float) -> np.ndarray:
-    yaw = math.radians(float(yaw_deg))
-    pitch = math.radians(float(pitch_deg))
-    front = np.array(
-        [
-            math.cos(yaw) * math.cos(pitch),
-            math.sin(yaw) * math.cos(pitch),
-            math.sin(pitch),
-        ],
-        dtype=np.float32,
-    )
-    front /= max(float(np.linalg.norm(front)), 1.0e-6)
-    return target.astype(np.float32) - front * float(distance)
 
 
 def _output_stem(prefix: str) -> str:
@@ -413,24 +297,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_ir(path: Path) -> dict[str, np.ndarray]:
-    ir = newton_import_ir.load_ir(path.resolve())
-    required = [
-        "x0",
-        "v0",
-        "mass",
-        "num_object_points",
-        "spring_edges",
-        "spring_rest_length",
-        "spring_ke",
-        "spring_kd",
-        "sim_dt",
-        "sim_substeps",
-        "collision_radius",
-    ]
-    missing = [key for key in required if key not in ir]
-    if missing:
-        raise KeyError(f"{path} missing IR fields: {missing}")
-    return ir
+    return load_ir_checked(
+        path,
+        newton_import_ir,
+        [
+            "x0",
+            "v0",
+            "mass",
+            "num_object_points",
+            "spring_edges",
+            "spring_rest_length",
+            "spring_ke",
+            "spring_kd",
+            "sim_dt",
+            "sim_substeps",
+            "collision_radius",
+        ],
+    )
 
 
 def _filter_object_only_ir(ir: dict[str, np.ndarray], *, particle_mass: float) -> dict[str, np.ndarray]:
@@ -481,65 +364,11 @@ def _filter_object_only_ir(ir: dict[str, np.ndarray], *, particle_mass: float) -
 
 
 def _load_surface_points(spec: SoftSpec) -> np.ndarray:
-    case_dir = BRIDGE_ROOT / "inputs" / "cases" / spec.case_name
-    final_data_path = case_dir / "final_data.pkl"
-    if not final_data_path.exists():
-        raise FileNotFoundError(f"Missing final_data.pkl: {final_data_path}")
-    with final_data_path.open("rb") as handle:
-        final_data = pickle.load(handle)
-    surface = np.asarray(final_data["surface_points"], dtype=np.float32).reshape(-1, 3)
-    if spec.reverse_z:
-        surface[:, 2] *= -1.0
-    surface += spec.placement_shift.astype(np.float32, copy=False)
-    return surface
-
-
-def _alpha_shape_surface_mesh(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    from scipy.spatial import Delaunay, cKDTree
-
-    pts = np.asarray(points, dtype=np.float64)
-    if pts.shape[0] < 4:
-        raise ValueError(f"Need at least 4 points for alpha shape, got {pts.shape[0]}")
-    tree = cKDTree(pts)
-    k = min(8, pts.shape[0])
-    dists, _ = tree.query(pts, k=k)
-    nn_col = min(4, dists.shape[1] - 1)
-    spacing = float(np.median(dists[:, nn_col]))
-    alpha = max(2.5 * spacing, 1.0e-5)
-
-    tetra = Delaunay(pts)
-    face_dict: dict[tuple[int, int, int], tuple[np.ndarray, int]] = {}
-    local_faces = (((0, 2, 1), 3), ((0, 1, 3), 2), ((0, 3, 2), 1), ((1, 2, 3), 0))
-    for tet in np.asarray(tetra.simplices, dtype=np.int32):
-        tet_pts = pts[tet]
-        A = 2.0 * (tet_pts[1:] - tet_pts[[0]])
-        b = np.sum(tet_pts[1:] ** 2 - tet_pts[[0]] ** 2, axis=1)
-        try:
-            center = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            continue
-        radius = float(np.linalg.norm(center - tet_pts[0]))
-        if not np.isfinite(radius) or radius > alpha:
-            continue
-        for face_local, opp_local in local_faces:
-            face = np.asarray([tet[idx] for idx in face_local], dtype=np.int32)
-            opp = pts[tet[opp_local]]
-            p0, p1, p2 = pts[face]
-            normal = np.cross(p1 - p0, p2 - p0)
-            if np.dot(normal, opp - p0) > 0.0:
-                face[[1, 2]] = face[[2, 1]]
-            key = tuple(sorted(int(v) for v in face))
-            if key in face_dict:
-                face_dict[key] = (face_dict[key][0], face_dict[key][1] + 1)
-            else:
-                face_dict[key] = (face, 1)
-
-    boundary = [face for face, count in face_dict.values() if count == 1]
-    if len(boundary) < 4:
-        raise ValueError("Alpha shape surface mesh is degenerate")
-    faces = np.asarray(boundary, dtype=np.int32)
-    unique_vertices, inverse = np.unique(faces.reshape(-1), return_inverse=True)
-    return pts[unique_vertices].astype(np.float32), inverse.reshape(-1, 3).astype(np.int32)
+    return load_surface_points(
+        spec.case_name,
+        reverse_z=spec.reverse_z,
+        placement_shift=spec.placement_shift,
+    )
 
 
 def _bind_proxy_vertices_to_particles(
@@ -691,7 +520,7 @@ def _build_soft_proxy(model: newton.Model, spec: SoftSpec, args: argparse.Namesp
     qd0 = state.particle_qd.numpy().astype(np.float32) if state.particle_qd is not None else np.zeros_like(q0, dtype=np.float32)
     obj_pts = q0[spec.particle_start : spec.particle_start + spec.particle_count]
     try:
-        proxy_vertices, tri_local = _alpha_shape_surface_mesh(obj_pts)
+        proxy_vertices, tri_local = alpha_shape_surface_mesh(obj_pts)
     except Exception:
         from scipy.spatial import ConvexHull
 
@@ -725,57 +554,6 @@ def _build_soft_proxy(model: newton.Model, spec: SoftSpec, args: argparse.Namesp
         collider_thickness=max(float(spec.collision_radius_mean), 0.025 * float(args.water_voxel_size)),
         collider_mu=float(np.clip(spec.collider_mu, 0.0, 2.0)),
     )
-
-
-def _spawn_mpm_particle_block(
-    builder: newton.ModelBuilder,
-    *,
-    bounds_lo: np.ndarray,
-    bounds_hi: np.ndarray,
-    voxel_size: float,
-    particles_per_cell: int,
-    density: float,
-    flags: int,
-) -> np.ndarray:
-    res = np.array(
-        np.ceil(max(1, int(particles_per_cell)) * (bounds_hi - bounds_lo) / max(voxel_size, 1.0e-4)),
-        dtype=int,
-    )
-    cell = (bounds_hi - bounds_lo) / res
-    cell_volume = float(np.prod(cell))
-    radius = float(np.max(cell) * 0.5)
-    mass = float(cell_volume * density)
-    begin_id = len(builder.particle_q)
-    builder.add_particle_grid(
-        pos=wp.vec3(bounds_lo),
-        rot=wp.quat_identity(),
-        vel=wp.vec3(0.0),
-        dim_x=int(res[0]) + 1,
-        dim_y=int(res[1]) + 1,
-        dim_z=int(res[2]) + 1,
-        cell_x=float(cell[0]),
-        cell_y=float(cell[1]),
-        cell_z=float(cell[2]),
-        mass=mass,
-        jitter=1.0 * radius,
-        radius_mean=radius,
-        flags=flags,
-    )
-    end_id = len(builder.particle_q)
-    return np.arange(begin_id, end_id, dtype=np.int32)
-
-
-def _model_particle_collider_body_ids(model: newton.Model) -> list[int]:
-    shape_flags = model.shape_flags.numpy()
-    body_ids: list[int] = []
-    for body_id in range(-1, model.body_count):
-        shape_ids = np.asarray(model.body_shapes.get(body_id, []), dtype=np.int32)
-        if shape_ids.size == 0:
-            continue
-        if np.any((shape_flags[shape_ids] & int(newton.ShapeFlags.COLLIDE_PARTICLES)) != 0):
-            body_ids.append(int(body_id))
-    return body_ids
-
 
 def build_model(ir: dict[str, np.ndarray], args: argparse.Namespace, device: str) -> tuple[newton.Model, DemoMeta]:
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
@@ -913,7 +691,7 @@ def build_water_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
         ],
         dtype=np.float32,
     )
-    water_ids = _spawn_mpm_particle_block(
+    water_ids = spawn_mpm_particle_block(
         water_builder,
         bounds_lo=lo,
         bounds_hi=hi,
@@ -921,6 +699,7 @@ def build_water_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
         particles_per_cell=int(args.water_particles_per_cell),
         density=float(args.water_density),
         flags=int(newton.ParticleFlags.ACTIVE),
+        jitter_scale=1.0,
     )
 
     water_model = water_builder.finalize(device=device)
@@ -950,7 +729,7 @@ def build_water_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
     water_solver = newton.solvers.SolverImplicitMPM(water_model, options)
 
     soft_proxy = _build_soft_proxy(model, meta.soft_spec, args, device)
-    body_collider_ids = _model_particle_collider_body_ids(model)
+    body_collider_ids = model_particle_collider_body_ids(model)
     collider_meshes = [None] * len(body_collider_ids) + [soft_proxy.mesh]
     collider_body_ids = body_collider_ids + [None]
     static_thickness = max(float(args.pool_wall_thickness), 0.75 * dx)
@@ -1130,21 +909,6 @@ def _pool_outline(meta: DemoMeta) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return starts, ends, colors
 
 
-def _ground_grid(size: float, z: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    vals = np.linspace(-size, size, 17, dtype=np.float32)
-    starts: list[list[float]] = []
-    ends: list[list[float]] = []
-    for v in vals:
-        starts.append([-size, float(v), z])
-        ends.append([size, float(v), z])
-        starts.append([float(v), -size, z])
-        ends.append([float(v), size, z])
-    starts_np = np.asarray(starts, dtype=np.float32)
-    ends_np = np.asarray(ends, dtype=np.float32)
-    colors_np = np.tile(np.asarray([[0.17, 0.24, 0.33]], dtype=np.float32), (starts_np.shape[0], 1))
-    return starts_np, ends_np, colors_np
-
-
 def simulate(model: newton.Model, meta: DemoMeta, args: argparse.Namespace, water: WaterSystem, device: str) -> dict[str, Any]:
     solver = newton.solvers.SolverSemiImplicit(
         model,
@@ -1197,7 +961,7 @@ def simulate(model: newton.Model, meta: DemoMeta, args: argparse.Namespace, wate
             wp.launch(
                 add_dense_particle_forces,
                 dim=model.particle_count,
-                inputs=[state_in.particle_f, water.soft_particle_forces],
+                inputs=[state_in.particle_f, water.soft_particle_forces, 1.0],
                 device=device,
             )
             model.collide(state_in, contacts)
@@ -1343,7 +1107,7 @@ def render_view_mp4(
 
         state = model.state()
         target = np.array([0.0, 0.0, max(meta.water_surface_z * 0.68, 1.0)], dtype=np.float32)
-        cpos = _camera_position(target, view_spec.yaw_deg, view_spec.pitch_deg, view_spec.distance)
+        cpos = camera_position(target, view_spec.yaw_deg, view_spec.pitch_deg, view_spec.distance)
         viewer.set_camera(wp.vec3(float(cpos[0]), float(cpos[1]), float(cpos[2])), float(view_spec.pitch_deg), float(view_spec.yaw_deg))
 
         bunny_mesh_points = wp.array((meta.bunny_mesh_vertices_local * float(meta.bunny_mesh_scale)).astype(np.float32), dtype=wp.vec3, device=device)
@@ -1360,7 +1124,7 @@ def render_view_mp4(
         pool_starts_wp = wp.array(pool_starts_np, dtype=wp.vec3, device=device)
         pool_ends_wp = wp.array(pool_ends_np, dtype=wp.vec3, device=device)
         pool_colors_wp = wp.array(pool_colors_np, dtype=wp.vec3, device=device)
-        ground_starts_np, ground_ends_np, ground_colors_np = _ground_grid(size=float(args.ground_extent), z=float(meta.ground_z))
+        ground_starts_np, ground_ends_np, ground_colors_np = ground_grid(size=float(args.ground_extent), z=float(meta.ground_z), steps=8)
         ground_starts_wp = wp.array(ground_starts_np, dtype=wp.vec3, device=device)
         ground_ends_wp = wp.array(ground_ends_np, dtype=wp.vec3, device=device)
         ground_colors_wp = wp.array(ground_colors_np, dtype=wp.vec3, device=device)
@@ -1411,7 +1175,7 @@ def render_view_mp4(
 
             frame = viewer.get_frame(render_ui=False).numpy()
             if args.overlay_label:
-                frame = _overlay_text_lines_rgb(
+                frame = overlay_text_lines_rgb(
                     frame,
                     [
                         view_spec.label,
@@ -1419,6 +1183,10 @@ def render_view_mp4(
                         f"frame {frame_idx + 1:03d}/{n_frames:03d}  t={sim_t:.3f}s",
                     ],
                     font_size=int(args.label_font_size),
+                    x=20,
+                    y=18,
+                    line_gap=8,
+                    bg_alpha=120,
                 )
             assert ffmpeg_proc.stdin is not None
             ffmpeg_proc.stdin.write(frame.tobytes())

@@ -19,10 +19,7 @@ parameters and visual style are intentionally pushed toward Newton's official
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
-import math
-import pickle
 import shutil
 import subprocess
 import sys
@@ -34,24 +31,24 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-BRIDGE_ROOT = Path(__file__).resolve().parents[2]
-CORE_DIR = BRIDGE_ROOT / "tools" / "core"
+from demo_common import (
+    CORE_DIR,
+    add_dense_particle_forces,
+    apply_drag_range,
+    camera_position,
+    ground_grid,
+    load_core_module,
+    load_ir_checked,
+    load_surface_points,
+    model_particle_collider_body_ids,
+    overlay_text_lines_rgb,
+)
+
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
 
-
-def _load_core(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, str(path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load {name} from {path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-path_defaults = _load_core("path_defaults", CORE_DIR / "path_defaults.py")
-newton_import_ir = _load_core("newton_import_ir", CORE_DIR / "newton_import_ir.py")
+path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
+newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
 
 import newton  # noqa: E402
 
@@ -127,125 +124,6 @@ class ViewSpec:
     distance: float
 
 
-@wp.kernel
-def compute_body_forces(
-    dt: float,
-    collider_ids: wp.array(dtype=int),
-    collider_impulses: wp.array(dtype=wp.vec3),
-    collider_impulse_pos: wp.array(dtype=wp.vec3),
-    body_ids: wp.array(dtype=int),
-    body_q: wp.array(dtype=wp.transform),
-    body_com: wp.array(dtype=wp.vec3),
-    body_f: wp.array(dtype=wp.spatial_vector),
-):
-    tid = wp.tid()
-    cid = collider_ids[tid]
-    if cid < 0 or cid >= body_ids.shape[0]:
-        return
-    body_index = body_ids[cid]
-    if body_index == -1:
-        return
-    f_world = collider_impulses[tid] / dt
-    X_wb = body_q[body_index]
-    r = collider_impulse_pos[tid] - wp.transform_point(X_wb, body_com[body_index])
-    wp.atomic_add(body_f, body_index, wp.spatial_vector(f_world, wp.cross(r, f_world)))
-
-
-@wp.kernel
-def subtract_body_force(
-    dt: float,
-    body_q: wp.array(dtype=wp.transform),
-    body_qd: wp.array(dtype=wp.spatial_vector),
-    body_f: wp.array(dtype=wp.spatial_vector),
-    body_inv_inertia: wp.array(dtype=wp.mat33),
-    body_inv_mass: wp.array(dtype=float),
-    body_q_res: wp.array(dtype=wp.transform),
-    body_qd_res: wp.array(dtype=wp.spatial_vector),
-):
-    body_id = wp.tid()
-    f = body_f[body_id]
-    delta_v = dt * body_inv_mass[body_id] * wp.spatial_top(f)
-    r = wp.transform_get_rotation(body_q[body_id])
-    delta_w = dt * wp.quat_rotate(r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f)))
-    body_q_res[body_id] = body_q[body_id]
-    body_qd_res[body_id] = body_qd[body_id] - wp.spatial_vector(delta_v, delta_w)
-
-
-@wp.kernel
-def add_dense_particle_forces(
-    particle_f: wp.array(dtype=wp.vec3),
-    external_f: wp.array(dtype=wp.vec3),
-    scale: float,
-):
-    tid = wp.tid()
-    particle_f[tid] = particle_f[tid] + external_f[tid] * scale
-
-
-@wp.kernel
-def apply_drag_range(
-    particle_q: wp.array(dtype=wp.vec3),
-    particle_qd: wp.array(dtype=wp.vec3),
-    particle_start: int,
-    particle_count: int,
-    dt: float,
-    damping: float,
-):
-    tid = wp.tid()
-    if tid >= particle_count:
-        return
-    i = particle_start + tid
-    v = particle_qd[i]
-    scale = wp.exp(-dt * damping)
-    particle_q[i] = particle_q[i] - v * dt * (1.0 - scale)
-    particle_qd[i] = v * scale
-
-
-def _overlay_text_lines_rgb(frame: np.ndarray, lines: list[str], font_size: int = 24) -> np.ndarray:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except Exception:
-        return frame
-
-    img = Image.fromarray(frame, mode="RGB")
-    draw = ImageDraw.Draw(img, mode="RGBA")
-    font = None
-    for font_path in (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ):
-        try:
-            font = ImageFont.truetype(font_path, size=max(10, int(font_size)))
-            break
-        except Exception:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
-
-    x = 18
-    y = 16
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        draw.rectangle((x - 8, y - 4, x + bbox[2] + 8, y + bbox[3] + 4), fill=(0, 0, 0, 110))
-        draw.text((x, y), line, fill=(255, 255, 255, 255), font=font)
-        y += (bbox[3] - bbox[1]) + 6
-    return np.asarray(img, dtype=np.uint8)
-
-
-def _camera_position(target: np.ndarray, yaw_deg: float, pitch_deg: float, distance: float) -> np.ndarray:
-    yaw = math.radians(float(yaw_deg))
-    pitch = math.radians(float(pitch_deg))
-    front = np.array(
-        [
-            math.cos(yaw) * math.cos(pitch),
-            math.sin(yaw) * math.cos(pitch),
-            math.sin(pitch),
-        ],
-        dtype=np.float32,
-    )
-    front /= max(float(np.linalg.norm(front)), 1.0e-6)
-    return target.astype(np.float32) - front * float(distance)
-
-
 def _substep_feedback_scale(substep: int, substeps: int) -> float:
     if substeps <= 1:
         return 1.0
@@ -254,54 +132,10 @@ def _substep_feedback_scale(substep: int, substeps: int) -> float:
     return max(0.0, 1.0 - (float(substep) / float(substeps - 1)))
 
 
-def _alpha_shape_surface_mesh(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    from scipy.spatial import Delaunay, cKDTree
-
-    pts = np.asarray(points, dtype=np.float64)
-    tree = cKDTree(pts)
-    k = min(8, pts.shape[0])
-    dists, _ = tree.query(pts, k=k)
-    nn_col = min(4, dists.shape[1] - 1)
-    spacing = float(np.median(dists[:, nn_col]))
-    alpha = max(2.5 * spacing, 1.0e-5)
-
-    tetra = Delaunay(pts)
-    face_dict: dict[tuple[int, int, int], tuple[np.ndarray, int]] = {}
-    local_faces = (((0, 2, 1), 3), ((0, 1, 3), 2), ((0, 3, 2), 1), ((1, 2, 3), 0))
-    simplices = np.asarray(tetra.simplices, dtype=np.int32)
-    for tet in simplices:
-        tet_pts = pts[tet]
-        A = 2.0 * (tet_pts[1:] - tet_pts[[0]])
-        b = np.sum(tet_pts[1:] ** 2 - tet_pts[[0]] ** 2, axis=1)
-        try:
-            center = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
-            continue
-        radius = float(np.linalg.norm(center - tet_pts[0]))
-        if not np.isfinite(radius) or radius > alpha:
-            continue
-        for face_local, opp_local in local_faces:
-            face = np.asarray([tet[idx] for idx in face_local], dtype=np.int32)
-            opp = pts[tet[opp_local]]
-            p0, p1, p2 = pts[face]
-            normal = np.cross(p1 - p0, p2 - p0)
-            if np.dot(normal, opp - p0) > 0.0:
-                face[[1, 2]] = face[[2, 1]]
-            key = tuple(sorted(int(v) for v in face))
-            if key in face_dict:
-                face_dict[key] = (face_dict[key][0], face_dict[key][1] + 1)
-            else:
-                face_dict[key] = (face, 1)
-
-    boundary = [face for face, count in face_dict.values() if count == 1]
-    faces = np.asarray(boundary, dtype=np.int32)
-    unique_vertices, inverse = np.unique(faces.reshape(-1), return_inverse=True)
-    return pts[unique_vertices].astype(np.float32), inverse.reshape(-1, 3).astype(np.int32)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Soft sloth particle-spring system drops into a Newton MPM sand bed.")
-    p.add_argument(
+    io_group = p.add_argument_group("io")
+    io_group.add_argument(
         "--sloth-ir",
         type=Path,
         default=Path(
@@ -309,74 +143,75 @@ def parse_args() -> argparse.Namespace:
             "20260305_163731_full_parity/double_lift_sloth_normal_ir.npz"
         ),
     )
-    p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--prefix", default="sloth_soft_mpm_sand")
-    p.add_argument("--device", default=path_defaults.default_device())
-    p.add_argument("--frames", type=int, default=40)
-    p.add_argument("--sim-dt", type=float, default=1.0e-4)
-    p.add_argument("--substeps", type=int, default=300)
-    p.add_argument("--gravity-mag", type=float, default=9.8)
+    io_group.add_argument("--out-dir", type=Path, required=True)
+    io_group.add_argument("--prefix", default="sloth_soft_mpm_sand")
+    io_group.add_argument("--device", default=path_defaults.default_device())
 
-    p.add_argument("--sand-half-extent-x", type=float, default=0.9)
-    p.add_argument("--sand-half-extent-y", type=float, default=1.4)
-    p.add_argument("--sand-height", type=float, default=0.18)
-    p.add_argument("--hidden-floor-z", type=float, default=-1.25)
+    sim_group = p.add_argument_group("simulation")
+    sim_group.add_argument("--frames", type=int, default=40)
+    sim_group.add_argument("--sim-dt", type=float, default=1.0e-4)
+    sim_group.add_argument("--substeps", type=int, default=300)
+    sim_group.add_argument("--gravity-mag", type=float, default=9.8)
 
-    p.add_argument("--sand-voxel-size", type=float, default=0.05)
-    p.add_argument("--sand-particles-per-cell", type=int, default=3)
-    p.add_argument("--sand-points-per-particle", type=int, default=1)
-    p.add_argument("--sand-density", type=float, default=2500.0)
-    p.add_argument("--sand-young-modulus", type=float, default=1.0e15)
-    p.add_argument("--sand-poisson-ratio", type=float, default=0.3)
-    p.add_argument("--sand-friction", type=float, default=0.68)
-    p.add_argument("--sand-yield-pressure", type=float, default=1.0e12)
-    p.add_argument("--sand-air-drag", type=float, default=1.0)
-    p.add_argument("--sand-grid-type", choices=["fixed", "sparse"], default="sparse")
-    p.add_argument("--sand-max-iterations", type=int, default=50)
-    p.add_argument("--sand-transfer-scheme", choices=["apic", "pic"], default="pic")
-    p.add_argument("--sand-critical-fraction", type=float, default=0.0)
+    scene_group = p.add_argument_group("scene")
+    scene_group.add_argument("--sand-half-extent-x", type=float, default=0.55)
+    scene_group.add_argument("--sand-half-extent-y", type=float, default=0.75)
+    scene_group.add_argument("--sand-height", type=float, default=0.30)
+    scene_group.add_argument("--hidden-floor-z", type=float, default=-1.25)
+    scene_group.add_argument("--sloth-center-xy", type=float, nargs=2, default=(-0.15, 0.20))
+    scene_group.add_argument("--sloth-center-z", type=float, default=3.0)
 
-    p.add_argument("--sloth-center-xy", type=float, nargs=2, default=(-0.15, 0.20))
-    p.add_argument("--sloth-center-z", type=float, default=3.0)
-    p.add_argument("--particle-mass", type=float, default=0.001)
-    p.add_argument("--drag-damping-scale", type=float, default=0.0)
-    p.add_argument("--spring-k-scale", type=float, default=0.0003)
-    p.add_argument("--soft-mpm-force-scale", type=float, default=0.01)
-    p.add_argument("--soft-mpm-max-dv-per-frame", type=float, default=0.0001)
+    sand_group = p.add_argument_group("sand")
+    sand_group.add_argument("--sand-voxel-size", type=float, default=0.05)
+    sand_group.add_argument("--sand-particles-per-cell", type=int, default=3)
+    sand_group.add_argument("--sand-points-per-particle", type=int, default=1)
+    sand_group.add_argument("--sand-density", type=float, default=2500.0)
+    sand_group.add_argument("--sand-young-modulus", type=float, default=1.0e15)
+    sand_group.add_argument("--sand-poisson-ratio", type=float, default=0.3)
+    sand_group.add_argument("--sand-friction", type=float, default=0.68)
+    sand_group.add_argument("--sand-yield-pressure", type=float, default=1.0e12)
+    sand_group.add_argument("--sand-air-drag", type=float, default=1.0)
+    sand_group.add_argument("--sand-grid-type", choices=["fixed", "sparse"], default="sparse")
+    sand_group.add_argument("--sand-max-iterations", type=int, default=50)
+    sand_group.add_argument("--sand-transfer-scheme", choices=["apic", "pic"], default="pic")
+    sand_group.add_argument("--sand-critical-fraction", type=float, default=0.0)
 
-    p.add_argument("--render-fps", type=float, default=30.0)
-    p.add_argument("--slowdown", type=float, default=1.0)
-    p.add_argument("--screen-width", type=int, default=960)
-    p.add_argument("--screen-height", type=int, default=540)
-    p.add_argument("--viewer-headless", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--views", default="close_a")
-    p.add_argument("--camera-fov", type=float, default=45.0)
-    p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--label-font-size", type=int, default=24)
+    soft_group = p.add_argument_group("softbody")
+    soft_group.add_argument("--particle-mass", type=float, default=1.0e-5)
+    soft_group.add_argument("--drag-damping-scale", type=float, default=1.0)
+    soft_group.add_argument("--spring-k-scale", type=float, default=0.0)
+    soft_group.add_argument("--relax-steps", type=int, default=240)
+    soft_group.add_argument("--relax-damping", type=float, default=60.0)
+    soft_group.add_argument("--soft-mpm-force-scale", type=float, default=0.01)
+    soft_group.add_argument("--soft-mpm-max-dv-per-frame", type=float, default=10.0)
+
+    render_group = p.add_argument_group("render")
+    render_group.add_argument("--render-fps", type=float, default=30.0)
+    render_group.add_argument("--slowdown", type=float, default=1.0)
+    render_group.add_argument("--screen-width", type=int, default=960)
+    render_group.add_argument("--screen-height", type=int, default=540)
+    render_group.add_argument("--viewer-headless", action=argparse.BooleanOptionalAction, default=True)
+    render_group.add_argument("--views", default="close_a")
+    render_group.add_argument("--camera-fov", type=float, default=45.0)
+    render_group.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
+    render_group.add_argument("--label-font-size", type=int, default=24)
     return p.parse_args()
 
 
 def _load_ir(path: Path) -> dict[str, np.ndarray]:
-    ir = newton_import_ir.load_ir(path.resolve())
-    required = ["x0", "v0", "mass", "num_object_points", "spring_edges", "spring_rest_length", "spring_ke", "spring_kd", "sim_dt", "sim_substeps"]
-    missing = [key for key in required if key not in ir]
-    if missing:
-        raise KeyError(f"{path} missing IR fields: {missing}")
-    return ir
+    return load_ir_checked(
+        path,
+        newton_import_ir,
+        ["x0", "v0", "mass", "num_object_points", "spring_edges", "spring_rest_length", "spring_ke", "spring_kd", "sim_dt", "sim_substeps"],
+    )
 
 
 def _load_surface_points(spec: SoftSpec) -> np.ndarray:
-    case_dir = BRIDGE_ROOT / "inputs" / "cases" / spec.case_name
-    final_data_path = case_dir / "final_data.pkl"
-    if not final_data_path.exists():
-        raise FileNotFoundError(f"Missing final_data.pkl: {final_data_path}")
-    with final_data_path.open("rb") as handle:
-        final_data = pickle.load(handle)
-    surface = np.asarray(final_data["surface_points"], dtype=np.float32).reshape(-1, 3)
-    if spec.reverse_z:
-        surface[:, 2] *= -1.0
-    surface += spec.placement_shift.astype(np.float32, copy=False)
-    return surface
+    return load_surface_points(
+        spec.case_name,
+        reverse_z=spec.reverse_z,
+        placement_shift=spec.placement_shift,
+    )
 
 
 def _largest_component_indices(edges: np.ndarray, n_obj: int) -> np.ndarray:
@@ -402,6 +237,83 @@ def _largest_component_indices(edges: np.ndarray, n_obj: int) -> np.ndarray:
         buckets.setdefault(root, []).append(i)
     largest = max(buckets.values(), key=len)
     return np.asarray(sorted(largest), dtype=np.int32)
+
+
+def _spawn_mpm_particle_cone(
+    builder: newton.ModelBuilder,
+    *,
+    center_xy: tuple[float, float],
+    base_radius_x: float,
+    base_radius_y: float,
+    height: float,
+    ground_z: float,
+    voxel_size: float,
+    particles_per_cell: int,
+    density: float,
+    flags: int,
+    seed: int = 0,
+) -> np.ndarray:
+    """Approximate a sand pile by sampling a tapered cone/heap volume."""
+    bbox_lo = np.array(
+        [
+            float(center_xy[0]) - float(base_radius_x),
+            float(center_xy[1]) - float(base_radius_y),
+            float(ground_z),
+        ],
+        dtype=np.float32,
+    )
+    bbox_hi = np.array(
+        [
+            float(center_xy[0]) + float(base_radius_x),
+            float(center_xy[1]) + float(base_radius_y),
+            float(ground_z + height),
+        ],
+        dtype=np.float32,
+    )
+    res = np.array(
+        np.ceil(max(1, int(particles_per_cell)) * (bbox_hi - bbox_lo) / max(float(voxel_size), 1.0e-4)),
+        dtype=int,
+    )
+    cell = (bbox_hi - bbox_lo) / res
+    cell_volume = float(np.prod(cell))
+    radius = float(np.max(cell) * 0.5)
+    mass = float(cell_volume * density)
+    jitter_scale = 0.35
+    rng = np.random.default_rng(seed)
+
+    pos: list[tuple[float, float, float]] = []
+    vel: list[tuple[float, float, float]] = []
+    masses: list[float] = []
+    radii: list[float] = []
+    flags_list: list[int] = []
+
+    for ix in range(int(res[0]) + 1):
+        for iy in range(int(res[1]) + 1):
+            for iz in range(int(res[2]) + 1):
+                base = bbox_lo + np.array([ix * cell[0], iy * cell[1], iz * cell[2]], dtype=np.float32)
+                jitter = (rng.random(3, dtype=np.float32) - 0.5) * (2.0 * jitter_scale) * cell.astype(np.float32)
+                p = base + jitter
+                p[2] = max(float(ground_z + 0.25 * cell[2]), float(p[2]))
+                rel_h = (p[2] - float(ground_z)) / max(float(height), 1.0e-6)
+                if rel_h < 0.0 or rel_h > 1.0:
+                    continue
+                taper = max(0.0, 1.0 - rel_h)
+                rx = float(base_radius_x) * taper
+                ry = float(base_radius_y) * taper
+                dx = (p[0] - float(center_xy[0])) / max(rx, 1.0e-6)
+                dy = (p[1] - float(center_xy[1])) / max(ry, 1.0e-6)
+                if dx * dx + dy * dy > 1.0:
+                    continue
+                pos.append((float(p[0]), float(p[1]), float(p[2])))
+                vel.append((0.0, 0.0, 0.0))
+                masses.append(mass)
+                radii.append(radius)
+                flags_list.append(int(flags))
+
+    begin_id = len(builder.particle_q)
+    builder.add_particles(pos=pos, vel=vel, mass=masses, radius=radii, flags=flags_list)
+    end_id = len(builder.particle_q)
+    return np.arange(begin_id, end_id, dtype=np.int32)
 
 
 def _copy_ir_for_demo(ir: dict[str, np.ndarray], args: argparse.Namespace) -> tuple[dict[str, Any], np.ndarray, bool]:
@@ -456,13 +368,73 @@ def _copy_ir_for_demo(ir: dict[str, np.ndarray], args: argparse.Namespace) -> tu
     return ir_demo, shift.astype(np.float32), bool(reverse_z)
 
 
+def _resolve_spring_scale(ir: dict[str, np.ndarray], args: argparse.Namespace) -> float:
+    if float(args.spring_k_scale) > 0.0:
+        return float(args.spring_k_scale)
+    n_obj = int(np.asarray(ir["num_object_points"]).ravel()[0])
+    mass = np.asarray(ir["mass"][:n_obj], dtype=np.float32)
+    positive_mass = mass[mass > 1.0e-8]
+    mass_ref = float(np.median(positive_mass)) if positive_mass.size else 1.0
+    return float(args.particle_mass) / max(mass_ref, 1.0e-8)
+
+
+def _relax_object_only_positions(
+    ir_obj: dict[str, np.ndarray],
+    spring_scale: float,
+    args: argparse.Namespace,
+    *,
+    device: str,
+) -> np.ndarray:
+    if int(args.relax_steps) <= 0:
+        return np.asarray(ir_obj["x0"], dtype=np.float32).copy()
+
+    builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
+    cfg = newton_import_ir.SimConfig(
+        add_ground_plane=False,
+        spring_ke_scale=float(spring_scale),
+        spring_kd_scale=float(spring_scale),
+        particle_contacts=False,
+        strict_physics_checks=False,
+        object_contact_radius=None,
+        particle_contact_radius=1.0e-5,
+    )
+    checks: dict[str, float] = {}
+    newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts=False)
+    newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+    solver = newton.solvers.SolverSemiImplicit(
+        model,
+        angular_damping=0.05,
+        friction_smoothing=1.0,
+        enable_tri_contact=False,
+    )
+    state_in = model.state()
+    state_out = model.state()
+    control = model.control()
+    relax_dt = min(float(args.sim_dt), 5.0e-05)
+    n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
+    for _ in range(int(args.relax_steps)):
+        state_in.clear_forces()
+        solver.step(state_in, state_out, control, None, relax_dt)
+        state_in, state_out = state_out, state_in
+        wp.launch(
+            apply_drag_range,
+            dim=n_obj,
+            inputs=[state_in.particle_q, state_in.particle_qd, 0, n_obj, relax_dt, float(args.relax_damping)],
+            device=device,
+        )
+    return state_in.particle_q.numpy().astype(np.float32)
+
+
 def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, device: str) -> tuple[newton.Model, DemoMeta, dict[str, Any]]:
+    spring_scale = _resolve_spring_scale(ir, args)
     cfg_validate = newton_import_ir.SimConfig(
         ir_path=args.sloth_ir.resolve(),
         out_dir=args.out_dir.resolve(),
         output_prefix=args.prefix,
-        spring_ke_scale=float(args.spring_k_scale),
-        spring_kd_scale=float(args.spring_k_scale),
+        spring_ke_scale=float(spring_scale),
+        spring_kd_scale=float(spring_scale),
         angular_damping=0.05,
         friction_smoothing=1.0,
         enable_tri_contact=True,
@@ -477,12 +449,13 @@ def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, devic
     )
     newton_import_ir.validate_ir_physics(ir, cfg_validate)
     ir_demo, shift, reverse_z = _copy_ir_for_demo(ir, args)
+    ir_demo["x0"] = _relax_object_only_positions(ir_demo, spring_scale, args, device=device)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.sloth_ir.resolve(),
         out_dir=args.out_dir.resolve(),
         output_prefix=args.prefix,
-        spring_ke_scale=float(args.spring_k_scale),
-        spring_kd_scale=float(args.spring_k_scale),
+        spring_ke_scale=float(spring_scale),
+        spring_kd_scale=float(spring_scale),
         angular_damping=0.05,
         friction_smoothing=1.0,
         enable_tri_contact=True,
@@ -549,18 +522,6 @@ def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, devic
     return model, meta, ir_demo
 
 
-def _model_particle_collider_body_ids(model: newton.Model) -> list[int]:
-    shape_flags = model.shape_flags.numpy()
-    body_ids: list[int] = []
-    for body_id in range(-1, model.body_count):
-        shape_ids = np.asarray(model.body_shapes.get(body_id, []), dtype=np.int32)
-        if shape_ids.size == 0:
-            continue
-        if np.any((shape_flags[shape_ids] & int(newton.ShapeFlags.COLLIDE_PARTICLES)) != 0):
-            body_ids.append(int(body_id))
-    return body_ids
-
-
 def _build_proxy(model: newton.Model, meta: DemoMeta, args: argparse.Namespace, device: str) -> SoftProxy:
     state = model.state()
     q0 = state.particle_q.numpy().astype(np.float32)
@@ -610,41 +571,24 @@ def _build_sand_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
     sand_builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
     newton.solvers.SolverImplicitMPM.register_custom_attributes(sand_builder)
 
-    lo = np.array(
-        [
-            -float(args.sand_half_extent_x),
-            -float(args.sand_half_extent_y),
-            0.0,
-        ],
-        dtype=np.float32,
-    )
-    hi = np.array(
-        [
-            float(args.sand_half_extent_x),
-            float(args.sand_half_extent_y),
-            float(args.sand_height),
-        ],
-        dtype=np.float32,
-    )
-    res = np.array(np.ceil(max(1, int(args.sand_particles_per_cell)) * (hi - lo) / max(float(args.sand_voxel_size), 1.0e-4)), dtype=int)
-    cell = (hi - lo) / res
-    cell_volume = float(np.prod(cell))
-    radius = float(np.max(cell) * 0.5)
-    mass = float(cell_volume * float(args.sand_density))
-    sand_builder.add_particle_grid(
-        pos=wp.vec3(lo),
-        rot=wp.quat_identity(),
-        vel=wp.vec3(0.0),
-        dim_x=int(res[0]) + 1,
-        dim_y=int(res[1]) + 1,
-        dim_z=int(res[2]) + 1,
-        cell_x=float(cell[0]),
-        cell_y=float(cell[1]),
-        cell_z=float(cell[2]),
-        mass=mass,
-        jitter=2.0 * radius,
-        radius_mean=radius,
+    # Add a ground plane to sand_builder so the MPM solver directly owns it.
+    # This matches the official example_mpm_granular.py pattern (line 89) where
+    # the ground plane belongs to the same model as the particles, ensuring the
+    # implicit MPM solver can properly enforce the boundary.
+    sand_builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=float(args.sand_friction)))
+
+    _spawn_mpm_particle_cone(
+        sand_builder,
+        center_xy=(0.0, 0.0),
+        base_radius_x=float(args.sand_half_extent_x),
+        base_radius_y=float(args.sand_half_extent_y),
+        height=float(args.sand_height),
+        ground_z=0.0,
+        voxel_size=float(args.sand_voxel_size),
+        particles_per_cell=int(args.sand_particles_per_cell),
+        density=float(args.sand_density),
         flags=int(newton.ParticleFlags.ACTIVE),
+        seed=0,
     )
 
     sand_model = sand_builder.finalize(device=device)
@@ -672,11 +616,13 @@ def _build_sand_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
     sand_solver = newton.solvers.SolverImplicitMPM(sand_model, options)
 
     proxy = _build_proxy(model, meta, args, device)
-    body_collider_ids = _model_particle_collider_body_ids(model)
+    body_collider_ids = model_particle_collider_body_ids(sand_model)
     collider_meshes = [None] * len(body_collider_ids) + [proxy.mesh]
     collider_body_ids = body_collider_ids + [None]
-    ground_thickness = 0.75 * float(args.sand_voxel_size)
-    ground_proj = 1.00 * float(args.sand_voxel_size)
+    # Increase ground collider thickness/projection to prevent tunnelling
+    # under high-velocity impact.
+    ground_thickness = 2.0 * float(args.sand_voxel_size)
+    ground_proj = 3.0 * float(args.sand_voxel_size)
     collider_thicknesses = [ground_thickness if body_id == -1 else None for body_id in body_collider_ids] + [proxy.collider_thickness]
     collider_projection_thresholds = [ground_proj if body_id == -1 else None for body_id in body_collider_ids] + [proxy.collider_projection_threshold]
     collider_friction = [None] * len(body_collider_ids) + [proxy.collider_mu]
@@ -686,19 +632,12 @@ def _build_sand_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
         collider_thicknesses=collider_thicknesses,
         collider_friction=collider_friction,
         collider_projection_threshold=collider_projection_thresholds,
-        model=model,
+        model=sand_model,
     )
     proxy.collider_id = len(body_collider_ids)
 
-    combined_state = model.state()
     sand_state_0 = sand_model.state()
     sand_state_1 = sand_model.state()
-    sand_state_0.body_q = wp.empty(0, dtype=wp.transform, device=device) if combined_state.body_q is None else wp.empty_like(combined_state.body_q)
-    sand_state_0.body_qd = wp.empty(0, dtype=wp.spatial_vector, device=device) if combined_state.body_qd is None else wp.empty_like(combined_state.body_qd)
-    sand_state_0.body_f = wp.empty(0, dtype=wp.spatial_vector, device=device) if combined_state.body_f is None else wp.empty_like(combined_state.body_f)
-    sand_state_1.body_q = wp.empty_like(sand_state_0.body_q)
-    sand_state_1.body_qd = wp.empty_like(sand_state_0.body_qd)
-    sand_state_1.body_f = wp.empty_like(sand_state_0.body_f)
 
     render_radii = wp.clone(sand_model.particle_radius)
     render_colors = wp.full(sand_model.particle_count, value=wp.vec3(0.87, 0.84, 0.63), dtype=wp.vec3, device=device)
@@ -731,6 +670,18 @@ def _collect_sand_impulses(sand: SandSystem) -> None:
         sand.collider_impulse_pos[:n].assign(pos[:n])
         sand.collider_impulse_ids[:n].assign(ids[:n])
     sand.active_impulse_count = n
+
+
+def _clamp_softbody_velocity(state: newton.State, max_speed: float) -> None:
+    if max_speed <= 0.0 or state.particle_qd is None:
+        return
+    qd_np = state.particle_qd.numpy()
+    speeds = np.linalg.norm(qd_np, axis=1)
+    over = speeds > max_speed
+    if not np.any(over):
+        return
+    qd_np[over] *= (max_speed / speeds[over])[:, None]
+    state.particle_qd.assign(qd_np)
 
 
 def _update_proxy_from_soft_state(state: newton.State, proxy: SoftProxy) -> None:
@@ -785,7 +736,10 @@ def _update_soft_particle_forces_from_sand(model: newton.Model, meta: DemoMeta, 
             np.add.at(forces, particle_ids[:, proxy_col, bind_col], imp * combo[:, proxy_col, bind_col : bind_col + 1])
 
     masses = model.particle_mass.numpy().astype(np.float32)
-    max_force = masses * (float(args.soft_mpm_max_dv_per_frame) / max(float(args.sim_dt) * float(args.substeps), 1.0e-8))
+    # The max_dv is per-frame. The impulse needed to cause that dv is mass * dv.
+    # Force = impulse / frame_dt
+    frame_dt = max(float(args.sim_dt) * float(args.substeps), 1.0e-8)
+    max_force = masses * (float(args.soft_mpm_max_dv_per_frame) / frame_dt)
     norms = np.linalg.norm(forces, axis=1)
     scale = np.ones_like(norms, dtype=np.float32)
     over = norms > np.maximum(max_force, 1.0e-8)
@@ -800,46 +754,81 @@ def _update_soft_particle_forces_from_sand(model: newton.Model, meta: DemoMeta, 
     }
 
 
-def _tray_outline(meta: DemoMeta, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    ext_x = float(meta.bed_half_extent_x)
-    ext_y = float(meta.bed_half_extent_y)
-    z0 = float(meta.ground_z)
-    z1 = float(meta.sand_height)
-    corners = np.asarray(
-        [
-            (-ext_x, -ext_y, z0), (ext_x, -ext_y, z0), (ext_x, ext_y, z0), (-ext_x, ext_y, z0),
-            (-ext_x, -ext_y, z1), (ext_x, -ext_y, z1), (ext_x, ext_y, z1), (-ext_x, ext_y, z1),
-        ],
-        dtype=np.float32,
+def _warn_if_sand_underground(sand_np: np.ndarray, ground_z: float, frame: int) -> None:
+    sand_z = sand_np[:, 2]
+    underground_mask = sand_z < ground_z
+    n_underground = int(np.count_nonzero(underground_mask))
+    if n_underground <= 0:
+        return
+    worst_z = float(sand_z[underground_mask].min())
+    print(
+        f"  WARNING: frame {frame+1}: {n_underground}/{sand_np.shape[0]}"
+        f" sand particles BELOW ground (z<{ground_z:.3f}),"
+        f" worst z={worst_z:.5f}",
+        flush=True,
     )
-    edges = np.asarray(
-        [
-            (0, 1), (1, 2), (2, 3), (3, 0),
-            (4, 5), (5, 6), (6, 7), (7, 4),
-            (0, 4), (1, 5), (2, 6), (3, 7),
-        ],
-        dtype=np.int32,
+
+
+def _build_sim_data(
+    q_hist: list[np.ndarray],
+    sand_hist: list[np.ndarray],
+    sand: SandSystem,
+    coupling_sample_hist: list[int],
+    coupling_impulse_hist: list[float],
+    *,
+    sim_dt: float,
+    substeps: int,
+    wall_time_sec: float,
+) -> dict[str, Any]:
+    return {
+        "particle_q_all": np.stack(q_hist),
+        "sand_points_all": np.stack(sand_hist),
+        "sand_point_radii": sand.render_radii.numpy().astype(np.float32),
+        "sand_point_colors": sand.render_colors.numpy().astype(np.float32),
+        "coupling_sample_count": np.asarray(coupling_sample_hist, dtype=np.int32),
+        "coupling_impulse_norm_sum": np.asarray(coupling_impulse_hist, dtype=np.float32),
+        "sim_dt": float(sim_dt),
+        "substeps": int(substeps),
+        "wall_time_sec": float(wall_time_sec),
+    }
+
+
+def _write_outputs(args: argparse.Namespace, sim_data: dict[str, Any], out_mp4: Path) -> None:
+    scene_npz = args.out_dir / f"{args.prefix}_scene.npz"
+    np.savez_compressed(
+        scene_npz,
+        particle_q_all=sim_data["particle_q_all"],
+        sand_points_all=sim_data["sand_points_all"],
+        sand_point_radii=sim_data["sand_point_radii"],
+        sand_point_colors=sim_data["sand_point_colors"],
+        coupling_sample_count=sim_data["coupling_sample_count"],
+        coupling_impulse_norm_sum=sim_data["coupling_impulse_norm_sum"],
+        sim_dt=np.float32(sim_data["sim_dt"]),
+        substeps=np.int32(sim_data["substeps"]),
+        wall_time_sec=np.float32(sim_data["wall_time_sec"]),
     )
-    starts = corners[edges[:, 0]]
-    ends = corners[edges[:, 1]]
-    colors = np.tile(np.asarray([[0.88, 0.90, 0.94]], dtype=np.float32), (starts.shape[0], 1))
-    return starts, ends, colors
-
-
-def _ground_grid(size: float = 3.0, steps: int = 12, z: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    vals = np.linspace(-size, size, steps + 1, dtype=np.float32)
-    starts: list[list[float]] = []
-    ends: list[list[float]] = []
-    for v in vals:
-        starts.append([-size, float(v), z])
-        ends.append([size, float(v), z])
-        starts.append([float(v), -size, z])
-        ends.append([float(v), size, z])
-    starts_np = np.asarray(starts, dtype=np.float32)
-    ends_np = np.asarray(ends, dtype=np.float32)
-    colors_np = np.tile(np.asarray([[0.17, 0.24, 0.33]], dtype=np.float32), (starts_np.shape[0], 1))
-    return starts_np, ends_np, colors_np
-
+    summary = {
+        "experiment": "sloth_soft_mpm_sand_demo",
+        "sloth_ir": str(args.sloth_ir.resolve()),
+        "frames": int(sim_data["particle_q_all"].shape[0]),
+        "sim_dt": float(sim_data["sim_dt"]),
+        "substeps": int(sim_data["substeps"]),
+        "wall_time_sec": float(sim_data["wall_time_sec"]),
+        "sand_half_extent_x": float(args.sand_half_extent_x),
+        "sand_half_extent_y": float(args.sand_half_extent_y),
+        "sand_height": float(args.sand_height),
+        "sand_voxel_size": float(args.sand_voxel_size),
+        "sand_particles_per_cell": int(args.sand_particles_per_cell),
+        "sand_density": float(args.sand_density),
+        "sand_transfer_scheme": str(args.sand_transfer_scheme),
+        "sand_grid_type": str(args.sand_grid_type),
+        "particle_mass": float(args.particle_mass),
+        "frames_with_coupling": int(np.count_nonzero(sim_data["coupling_sample_count"])),
+        "coupling_samples_total": int(np.sum(sim_data["coupling_sample_count"])),
+        "coupling_impulse_norm_total": float(np.sum(sim_data["coupling_impulse_norm_sum"])),
+        "panel_videos": [str(out_mp4)],
+    }
+    (args.out_dir / f"{args.prefix}_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 def render_view_mp4(
     *,
@@ -885,12 +874,12 @@ def render_view_mp4(
 
         state = model.state()
         target = np.array([0.0, 0.0, max(0.45 * meta.sand_height, 0.22)], dtype=np.float32)
-        cpos = _camera_position(target, -34.0, -14.0, 4.3)
+        cpos = camera_position(target, -34.0, -14.0, 4.3)
         viewer.set_camera(wp.vec3(float(cpos[0]), float(cpos[1]), float(cpos[2])), -14.0, -34.0)
         sand_points_wp = wp.empty(sim_data["sand_points_all"].shape[1], dtype=wp.vec3, device=device)
         sand_radii_wp = wp.array(sim_data["sand_point_radii"], dtype=wp.float32, device=device)
         sand_colors_wp = wp.array(sim_data["sand_point_colors"], dtype=wp.vec3, device=device)
-        ground_starts_np, ground_ends_np, ground_colors_np = _ground_grid(size=4.0, steps=18, z=float(meta.ground_z))
+        ground_starts_np, ground_ends_np, ground_colors_np = ground_grid(size=4.0, steps=18, z=float(meta.ground_z))
         ground_starts_wp = wp.array(ground_starts_np, dtype=wp.vec3, device=device)
         ground_ends_wp = wp.array(ground_ends_np, dtype=wp.vec3, device=device)
         ground_colors_wp = wp.array(ground_colors_np, dtype=wp.vec3, device=device)
@@ -904,8 +893,13 @@ def render_view_mp4(
                 state.particle_qd.zero_()
             sim_t = float(frame_idx) * float(sim_data["sim_dt"]) * float(sim_data["substeps"])
             viewer.begin_frame(sim_t)
+            # Render sand FIRST so the sloth draws ON TOP and remains visible
+            # even when partially embedded in the sand bed.
+            viewer.log_points("/demo/sand", sand_points_wp, sand_radii_wp, sand_colors_wp, hidden=False)
+            viewer.log_lines("/demo/ground", ground_starts_wp, ground_ends_wp, ground_colors_wp, width=1.0, hidden=False)
+            # Now render sloth over the sand with slightly larger radii for contrast
             sloth_pts = wp.array(q_all[meta.spec.render_particle_ids_global], dtype=wp.vec3, device=device)
-            sloth_radii = wp.array(meta.spec.render_point_radius.astype(np.float32), dtype=wp.float32, device=device)
+            sloth_radii = wp.array((meta.spec.render_point_radius * 1.4).astype(np.float32), dtype=wp.float32, device=device)
             sloth_colors = wp.array(
                 np.tile(np.asarray(meta.spec.color_rgb, dtype=np.float32), (meta.spec.render_particle_ids_global.shape[0], 1)),
                 dtype=wp.vec3,
@@ -920,15 +914,13 @@ def render_view_mp4(
                     wp.array(starts, dtype=wp.vec3, device=device),
                     wp.array(ends, dtype=wp.vec3, device=device),
                     wp.array(np.tile(np.asarray(meta.spec.color_rgb, dtype=np.float32), (starts.shape[0], 1)), dtype=wp.vec3, device=device),
-                    width=1.0,
+                    width=1.5,
                     hidden=False,
                 )
-            viewer.log_points("/demo/sand", sand_points_wp, sand_radii_wp, sand_colors_wp, hidden=False)
-            viewer.log_lines("/demo/ground", ground_starts_wp, ground_ends_wp, ground_colors_wp, width=1.0, hidden=False)
             viewer.end_frame()
             frame = viewer.get_frame(render_ui=False).numpy()
             if args.overlay_label:
-                frame = _overlay_text_lines_rgb(frame, ["Close View", meta.scene_label, f"frame {frame_idx+1:03d}/{n_frames:03d}  t={sim_t:.3f}s"], font_size=int(args.label_font_size))
+                frame = overlay_text_lines_rgb(frame, ["Close View", meta.scene_label, f"frame {frame_idx+1:03d}/{n_frames:03d}  t={sim_t:.3f}s"], font_size=int(args.label_font_size))
             assert ffmpeg_proc.stdin is not None
             ffmpeg_proc.stdin.write(frame.tobytes())
         assert ffmpeg_proc.stdin is not None
@@ -965,7 +957,7 @@ class Example:
     def step(self):
         solver = newton.solvers.SolverSemiImplicit(
             self.model,
-            angular_damping=0.05,
+            angular_damping=0.15,
             friction_smoothing=1.0,
             enable_tri_contact=True,
         )
@@ -1002,8 +994,16 @@ class Example:
                         inputs=[state_in.particle_q, state_in.particle_qd, 0, self.meta.spec.particle_count, float(self.args.sim_dt), self.meta.spec.drag_damping],
                         device=self.device,
                     )
+                # Clamp softbody velocities to keep explicit soft↔MPM feedback
+                # from accelerating extremely light particles into runaway states.
+                _clamp_softbody_velocity(state_in, max_speed=50.0)
             _update_proxy_from_soft_state(state_in, self.sand.proxy)
             self.sand.solver.step(self.sand.state_0, self.sand.state_1, contacts=None, control=None, dt=frame_dt)
+            # Project particles back outside colliders (ground plane, proxy mesh)
+            # to enforce boundary conditions.  This is what Newton's official
+            # examples do (see example_mpm_granular.py line 133) and prevents
+            # sand from tunnelling through the ground.
+            self.sand.solver.project_outside(self.sand.state_1, self.sand.state_1, frame_dt)
             self.sand.state_0, self.sand.state_1 = self.sand.state_1, self.sand.state_0
             _collect_sand_impulses(self.sand)
 
@@ -1013,6 +1013,8 @@ class Example:
                 raise RuntimeError(f"Softbody state contains non-finite values at frame {frame}")
             if not np.all(np.isfinite(sand_np)):
                 raise RuntimeError(f"Sand state contains non-finite values at frame {frame}")
+
+            _warn_if_sand_underground(sand_np, float(self.meta.ground_z), frame)
             q_render = q_np[self.meta.spec.render_particle_ids_global]
             bbox_size = float(np.linalg.norm(np.max(q_render, axis=0) - np.min(q_render, axis=0)))
             if bbox_size > 200.0:
@@ -1029,57 +1031,22 @@ class Example:
                     f"  coupling_samples={int(coupling['sample_count'])}",
                     flush=True,
                 )
-        self.sim_data = {
-            "particle_q_all": np.stack(q_hist),
-            "sand_points_all": np.stack(sand_hist),
-            "sand_point_radii": self.sand.render_radii.numpy().astype(np.float32),
-            "sand_point_colors": self.sand.render_colors.numpy().astype(np.float32),
-            "coupling_sample_count": np.asarray(coupling_sample_hist, dtype=np.int32),
-            "coupling_impulse_norm_sum": np.asarray(coupling_impulse_hist, dtype=np.float32),
-            "sim_dt": float(self.args.sim_dt),
-            "substeps": int(self.args.substeps),
-            "wall_time_sec": float(time.perf_counter() - t0),
-        }
+        self.sim_data = _build_sim_data(
+            q_hist,
+            sand_hist,
+            self.sand,
+            coupling_sample_hist,
+            coupling_impulse_hist,
+            sim_dt=float(self.args.sim_dt),
+            substeps=int(self.args.substeps),
+            wall_time_sec=float(time.perf_counter() - t0),
+        )
 
     def render(self):
         assert self.sim_data is not None
         out_mp4 = self.args.out_dir / f"{self.args.prefix}_close_a.mp4"
         render_view_mp4(model=self.model, sim_data=self.sim_data, meta=self.meta, args=self.args, device=self.device, out_mp4=out_mp4)
-        scene_npz = self.args.out_dir / f"{self.args.prefix}_scene.npz"
-        np.savez_compressed(
-            scene_npz,
-            particle_q_all=self.sim_data["particle_q_all"],
-            sand_points_all=self.sim_data["sand_points_all"],
-            sand_point_radii=self.sim_data["sand_point_radii"],
-            sand_point_colors=self.sim_data["sand_point_colors"],
-            coupling_sample_count=self.sim_data["coupling_sample_count"],
-            coupling_impulse_norm_sum=self.sim_data["coupling_impulse_norm_sum"],
-            sim_dt=np.float32(self.sim_data["sim_dt"]),
-            substeps=np.int32(self.sim_data["substeps"]),
-            wall_time_sec=np.float32(self.sim_data["wall_time_sec"]),
-        )
-        summary = {
-            "experiment": "sloth_soft_mpm_sand_demo",
-            "sloth_ir": str(self.args.sloth_ir.resolve()),
-            "frames": int(self.sim_data["particle_q_all"].shape[0]),
-            "sim_dt": float(self.sim_data["sim_dt"]),
-            "substeps": int(self.sim_data["substeps"]),
-            "wall_time_sec": float(self.sim_data["wall_time_sec"]),
-            "sand_half_extent_x": float(self.args.sand_half_extent_x),
-            "sand_half_extent_y": float(self.args.sand_half_extent_y),
-            "sand_height": float(self.args.sand_height),
-            "sand_voxel_size": float(self.args.sand_voxel_size),
-            "sand_particles_per_cell": int(self.args.sand_particles_per_cell),
-            "sand_density": float(self.args.sand_density),
-            "sand_transfer_scheme": str(self.args.sand_transfer_scheme),
-            "sand_grid_type": str(self.args.sand_grid_type),
-            "particle_mass": float(self.args.particle_mass),
-            "frames_with_coupling": int(np.count_nonzero(self.sim_data["coupling_sample_count"])),
-            "coupling_samples_total": int(np.sum(self.sim_data["coupling_sample_count"])),
-            "coupling_impulse_norm_total": float(np.sum(self.sim_data["coupling_impulse_norm_sum"])),
-            "panel_videos": [str(out_mp4)],
-        }
-        (self.args.out_dir / f"{self.args.prefix}_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        _write_outputs(self.args, self.sim_data, out_mp4)
 
     def run(self) -> int:
         print("Building soft sloth + sand system...", flush=True)
