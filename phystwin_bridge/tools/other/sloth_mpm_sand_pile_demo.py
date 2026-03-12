@@ -110,6 +110,7 @@ class SandSystem:
     body_sand_forces: wp.array | None
     frame_dt: float
     sim_dt: float
+    coupling_dt: float
     active_impulse_count: int
     render_radii: wp.array
     render_colors: wp.array
@@ -594,6 +595,7 @@ def _build_sand_system(model: newton.Model, meta: DemoMeta, args: argparse.Names
         body_sand_forces=None,
         frame_dt=float(args.sim_dt) * float(args.substeps),
         sim_dt=float(args.sim_dt),
+        coupling_dt=float(args.sim_dt) * float(args.substeps),
         active_impulse_count=0,
         render_radii=render_radii,
         render_colors=render_colors,
@@ -628,6 +630,7 @@ def _assign_sand_impulses(
 
 
 def _step_sand_substeps(sand: SandSystem, frame_dt: float, substeps: int) -> None:
+    sand.coupling_dt = float(frame_dt)
     dt = frame_dt / max(int(substeps), 1)
     impulse_chunks: list[np.ndarray] = []
     pos_chunks: list[np.ndarray] = []
@@ -707,13 +710,12 @@ def _update_soft_particle_forces_from_sand(model: newton.Model, meta: DemoMeta, 
         return {"sample_count": 0.0, "impulse_norm_sum": 0.0, "force_norm_max": 0.0, "forces": forces}
 
     pts = positions[mask]
-    # Official Newton pattern: force = impulse / frame_dt.
-    # sand.frame_dt is the full soft-body frame duration (sim_dt * substeps).
-    # The MPM solver returns impulses scaled to the dt passed to its step(),
-    # which is frame_dt / sand_mpm_substeps.  To convert to force we divide
-    # by that same dt so the units cancel correctly.
-    mpm_dt = max(float(sand.frame_dt) / max(float(args.sand_mpm_substeps), 1.0), 1.0e-8)
-    imp = impulses[mask] * (float(args.soft_mpm_force_scale) / mpm_dt)
+    # Official Newton two-way pattern: convert accumulated impulse over the
+    # last MPM step window into an average force over that same window.
+    # In our interleaved scheme, `sand.coupling_dt` is the actual chunk length
+    # used by the last `_step_sand_substeps()` call.
+    coupling_dt = max(float(sand.coupling_dt), 1.0e-8)
+    imp = impulses[mask] * (float(args.soft_mpm_force_scale) / coupling_dt)
     proxy_points = np.asarray(sand.proxy.query_points_world, dtype=np.float64)
     tree = cKDTree(proxy_points)
     k = min(4, proxy_points.shape[0])
@@ -1011,7 +1013,7 @@ class Example:
 
                 _clamp_softbody_velocity(state_in, max_speed=200.0)
                 _update_proxy_from_soft_state(state_in, self.sand.proxy)
-                _step_sand_substeps(self.sand, float(self.args.sim_dt) * float(chunk_steps), 1)
+                _step_sand_substeps(self.sand, float(self.args.sim_dt) * float(chunk_steps), chunk_steps)
                 remaining_soft_steps -= chunk_steps
 
             q_np = state_in.particle_q.numpy().astype(np.float32)
