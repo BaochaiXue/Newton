@@ -44,6 +44,9 @@ from demo_common import (
 
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
+NEWTON_PY_ROOT = CORE_DIR.parents[2] / "newton"
+if str(NEWTON_PY_ROOT) not in sys.path:
+    sys.path.insert(0, str(NEWTON_PY_ROOT))
 
 path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
 newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
@@ -121,6 +124,22 @@ def _candidate_zebra_ir_paths() -> list[Path]:
     return [path for path in candidates if path.is_file()]
 
 
+def _pick_preferred_ir(paths: list[Path]) -> Path | None:
+    if not paths:
+        return None
+    preferred_tokens = (
+        "full_parity",
+        "sidecar_from_ckpt",
+        "load4cases",
+        "sidecar",
+    )
+    for token in preferred_tokens:
+        matches = [path for path in paths if token in str(path)]
+        if matches:
+            return max(matches, key=lambda path: (path.stat().st_mtime, str(path)))
+    return max(paths, key=lambda path: (path.stat().st_mtime, str(path)))
+
+
 def _default_zebra_ir() -> Path:
     root = Path("/home/xinjie/Newton_Connection/Newton/phystwin_bridge/outputs")
     prioritized_groups = [
@@ -130,8 +149,9 @@ def _default_zebra_ir() -> Path:
     ]
     for group in prioritized_groups:
         existing = [path for path in group if path.is_file()]
-        if existing:
-            return existing[-1]
+        picked = _pick_preferred_ir(existing)
+        if picked is not None:
+            return picked
     return Path(
         "Newton/phystwin_bridge/outputs/double_lift_zebra_normal/"
         "20260305_163731_full_parity/double_lift_zebra_normal_ir.npz"
