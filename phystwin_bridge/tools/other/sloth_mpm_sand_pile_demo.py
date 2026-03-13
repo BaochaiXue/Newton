@@ -34,7 +34,7 @@ import warp as wp
 from demo_common import (
     CORE_DIR,
     add_dense_particle_forces,
-    apply_drag_range,
+    alpha_shape_surface_mesh,
     camera_position,
     ground_grid,
     load_core_module,
@@ -171,6 +171,7 @@ def parse_args() -> argparse.Namespace:
     sand_group.add_argument("--sand-critical-fraction", type=float, default=0.0)
     sand_group.add_argument("--sand-mpm-substeps", type=int, default=16)
     sand_group.add_argument("--contact-refine-height", type=float, default=0.6)
+    sand_group.add_argument("--coupling-mode", choices=["one-way", "two-way"], default="one-way")
 
     soft_group = p.add_argument_group("softbody")
     soft_group.add_argument("--particle-mass", type=float, default=1.0)
@@ -378,10 +379,10 @@ def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, devic
         friction_smoothing=1.0,
         enable_tri_contact=True,
         disable_particle_contact_kernel=True,
-        shape_contacts=True,
+        shape_contacts=False,
         add_ground_plane=False,
         strict_physics_checks=True,
-        apply_drag=False,
+        apply_drag=True,
         drag_damping_scale=1.0,
         up_axis="Z",
         device=device,
@@ -398,10 +399,10 @@ def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, devic
         friction_smoothing=1.0,
         enable_tri_contact=True,
         disable_particle_contact_kernel=True,
-        shape_contacts=True,
+        shape_contacts=False,
         add_ground_plane=False,
         strict_physics_checks=False,
-        apply_drag=False,
+        apply_drag=True,
         drag_damping_scale=1.0,
         up_axis="Z",
         device=device,
@@ -411,6 +412,12 @@ def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, devic
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
     radius_all, _, _ = newton_import_ir._add_particles(builder, ir_demo, cfg, particle_contacts)
     newton_import_ir._add_springs(builder, ir_demo, cfg, checks)
+
+    # Ground plane for the softbody so it doesn't fall through the floor.
+    # Invisible (rendering handled by the sand system) but provides collision.
+    ground_cfg = builder.default_shape_cfg.copy()
+    ground_cfg.is_visible = False
+    builder.add_ground_plane(cfg=ground_cfg)
 
     model = builder.finalize(device=device)
     if not (particle_contacts and (not cfg.disable_particle_contact_kernel)):
@@ -434,7 +441,7 @@ def _build_soft_model(ir: dict[str, np.ndarray], args: argparse.Namespace, devic
         particle_start=0,
         particle_count=n_obj,
         render_particle_ids_global=render_local_ids.astype(np.int32, copy=False),
-        drag_damping=0.0,
+        drag_damping=float(newton_import_ir.ir_scalar(ir_demo, "drag_damping", default=0.0)),
         render_edge_global=render_edges,
         render_point_radius=point_radius.astype(np.float32),
         mass_sum=float(np.asarray(ir_demo["mass"], dtype=np.float32)[:n_obj].sum()),
@@ -460,21 +467,26 @@ def _build_proxy(model: newton.Model, meta: DemoMeta, args: argparse.Namespace, 
     qd0 = state.particle_qd.numpy().astype(np.float32) if state.particle_qd is not None else np.zeros_like(q0, dtype=np.float32)
     spec = meta.spec
     obj_pts = q0[spec.render_particle_ids_global]
-    from scipy.spatial import ConvexHull
+    try:
+        surface_points = _load_surface_points(spec)
+        proxy_vertices, tri_local = alpha_shape_surface_mesh(surface_points)
+    except Exception:
+        from scipy.spatial import ConvexHull
 
-    hull = ConvexHull(np.asarray(obj_pts, dtype=np.float64))
-    tri_local = np.asarray(hull.simplices, dtype=np.int32)
-    used = np.unique(tri_local.reshape(-1))
-    remap = {old: i for i, old in enumerate(used.tolist())}
-    proxy_vertices = obj_pts[used].astype(np.float32, copy=True)
-    tri_local = np.vectorize(remap.get, otypes=[np.int32])(tri_local).astype(np.int32, copy=False)
-    proxy_center = np.mean(proxy_vertices, axis=0)
-    for face in tri_local:
-        p0, p1, p2 = proxy_vertices[face]
-        normal = np.cross(p1 - p0, p2 - p0)
-        face_center = (p0 + p1 + p2) / 3.0
-        if np.dot(normal, face_center - proxy_center) < 0.0:
-            face[1], face[2] = face[2], face[1]
+        hull = ConvexHull(np.asarray(obj_pts, dtype=np.float64))
+        tri_local = np.asarray(hull.simplices, dtype=np.int32)
+        used = np.unique(tri_local.reshape(-1))
+        remap = {old: i for i, old in enumerate(used.tolist())}
+        proxy_vertices = obj_pts[used].astype(np.float32, copy=True)
+        tri_local = np.vectorize(remap.get, otypes=[np.int32])(tri_local).astype(np.int32, copy=False)
+
+        proxy_center = np.mean(proxy_vertices, axis=0)
+        for face in tri_local:
+            p0, p1, p2 = proxy_vertices[face]
+            normal = np.cross(p1 - p0, p2 - p0)
+            face_center = (p0 + p1 + p2) / 3.0
+            if np.dot(normal, face_center - proxy_center) < 0.0:
+                face[1], face[2] = face[2], face[1]
 
     from scipy.spatial import cKDTree
 
@@ -659,23 +671,6 @@ def _step_sand_substeps(sand: SandSystem, frame_dt: float, substeps: int) -> Non
             np.zeros((0,), dtype=np.int32),
         )
 
-
-def _clamp_softbody_velocity(state: newton.State, max_speed: float) -> None:
-    if max_speed <= 0.0 or state.particle_qd is None:
-        return
-    qd_np = state.particle_qd.numpy()
-    invalid = ~np.all(np.isfinite(qd_np), axis=1)
-    if np.any(invalid):
-        qd_np[invalid] = 0.0
-    speeds = np.linalg.norm(qd_np, axis=1)
-    over = speeds > max_speed
-    if not np.any(over) and not np.any(invalid):
-        return
-    if np.any(over):
-        qd_np[over] *= (max_speed / speeds[over])[:, None]
-    state.particle_qd.assign(qd_np)
-
-
 def _update_proxy_from_soft_state(state: newton.State, proxy: SoftProxy) -> None:
     q = state.particle_q.numpy().astype(np.float32)
     qd = state.particle_qd.numpy().astype(np.float32)
@@ -690,7 +685,7 @@ def _update_proxy_from_soft_state(state: newton.State, proxy: SoftProxy) -> None
     proxy.query_points_world = pts.copy()
     proxy.mesh_points.assign(pts)
     proxy.mesh_velocities.assign(vel)
-    proxy.mesh = wp.Mesh(proxy.mesh_points, proxy.mesh_indices, proxy.mesh_velocities)
+    proxy.mesh.refit()
 
 
 def _update_soft_particle_forces_from_sand(model: newton.Model, meta: DemoMeta, sand: SandSystem, args: argparse.Namespace) -> dict[str, float]:
@@ -968,53 +963,53 @@ class Example:
         coupling_sample_hist: list[int] = [0]
         coupling_impulse_hist: list[float] = [0.0]
         t0 = time.perf_counter()
-        _collect_sand_impulses(self.sand)
+        two_way = self.args.coupling_mode == "two-way"
         frame_dt = float(self.args.sim_dt) * float(self.args.substeps)
-        sand_updates_per_frame = max(int(self.args.sand_mpm_substeps), 1)
-        soft_steps_per_sand_update_base = max(int(np.ceil(float(self.args.substeps) / float(sand_updates_per_frame))), 1)
+
+        if two_way:
+            _collect_sand_impulses(self.sand)
+            sand_updates_per_frame = max(int(self.args.sand_mpm_substeps), 1)
+            soft_steps_per_sand_update_base = max(int(np.ceil(float(self.args.substeps) / float(sand_updates_per_frame))), 1)
+
         for frame in range(1, int(self.args.frames)):
-            remaining_soft_steps = int(self.args.substeps)
             frame_coupling_samples = 0
             frame_coupling_impulse = 0.0
-            while remaining_soft_steps > 0:
-                coupling = _update_soft_particle_forces_from_sand(self.model, self.meta, self.sand, self.args)
-                coupling_forces_wp = wp.array(coupling["forces"], dtype=wp.vec3, device=self.device)
-                frame_coupling_samples += int(coupling["sample_count"])
-                frame_coupling_impulse += float(coupling["impulse_norm_sum"])
 
-                z_min_live = float(state_in.particle_q.numpy()[self.meta.spec.render_particle_ids_global, 2].min())
-                near_contact = z_min_live < (float(self.meta.sand_height) + float(self.args.contact_refine_height))
-                chunk_steps = 1 if near_contact else min(remaining_soft_steps, soft_steps_per_sand_update_base)
-                for _sub in range(chunk_steps):
+            if two_way:
+                # ── Two-way: interleaved soft ↔ sand stepping ──
+                remaining_soft_steps = int(self.args.substeps)
+                while remaining_soft_steps > 0:
+                    coupling = _update_soft_particle_forces_from_sand(self.model, self.meta, self.sand, self.args)
+                    coupling_forces_wp = wp.array(coupling["forces"], dtype=wp.vec3, device=self.device)
+                    frame_coupling_samples += int(coupling["sample_count"])
+                    frame_coupling_impulse += float(coupling["impulse_norm_sum"])
+
+                    z_min_live = float(state_in.particle_q.numpy()[self.meta.spec.render_particle_ids_global, 2].min())
+                    near_contact = z_min_live < (float(self.meta.sand_height) + float(self.args.contact_refine_height))
+                    chunk_steps = 1 if near_contact else min(remaining_soft_steps, soft_steps_per_sand_update_base)
+                    for _sub in range(chunk_steps):
+                        state_in.clear_forces()
+                        wp.launch(
+                            add_dense_particle_forces,
+                            dim=self.model.particle_count,
+                            inputs=[state_in.particle_f, coupling_forces_wp, 1.0],
+                            device=self.device,
+                        )
+                        self.model.collide(state_in, contacts)
+                        solver.step(state_in, state_out, control, contacts, float(self.args.sim_dt))
+                        state_in, state_out = state_out, state_in
+                    _update_proxy_from_soft_state(state_in, self.sand.proxy)
+                    _step_sand_substeps(self.sand, float(self.args.sim_dt) * float(chunk_steps), chunk_steps)
+                    remaining_soft_steps -= chunk_steps
+            else:
+                # ── One-way: softbody steps independently, sand follows ──
+                for _sub in range(int(self.args.substeps)):
                     state_in.clear_forces()
-                    wp.launch(
-                        add_dense_particle_forces,
-                        dim=self.model.particle_count,
-                        inputs=[state_in.particle_f, coupling_forces_wp, 1.0],
-                        device=self.device,
-                    )
                     self.model.collide(state_in, contacts)
                     solver.step(state_in, state_out, control, contacts, float(self.args.sim_dt))
                     state_in, state_out = state_out, state_in
-                    if self.meta.spec.drag_damping > 0.0:
-                        wp.launch(
-                            apply_drag_range,
-                            dim=self.meta.spec.particle_count,
-                            inputs=[
-                                state_in.particle_q,
-                                state_in.particle_qd,
-                                0,
-                                self.meta.spec.particle_count,
-                                float(self.args.sim_dt),
-                                self.meta.spec.drag_damping,
-                            ],
-                            device=self.device,
-                        )
-
-                _clamp_softbody_velocity(state_in, max_speed=200.0)
                 _update_proxy_from_soft_state(state_in, self.sand.proxy)
-                _step_sand_substeps(self.sand, float(self.args.sim_dt) * float(chunk_steps), chunk_steps)
-                remaining_soft_steps -= chunk_steps
+                _step_sand_substeps(self.sand, frame_dt, max(int(self.args.sand_mpm_substeps), 1))
 
             q_np = state_in.particle_q.numpy().astype(np.float32)
             sand_np = self.sand.state_0.particle_q.numpy().astype(np.float32)
@@ -1037,7 +1032,8 @@ class Example:
                     f"  frame {frame+1}/{int(self.args.frames)}"
                     f"  z=[{q_np[:, 2].min():.3f}, {q_np[:, 2].max():.3f}]"
                     f"  bbox={bbox_size:.3f}"
-                    f"  coupling_samples={int(frame_coupling_samples)}",
+                    f"  coupling_samples={int(frame_coupling_samples)}"
+                    f"  mode={self.args.coupling_mode}",
                     flush=True,
                 )
         self.sim_data = _build_sim_data(
