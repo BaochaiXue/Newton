@@ -35,6 +35,7 @@ from demo_common import (
     CORE_DIR,
     add_dense_particle_forces,
     alpha_shape_surface_mesh,
+    apply_drag_range,
     camera_position,
     ground_grid,
     load_core_module,
@@ -998,6 +999,20 @@ class Example:
                         self.model.collide(state_in, contacts)
                         solver.step(state_in, state_out, control, contacts, float(self.args.sim_dt))
                         state_in, state_out = state_out, state_in
+                        if self.meta.spec.drag_damping > 0.0:
+                            wp.launch(
+                                apply_drag_range,
+                                dim=self.meta.spec.particle_count,
+                                inputs=[
+                                    state_in.particle_q,
+                                    state_in.particle_qd,
+                                    0,
+                                    self.meta.spec.particle_count,
+                                    float(self.args.sim_dt),
+                                    self.meta.spec.drag_damping,
+                                ],
+                                device=self.device,
+                            )
                     _update_proxy_from_soft_state(state_in, self.sand.proxy)
                     _step_sand_substeps(self.sand, float(self.args.sim_dt) * float(chunk_steps), chunk_steps)
                     remaining_soft_steps -= chunk_steps
@@ -1008,6 +1023,20 @@ class Example:
                     self.model.collide(state_in, contacts)
                     solver.step(state_in, state_out, control, contacts, float(self.args.sim_dt))
                     state_in, state_out = state_out, state_in
+                    if self.meta.spec.drag_damping > 0.0:
+                        wp.launch(
+                            apply_drag_range,
+                            dim=self.meta.spec.particle_count,
+                            inputs=[
+                                state_in.particle_q,
+                                state_in.particle_qd,
+                                0,
+                                self.meta.spec.particle_count,
+                                float(self.args.sim_dt),
+                                self.meta.spec.drag_damping,
+                            ],
+                            device=self.device,
+                        )
                 _update_proxy_from_soft_state(state_in, self.sand.proxy)
                 _step_sand_substeps(self.sand, frame_dt, max(int(self.args.sand_mpm_substeps), 1))
 
