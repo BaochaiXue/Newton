@@ -31,7 +31,6 @@ import warp as wp
 from demo_common import (
     CORE_DIR,
     alpha_shape_surface_mesh,
-    apply_drag_range,
     camera_position,
     ground_grid,
     load_core_module,
@@ -58,6 +57,7 @@ import newton  # noqa: E402
 class SoftSpec:
     name: str
     case_name: str
+    case_dir: Path
     ir_path: Path
     particle_count: int
     total_particle_count: int
@@ -114,47 +114,10 @@ class SandSystem:
     proxy: SoftProxy
 
 
-def _candidate_zebra_ir_paths() -> list[Path]:
-    root = Path("/home/xinjie/Newton_Connection/Newton/phystwin_bridge/outputs")
-    candidates: list[Path] = []
-    if root.exists():
-        candidates.extend(sorted(root.glob("zebra_around_easy/**/*_ir.npz")))
-        candidates.extend(sorted(root.glob("double_lift_zebra_normal/**/*_ir.npz")))
-        candidates.extend(sorted(root.glob("zebra_around_hard/**/*_ir.npz")))
-    return [path for path in candidates if path.is_file()]
-
-
-def _pick_preferred_ir(paths: list[Path]) -> Path | None:
-    if not paths:
-        return None
-    preferred_tokens = (
-        "full_parity",
-        "sidecar_from_ckpt",
-        "load4cases",
-        "sidecar",
-    )
-    for token in preferred_tokens:
-        matches = [path for path in paths if token in str(path)]
-        if matches:
-            return max(matches, key=lambda path: (path.stat().st_mtime, str(path)))
-    return max(paths, key=lambda path: (path.stat().st_mtime, str(path)))
-
-
 def _default_zebra_ir() -> Path:
-    root = Path("/home/xinjie/Newton_Connection/Newton/phystwin_bridge/outputs")
-    prioritized_groups = [
-        sorted(root.glob("zebra_around_easy/**/*_ir.npz")),
-        sorted(root.glob("double_lift_zebra_normal/**/*_ir.npz")),
-        sorted(root.glob("zebra_around_hard/**/*_ir.npz")),
-    ]
-    for group in prioritized_groups:
-        existing = [path for path in group if path.is_file()]
-        picked = _pick_preferred_ir(existing)
-        if picked is not None:
-            return picked
     return Path(
-        "Newton/phystwin_bridge/outputs/double_lift_zebra_normal/"
-        "20260305_163731_full_parity/double_lift_zebra_normal_ir.npz"
+        "Newton/phystwin_bridge/ir/double_lift_zebra_normal/"
+        "phystwin_ir_v2_bf_strict.npz"
     )
 
 
@@ -162,6 +125,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Controller-driven zebra + one-way kinematic MPM sand demo.")
 
     io_group = p.add_argument_group("io")
+    io_group.add_argument(
+        "--zebra-case-dir",
+        type=Path,
+        default=Path("Newton/phystwin_bridge/inputs/cases/double_lift_zebra_normal"),
+    )
     io_group.add_argument("--zebra-ir", type=Path, default=_default_zebra_ir())
     io_group.add_argument("--out-dir", type=Path, required=True)
     io_group.add_argument("--prefix", default="zebra_mpm_sand_one_way")
@@ -172,11 +140,17 @@ def parse_args() -> argparse.Namespace:
     sim_group.add_argument("--sim-dt", type=float, default=None)
     sim_group.add_argument("--substeps", type=int, default=None)
     sim_group.add_argument("--gravity-mag", type=float, default=9.8)
+    sim_group.add_argument("--soft-gravity-mag", type=float, default=0.0)
     sim_group.add_argument("--interpolate-controls", action=argparse.BooleanOptionalAction, default=True)
 
     soft_group = p.add_argument_group("softbody")
     soft_group.add_argument("--zebra-target-xy", type=float, nargs=2, default=(0.0, 0.70))
-    soft_group.add_argument("--zebra-bottom-z", type=float, default=0.34)
+    soft_group.add_argument(
+        "--zebra-bottom-z",
+        type=float,
+        default=None,
+        help="Initial zebra bottom height. Defaults to the ground plane z so the zebra starts at ground level.",
+    )
     soft_group.add_argument("--drag-damping-scale", type=float, default=1.0)
     soft_group.add_argument("--particle-contact-kernel", action=argparse.BooleanOptionalAction, default=False)
     soft_group.add_argument("--spring-edge-stride", type=int, default=16)
@@ -191,6 +165,7 @@ def parse_args() -> argparse.Namespace:
     sand_group.add_argument("--tolerance", type=float, default=1.0e-5)
     sand_group.add_argument("--max-iterations", type=int, default=50)
     sand_group.add_argument("--air-drag", type=float, default=1.0)
+    sand_group.add_argument("--sand-frame-substeps", type=int, default=4)
     sand_group.add_argument("--sand-bounds-lo", type=float, nargs=3, default=(-0.5, -0.5, 0.0))
     sand_group.add_argument("--sand-bounds-hi", type=float, nargs=3, default=(0.5, 2.5, 0.15))
     sand_group.add_argument("--sand-density", type=float, default=2500.0)
@@ -244,6 +219,29 @@ def _resolve_timing(args: argparse.Namespace, ir: dict[str, np.ndarray]) -> None
     args.substeps = max(1, int(args.substeps))
 
 
+def _largest_component_indices(edges: np.ndarray, n_obj: int) -> np.ndarray:
+    parent = np.arange(n_obj, dtype=np.int32)
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = int(parent[x])
+        return x
+
+    for a, b in np.asarray(edges, dtype=np.int32):
+        ra = find(int(a))
+        rb = find(int(b))
+        if ra != rb:
+            parent[rb] = ra
+
+    components: dict[int, list[int]] = {}
+    for i in range(n_obj):
+        root = find(i)
+        components.setdefault(root, []).append(i)
+    largest = max(components.values(), key=len)
+    return np.asarray(sorted(largest), dtype=np.int32)
+
+
 def _prepare_ir_for_demo(
     ir: dict[str, np.ndarray],
     args: argparse.Namespace,
@@ -268,11 +266,16 @@ def _prepare_ir_for_demo(
     bbox_min = obj_pts.min(axis=0)
     bbox_max = obj_pts.max(axis=0)
     center_xy = 0.5 * (bbox_min[:2] + bbox_max[:2])
+    target_bottom_z = (
+        float(args.zebra_bottom_z)
+        if args.zebra_bottom_z is not None
+        else float(np.asarray(args.sand_bounds_lo, dtype=np.float32)[2])
+    )
     shift = np.array(
         [
             float(args.zebra_target_xy[0]) - float(center_xy[0]),
             float(args.zebra_target_xy[1]) - float(center_xy[1]),
-            float(args.zebra_bottom_z) - float(bbox_min[2]),
+            target_bottom_z - float(bbox_min[2]),
         ],
         dtype=np.float32,
     )
@@ -313,7 +316,7 @@ def _build_soft_model(
         ir_path=args.zebra_ir.resolve(),
         out_dir=args.out_dir.resolve(),
         output_prefix=args.prefix,
-        gravity=-float(args.gravity_mag),
+        gravity=-float(args.soft_gravity_mag),
         gravity_from_reverse_z=False,
         spring_ke_scale=1.0,
         spring_kd_scale=1.0,
@@ -333,18 +336,24 @@ def _build_soft_model(
     model = model_result.model
 
     n_obj = int(np.asarray(ir["num_object_points"]).ravel()[0])
+    ctrl_idx = np.asarray(ir["controller_idx"], dtype=np.int32).ravel()
     edges = np.asarray(ir["spring_edges"], dtype=np.int32)
     obj_edge_mask = (edges[:, 0] < n_obj) & (edges[:, 1] < n_obj)
-    render_edges = edges[obj_edge_mask][:: max(1, int(args.spring_edge_stride))].astype(np.int32, copy=True)
-    render_ids = np.arange(n_obj, dtype=np.int32)
+    obj_edges = edges[obj_edge_mask]
+    largest_ids = _largest_component_indices(obj_edges, n_obj)
+    render_ids = np.setdiff1d(largest_ids, ctrl_idx, assume_unique=False)
+    render_edge_mask = np.isin(obj_edges[:, 0], render_ids) & np.isin(obj_edges[:, 1], render_ids)
+    render_edges = obj_edges[render_edge_mask][:: max(1, int(args.spring_edge_stride))].astype(np.int32, copy=True)
     point_radius = np.maximum(
-        model_result.radius[:n_obj].astype(np.float32) * float(args.point_radius_vis_scale),
+        model_result.radius[render_ids].astype(np.float32) * float(args.point_radius_vis_scale),
         float(args.point_radius_vis_min),
     )
-    case_name = str(np.asarray(ir.get("case_name", np.array(["zebra"]))).ravel()[0])
+    case_dir = args.zebra_case_dir.resolve()
+    case_name = case_dir.name
     spec = SoftSpec(
         name="zebra",
         case_name=case_name,
+        case_dir=case_dir,
         ir_path=args.zebra_ir.resolve(),
         particle_count=n_obj,
         total_particle_count=model.particle_count,
@@ -498,15 +507,21 @@ def _apply_controller_targets(
     *,
     interpolate: bool,
 ) -> None:
-    target = newton_import_ir.interpolate_controller(
-        controller.traj_np,
-        frame,
-        substep,
-        substeps,
-        interpolate,
-    )
-    controller.target_wp.assign(target.astype(np.float32, copy=False))
-    controller.vel_wp.assign(controller.zero_vel_np)
+    last_frame = int(controller.traj_np.shape[0]) - 1
+    if frame >= last_frame:
+        target = controller.traj_np[last_frame]
+        controller.target_wp.assign(target.astype(np.float32, copy=False))
+        controller.vel_wp.assign(controller.zero_vel_np)
+    else:
+        target = newton_import_ir.interpolate_controller(
+            controller.traj_np,
+            frame,
+            substep,
+            substeps,
+            interpolate,
+        )
+        controller.target_wp.assign(target.astype(np.float32, copy=False))
+        controller.vel_wp.assign(controller.zero_vel_np)
     wp.launch(
         newton_import_ir._write_kinematic_state,
         dim=controller.indices_np.size,
@@ -554,7 +569,7 @@ def simulate(
         ir_path=args.zebra_ir.resolve(),
         out_dir=args.out_dir.resolve(),
         output_prefix=args.prefix,
-        gravity=-float(args.gravity_mag),
+        gravity=-float(args.soft_gravity_mag),
         gravity_from_reverse_z=False,
         spring_ke_scale=1.0,
         spring_kd_scale=1.0,
@@ -585,7 +600,7 @@ def simulate(
         search_radius = max(search_radius, float(getattr(newton_import_ir, "EPSILON", 1.0e-6)))
 
     frame_dt = float(args.sim_dt) * float(args.substeps)
-    max_frames = int(min(args.frames, controller.traj_np.shape[0]))
+    max_frames = int(args.frames)
     if max_frames < 2:
         raise ValueError(f"Need at least 2 frames, got {max_frames}")
 
@@ -619,12 +634,11 @@ def simulate(
 
             if spec.drag_damping > 0.0:
                 wp.launch(
-                    apply_drag_range,
+                    newton_import_ir._apply_drag_correction,
                     dim=spec.particle_count,
                     inputs=[
                         state_in.particle_q,
                         state_in.particle_qd,
-                        0,
                         spec.particle_count,
                         float(args.sim_dt),
                         float(spec.drag_damping),
@@ -633,9 +647,12 @@ def simulate(
                 )
 
         _update_proxy_from_soft_state(state_in, sand.proxy, frame_dt)
-        sand.solver.step(sand.state_0, sand.state_1, None, None, frame_dt)
-        sand.solver.project_outside(sand.state_1, sand.state_1, frame_dt)
-        sand.state_0, sand.state_1 = sand.state_1, sand.state_0
+        sand_substeps = max(1, int(args.sand_frame_substeps))
+        sand_dt = frame_dt / float(sand_substeps)
+        for _ in range(sand_substeps):
+            sand.solver.step(sand.state_0, sand.state_1, None, None, sand_dt)
+            sand.solver.project_outside(sand.state_1, sand.state_1, sand_dt)
+            sand.state_0, sand.state_1 = sand.state_1, sand.state_0
 
         soft_hist.append(state_in.particle_q.numpy().astype(np.float32))
         sand_hist.append(sand.state_0.particle_q.numpy().astype(np.float32))
@@ -734,7 +751,8 @@ def render_mp4(
             float(args.camera_yaw),
         )
 
-        zebra_count = int(meta.soft_spec.particle_count)
+        zebra_render_ids = np.asarray(meta.soft_spec.render_particle_ids_global, dtype=np.int32)
+        zebra_count = int(zebra_render_ids.shape[0])
         sand_points_wp = wp.empty(sim_data["sand_points_all"].shape[1], dtype=wp.vec3, device=device)
         sand_radii_wp = wp.array(sim_data["sand_point_radii"], dtype=wp.float32, device=device)
         sand_colors_wp = wp.array(sim_data["sand_point_colors"], dtype=wp.vec3, device=device)
@@ -760,7 +778,7 @@ def render_mp4(
         n_frames = int(sim_data["soft_particle_q_all"].shape[0])
         for frame_idx in range(n_frames):
             q_all = sim_data["soft_particle_q_all"][frame_idx].astype(np.float32, copy=False)
-            zebra_points_wp.assign(q_all[:zebra_count])
+            zebra_points_wp.assign(q_all[zebra_render_ids])
             sand_points_wp.assign(sim_data["sand_points_all"][frame_idx].astype(np.float32, copy=False))
 
             sim_t = float(frame_idx) * float(sim_data["frame_dt"])
@@ -848,9 +866,16 @@ def _write_outputs(
         "substeps": int(sim_data["substeps"]),
         "frame_dt": float(sim_data["frame_dt"]),
         "wall_time_sec": float(sim_data["wall_time_sec"]),
+        "soft_gravity_mag": float(args.soft_gravity_mag),
+        "zebra_bottom_z_effective": (
+            float(args.zebra_bottom_z)
+            if args.zebra_bottom_z is not None
+            else float(np.asarray(args.sand_bounds_lo, dtype=np.float32)[2])
+        ),
         "voxel_size": float(args.voxel_size),
         "particles_per_cell": int(args.particles_per_cell),
         "grid_type": str(args.grid_type),
+        "sand_frame_substeps": int(args.sand_frame_substeps),
         "sand_bounds_lo": [float(v) for v in np.asarray(args.sand_bounds_lo, dtype=np.float32)],
         "sand_bounds_hi": [float(v) for v in np.asarray(args.sand_bounds_hi, dtype=np.float32)],
         "controller_count": int(np.asarray(ir["controller_idx"]).size),
@@ -863,6 +888,9 @@ def main() -> int:
     args = parse_args()
     args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    args.zebra_case_dir = args.zebra_case_dir.resolve()
+    if not args.zebra_case_dir.exists():
+        raise FileNotFoundError(f"Missing zebra case dir: {args.zebra_case_dir}")
 
     wp.init()
     device = newton_import_ir.resolve_device(args.device)
@@ -871,9 +899,8 @@ def main() -> int:
     _resolve_timing(args, raw_ir)
     ir_demo, shift, reverse_z = _prepare_ir_for_demo(raw_ir, args)
 
+    print(f"Using zebra case dir: {args.zebra_case_dir}", flush=True)
     print(f"Using zebra IR: {args.zebra_ir.resolve()}", flush=True)
-    if "zebra_around_easy" not in str(args.zebra_ir):
-        print("NOTE: local zebra easy IR was not found; using the selected fallback IR path.", flush=True)
 
     model, spec, meta = _build_soft_model(ir_demo, args, device)
     spec.placement_shift = shift.astype(np.float32)
