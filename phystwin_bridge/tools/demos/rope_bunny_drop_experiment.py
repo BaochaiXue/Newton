@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -87,12 +88,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--screen-width", type=int, default=1920)
     p.add_argument("--screen-height", type=int, default=1080)
     p.add_argument("--viewer-headless", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--camera-pos", type=float, nargs=3, default=(4.5, -6.0, 2.6), metavar=("X", "Y", "Z"))
+    p.add_argument("--camera-pos", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"))
     p.add_argument("--camera-pitch", type=float, default=-8.0)
     p.add_argument("--camera-yaw", type=float, default=-42.0)
     p.add_argument("--camera-fov", type=float, default=55.0)
+    p.add_argument("--camera-distance-scale", type=float, default=1.35)
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
-    p.add_argument("--particle-radius-vis-min", type=float, default=0.02)
+    p.add_argument(
+        "--particle-radius-vis-min",
+        type=float,
+        default=0.004,
+        help="Visualization-only radius cap: render_radius = min(physical_radius * scale, this value).",
+    )
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--label-font-size", type=int, default=28)
     p.add_argument("--rope-line-width", type=float, default=0.01)
@@ -144,6 +151,39 @@ def quat_to_rotmat(q_xyzw: list[float] | tuple[float, float, float, float] | np.
         ],
         dtype=np.float32,
     )
+
+
+def _camera_position(target: np.ndarray, yaw_deg: float, pitch_deg: float, distance: float) -> np.ndarray:
+    yaw = math.radians(float(yaw_deg))
+    pitch = math.radians(float(pitch_deg))
+    front = np.array(
+        [
+            math.cos(yaw) * math.cos(pitch),
+            math.sin(yaw) * math.cos(pitch),
+            math.sin(pitch),
+        ],
+        dtype=np.float32,
+    )
+    front /= max(float(np.linalg.norm(front)), 1.0e-6)
+    return target.astype(np.float32) - front * float(distance)
+
+
+def _compute_camera_pose(sim_data: dict[str, Any], meta: dict[str, Any], args: argparse.Namespace) -> tuple[np.ndarray, float, float]:
+    rope_pts = sim_data["particle_q_object"].reshape(-1, 3)
+    bunny_body_pos = sim_data["body_q"][:, 0, :3]
+    mesh_local = np.asarray(meta["mesh_verts_local"], dtype=np.float32) * float(meta["mesh_scale"])
+    half_extent = np.max(np.abs(mesh_local), axis=0)
+
+    pts_min = np.minimum(rope_pts.min(axis=0), bunny_body_pos.min(axis=0) - half_extent)
+    pts_max = np.maximum(rope_pts.max(axis=0), bunny_body_pos.max(axis=0) + half_extent)
+    center = 0.5 * (pts_min + pts_max)
+    span = float(np.max(pts_max - pts_min))
+    distance = max(2.0, span * float(args.camera_distance_scale))
+
+    yaw = float(args.camera_yaw)
+    pitch = float(args.camera_pitch)
+    cam_pos = _camera_position(center, yaw, pitch, distance)
+    return cam_pos, pitch, yaw
 
 
 def _copy_object_only_ir(ir: dict[str, np.ndarray], args: argparse.Namespace) -> dict[str, Any]:
@@ -395,7 +435,7 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
 
     width = int(args.screen_width)
     height = int(args.screen_height)
-    fps_out = float(args.render_fps) / max(float(args.slowdown), 1.0e-6)
+    fps_out = float(args.render_fps)
     out_mp4 = args.out_dir / f"{args.prefix}_m{int(args.rigid_mass)}.mp4"
     cmd = [
         ffmpeg,
@@ -440,14 +480,20 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
             viewer.camera.fov = float(args.camera_fov)
         except Exception:
             pass
+        if args.camera_pos is None:
+            cam_pos, cam_pitch, cam_yaw = _compute_camera_pose(sim_data, meta, args)
+        else:
+            cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
+            cam_pitch = float(args.camera_pitch)
+            cam_yaw = float(args.camera_yaw)
         viewer.set_camera(
-            wp.vec3(float(args.camera_pos[0]), float(args.camera_pos[1]), float(args.camera_pos[2])),
-            float(args.camera_pitch),
-            float(args.camera_yaw),
+            wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])),
+            float(cam_pitch),
+            float(cam_yaw),
         )
 
         radii = model.particle_radius.numpy().astype(np.float32, copy=False)
-        radii = np.maximum(radii * float(args.particle_radius_vis_scale), float(args.particle_radius_vis_min))
+        radii = np.minimum(radii * float(args.particle_radius_vis_scale), float(args.particle_radius_vis_min))
         model.particle_radius.assign(radii)
 
         try:
@@ -474,16 +520,27 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
             state.body_qd.zero_()
 
         ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        n_frames = int(sim_data["particle_q_all"].shape[0])
-        for f in range(n_frames):
-            state.particle_q.assign(sim_data["particle_q_all"][f].astype(np.float32, copy=False))
-            state.body_q.assign(sim_data["body_q"][f].astype(np.float32, copy=False))
+        n_sim_frames = int(sim_data["particle_q_all"].shape[0])
+        sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+        sim_duration = max(float(n_sim_frames - 1) * sim_frame_dt, 0.0)
+        video_duration = sim_duration * max(float(args.slowdown), 1.0e-6)
+        n_out_frames = max(1, int(round(video_duration * fps_out)))
+        if n_out_frames == 1 or sim_duration <= 0.0:
+            render_indices = np.zeros((1,), dtype=np.int32)
+        else:
+            sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
+            render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
 
-            viewer.begin_frame(float(f) * float(sim_data["sim_dt"]) * float(sim_data["substeps"]))
+        for out_idx, sim_idx in enumerate(render_indices):
+            state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
+            state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
+
+            sim_t = float(sim_idx) * sim_frame_dt
+            viewer.begin_frame(sim_t)
             viewer.log_state(state)
 
             if rope_edges.size and starts_wp is not None and ends_wp is not None:
-                q_obj = sim_data["particle_q_object"][f]
+                q_obj = sim_data["particle_q_object"][sim_idx]
                 starts_wp.assign(q_obj[rope_edges[:, 0]].astype(np.float32, copy=False))
                 ends_wp.assign(q_obj[rope_edges[:, 1]].astype(np.float32, copy=False))
                 viewer.log_lines(
@@ -498,12 +555,11 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
             viewer.end_frame()
             frame = viewer.get_frame(render_ui=False).numpy()
             if args.overlay_label:
-                sim_t = float(f) * float(sim_data["sim_dt"]) * float(sim_data["substeps"])
                 frame = overlay_text_lines_rgb(
                     frame,
                     [
                         f"SLOW MOTION {float(args.slowdown):.1f}x",
-                        f"frame {f + 1:03d}/{n_frames:03d}  t={sim_t:.3f}s",
+                        f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
                     ],
                     font_size=int(args.label_font_size),
                 )
@@ -554,6 +610,11 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
 
 def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: dict[str, Any], meta: dict[str, Any], n_obj: int, out_mp4: Path) -> dict[str, Any]:
     body_speed = np.linalg.norm(sim_data["body_vel"][:, 0, :], axis=1)
+    auto_cam_pos, auto_cam_pitch, auto_cam_yaw = _compute_camera_pose(sim_data, meta, args)
+    sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+    sim_duration = max((sim_data["particle_q_all"].shape[0] - 1) * sim_frame_dt, 0.0)
+    video_duration = sim_duration * float(args.slowdown)
+    rendered_frame_count = max(1, int(round(video_duration * float(args.render_fps))))
     return {
         "experiment": "rope_bunny_drop_object_only",
         "ir_path": str(args.ir.resolve()),
@@ -572,17 +633,28 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "frames": int(args.frames),
         "sim_dt": float(sim_data["sim_dt"]),
         "substeps": int(sim_data["substeps"]),
+        "frame_dt": float(sim_frame_dt),
+        "sim_duration_sec": float(sim_duration),
         "wall_time_sec": float(sim_data["wall_time"]),
         "slowdown_factor": float(args.slowdown),
+        "render_fps": float(args.render_fps),
+        "rendered_frame_count": int(rendered_frame_count),
+        "video_duration_target_sec": float(video_duration),
         "body_speed_initial": float(body_speed[0]),
         "body_speed_final": float(body_speed[-1]),
         "body_speed_max": float(np.max(body_speed)),
         "apply_drag": bool(args.apply_drag),
         "drag_damping_scale": float(args.drag_damping_scale),
-        "camera_pos": [float(v) for v in args.camera_pos],
-        "camera_pitch": float(args.camera_pitch),
-        "camera_yaw": float(args.camera_yaw),
+        "camera_pos": (
+            [float(v) for v in args.camera_pos]
+            if args.camera_pos is not None
+            else [float(v) for v in auto_cam_pos]
+        ),
+        "camera_pitch": float(args.camera_pitch if args.camera_pos is not None else auto_cam_pitch),
+        "camera_yaw": float(args.camera_yaw if args.camera_pos is not None else auto_cam_yaw),
         "camera_fov": float(args.camera_fov),
+        "camera_distance_scale": float(args.camera_distance_scale),
+        "camera_mode": "manual" if args.camera_pos is not None else "auto_framed",
         "render_video": str(out_mp4),
     }
 
