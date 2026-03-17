@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     )
     soft_group.add_argument("--spring-edge-stride", type=int, default=16)
     soft_group.add_argument("--point-radius-vis-scale", type=float, default=2.0)
-    soft_group.add_argument("--point-radius-vis-min", type=float, default=0.008)
+    soft_group.add_argument("--point-radius-vis-min", type=float, default=0.005)
     soft_group.add_argument(
         "--render-soft-springs", action=argparse.BooleanOptionalAction, default=False
     )
@@ -472,7 +472,7 @@ def _build_soft_model(
     render_edges = obj_edges[render_edge_mask][
         :: max(1, int(args.spring_edge_stride))
     ].astype(np.int32, copy=True)
-    point_radius = np.maximum(
+    point_radius = np.minimum(
         model_result.radius[render_ids].astype(np.float32)
         * float(args.point_radius_vis_scale),
         float(args.point_radius_vis_min),
