@@ -115,6 +115,8 @@ class SimConfig:
     object_contact_radius: float | None = None
     particle_contact_ke: float | None = None
     particle_contact_kf_scale: float = 1.0
+    shape_contact_scale: float | None = None
+    shape_contact_damping_multiplier: float = 1.0
 
     # Controls
     interpolate_controls: bool = True
@@ -186,6 +188,8 @@ class SimConfig:
             object_contact_radius=args.object_contact_radius,
             particle_contact_ke=args.particle_contact_ke,
             particle_contact_kf_scale=args.particle_contact_kf_scale,
+            shape_contact_scale=args.shape_contact_scale,
+            shape_contact_damping_multiplier=args.shape_contact_damping_multiplier,
             interpolate_controls=args.interpolate_controls,
             strict_physics_checks=args.strict_physics_checks,
             apply_drag=args.apply_drag,
@@ -353,6 +357,26 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Scales Newton particle tangential friction stiffness: particle_kf = "
             "particle_contact_kf_scale * particle_kd."
+        ),
+    )
+    p.add_argument(
+        "--shape-contact-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale factor applied to the actual particle-shape contact chain used by "
+            "SemiImplicit: model.soft_contact_ke and model.shape_material_ke. "
+            "Use together with low-mass experiments when trying to preserve baseline contact behavior."
+        ),
+    )
+    p.add_argument(
+        "--shape-contact-damping-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Extra multiplier applied on top of --shape-contact-scale for kd/kf terms in the "
+            "particle-shape contact chain. Values >1 are useful when minimizing rollout RMSE under "
+            "discrete penalty contact."
         ),
     )
 
@@ -609,6 +633,15 @@ def _validate_config_ranges(cfg: SimConfig) -> None:
     if cfg.particle_contact_ke is not None and cfg.particle_contact_ke <= 0.0:
         raise ValueError(
             f"--particle-contact-ke must be > 0 when provided, got {cfg.particle_contact_ke}"
+        )
+    if cfg.shape_contact_scale is not None and cfg.shape_contact_scale <= 0.0:
+        raise ValueError(
+            f"--shape-contact-scale must be > 0 when provided, got {cfg.shape_contact_scale}"
+        )
+    if cfg.shape_contact_damping_multiplier <= 0.0:
+        raise ValueError(
+            "--shape-contact-damping-multiplier must be > 0, "
+            f"got {cfg.shape_contact_damping_multiplier}"
         )
     if cfg.rigid_probe:
         if cfg.rigid_probe_object_mass <= 0.0:
@@ -1091,6 +1124,53 @@ def _apply_ps_object_collision_mapping(
     return True
 
 
+def _apply_shape_contact_scaling(
+    model: newton.Model, cfg: SimConfig, checks: dict
+) -> None:
+    """Scale the actual particle-shape soft-contact chain used by SemiImplicit.
+
+    Newton's particle-vs-shape kernel does not read ``model.particle_ke/kd/kf``.
+    Instead it averages:
+    - ``model.soft_contact_ke/kd/kf``
+    - ``model.shape_material_ke/kd/kf``
+
+    Therefore low-mass experiments that aim to preserve the original contact
+    regime must scale this chain explicitly.
+    """
+    if cfg.shape_contact_scale is None:
+        checks["shape_contact_scale_applied"] = False
+        return
+
+    alpha = float(cfg.shape_contact_scale)
+    damping_mult = float(cfg.shape_contact_damping_multiplier)
+
+    checks["shape_contact_scale_applied"] = True
+    checks["shape_contact_scale"] = alpha
+    checks["shape_contact_damping_multiplier"] = damping_mult
+
+    checks["soft_contact_ke_before"] = float(model.soft_contact_ke)
+    checks["soft_contact_kd_before"] = float(model.soft_contact_kd)
+    checks["soft_contact_kf_before"] = float(model.soft_contact_kf)
+
+    model.soft_contact_ke = float(model.soft_contact_ke * alpha)
+    model.soft_contact_kd = float(model.soft_contact_kd * alpha * damping_mult)
+    model.soft_contact_kf = float(model.soft_contact_kf * alpha * damping_mult)
+
+    checks["soft_contact_ke_after"] = float(model.soft_contact_ke)
+    checks["soft_contact_kd_after"] = float(model.soft_contact_kd)
+    checks["soft_contact_kf_after"] = float(model.soft_contact_kf)
+
+    for arr_name in ("shape_material_ke", "shape_material_kd", "shape_material_kf"):
+        arr = getattr(model, arr_name)
+        vals = arr.numpy().astype(np.float32, copy=False).copy()
+        checks[f"{arr_name}_before_mean"] = float(np.mean(vals)) if vals.size else None
+        vals *= np.float32(alpha)
+        if arr_name != "shape_material_ke":
+            vals *= np.float32(damping_mult)
+        arr.assign(vals)
+        checks[f"{arr_name}_after_mean"] = float(np.mean(vals)) if vals.size else None
+
+
 def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     """Build a complete Newton Model from IR data.
 
@@ -1129,6 +1209,7 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
 
     # Optional mapping from PhysTwin object-collision params to Newton particle-contact params.
     object_collision_mapped = _apply_ps_object_collision_mapping(model, ir, cfg, checks)
+    _apply_shape_contact_scaling(model, cfg, checks)
 
     # Particle friction fallback/override.
     if cfg.particle_mu_override is not None:

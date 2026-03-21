@@ -145,6 +145,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Pass-through to importer: override object particle contact radius.",
     )
+    parser.add_argument(
+        "--shape-contact-scale",
+        type=float,
+        default=None,
+        help=(
+            "Pass-through to importer: scale the actual SemiImplicit particle-shape contact chain "
+            "(model.soft_contact_* and model.shape_material_*)."
+        ),
+    )
+    parser.add_argument(
+        "--shape-contact-damping-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Pass-through to importer: extra multiplier applied on top of "
+            "--shape-contact-scale for kd/kf terms in the particle-shape contact chain."
+        ),
+    )
 
     # ── Controls ──
     parser.add_argument(
@@ -475,11 +493,14 @@ def _build_importer_cmd(
         "--ground-restitution-scale", str(args.ground_restitution_scale),
         "--ground-restitution-mode", str(args.ground_restitution_mode),
         "--drag-damping-scale", str(args.drag_damping_scale),
+        "--shape-contact-damping-multiplier", str(args.shape_contact_damping_multiplier),
     ]
     if args.particle_contact_ke is not None:
         cmd.extend(["--particle-contact-ke", str(args.particle_contact_ke)])
     if args.object_contact_radius is not None:
         cmd.extend(["--object-contact-radius", str(args.object_contact_radius)])
+    if args.shape_contact_scale is not None:
+        cmd.extend(["--shape-contact-scale", str(args.shape_contact_scale)])
     if args.substeps_per_frame is not None:
         cmd.extend(["--substeps-per-frame", str(args.substeps_per_frame)])
     if args.sim_dt is not None:
