@@ -1,5 +1,11 @@
 # Newton Development Guidelines
 
+## Workspace write policy
+
+- `Newton/newton/` is strictly read-only in this workspace.
+- Agents and sub-agents must not modify files inside this tree.
+- If work seems to require a Newton core change, stop and ask for a bridge-layer or external workaround instead of editing core code.
+
 - `newton/_src/` is internal. Examples and docs must not import from `newton._src`. Expose user-facing symbols via public modules (`newton/geometry.py`, `newton/solvers.py`, etc.).
 - Breaking changes require a deprecation first. Do not remove or rename public API symbols without deprecating them in a prior release.
 - Prefix-first naming for autocomplete: `ActuatorPD` (not `PDActuator`), `add_shape_sphere()` (not `add_sphere_shape()`).
