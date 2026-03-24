@@ -16,13 +16,13 @@ Usage examples
 --------------
 
 Stable OFF playground (recommended):
-    python cloth_bunny_interactive_playground.py --viewer gl
+    python demo_cloth_bunny_realtime_playground.py --viewer gl
 
 Quick validation without opening a window:
-    python cloth_bunny_interactive_playground.py --viewer null --num-frames 5
+    python demo_cloth_bunny_realtime_playground.py --viewer null --num-frames 5
 
 Experimental ON playground:
-    python cloth_bunny_interactive_playground.py --mode on --viewer gl
+    python demo_cloth_bunny_realtime_playground.py --mode on --viewer gl
 """
 
 from __future__ import annotations
@@ -58,8 +58,8 @@ WORKSPACE_ROOT = THIS_DIR.parents[2]
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-import cloth_bunny_drop_experiment_off_case as off_case
-import cloth_bunny_drop_experiment_on_case as on_case
+import demo_cloth_bunny_drop_without_self_contact as off_case
+import demo_cloth_bunny_drop_with_self_contact as on_case
 
 
 DEFAULT_IR = WORKSPACE_ROOT / "Newton/phystwin_bridge/ir/blue_cloth_double_lift_around/phystwin_ir_v2_bf_strict.npz"

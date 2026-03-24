@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_common import (
+from demo_shared import (
     CORE_DIR,
     alpha_shape_surface_mesh,
     camera_position,

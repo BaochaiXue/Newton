@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_common import (
+from demo_shared import (
     CORE_DIR,
     add_dense_particle_forces,
     alpha_shape_surface_mesh,
@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     )
     io_group.add_argument("--sloth-ir", type=Path, default=_default_sloth_ir())
     io_group.add_argument("--out-dir", type=Path, required=True)
-    io_group.add_argument("--prefix", default="exp1_sand_two_way_mpm")
+    io_group.add_argument("--prefix", default="demo_sloth_sand_two_way_mpm")
     io_group.add_argument("--device", default=path_defaults.default_device())
 
     sim_group = p.add_argument_group("simulation")
@@ -1407,7 +1407,7 @@ def _write_outputs(args: argparse.Namespace, ir: dict[str, Any], sim_data: dict[
         wall_time_sec=np.float32(sim_data["wall_time_sec"]),
     )
     summary = {
-        "experiment": "exp1_sand_two_way_mpm",
+        "experiment": "demo_sloth_sand_two_way_mpm",
         "sloth_ir": str(args.sloth_ir.resolve()),
         "case_name": str(np.asarray(ir.get("case_name", np.array(["unknown"]))).ravel()[0]),
         "frames": int(sim_data["soft_particle_q_all"].shape[0]),

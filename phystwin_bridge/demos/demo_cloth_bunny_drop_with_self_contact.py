@@ -22,7 +22,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from rope_bunny_drop_experiment import (
+from demo_rope_bunny_drop import (
     _apply_drag_correction_ignore_axis,
     load_bunny_mesh,
     newton,

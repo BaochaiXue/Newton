@@ -31,7 +31,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_common import CORE_DIR, load_core_module, overlay_text_lines_rgb
+from demo_shared import CORE_DIR, load_core_module, overlay_text_lines_rgb
 
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
