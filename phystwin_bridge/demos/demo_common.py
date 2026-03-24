@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-BRIDGE_ROOT = Path(__file__).resolve().parents[2]
+BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 CORE_DIR = BRIDGE_ROOT / "tools" / "core"
 
 

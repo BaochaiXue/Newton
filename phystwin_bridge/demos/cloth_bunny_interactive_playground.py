@@ -54,7 +54,7 @@ from newton._src.solvers.semi_implicit.kernels_particle import (
 
 
 THIS_DIR = Path(__file__).resolve().parent
-WORKSPACE_ROOT = THIS_DIR.parents[3]
+WORKSPACE_ROOT = THIS_DIR.parents[2]
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
