@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Softbody Hanging
@@ -31,9 +19,9 @@ import newton.examples
 
 
 class Example:
-    def __init__(self, viewer, args=None, solver_type: str = "vbd"):
+    def __init__(self, viewer, args):
         self.viewer = viewer
-        self.solver_type = solver_type
+        self.solver_type = args.solver
         self.sim_time = 0.0
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -141,7 +129,7 @@ class Example:
         newton.examples.test_particle_state(
             self.state_0,
             "particles are within a reasonable volume",
-            lambda q, _qd: newton.utils.vec_inside_limits(q, p_lower, p_upper),
+            lambda q, _qd: newton.math.vec_inside_limits(q, p_lower, p_upper),
         )
 
     def render(self):
@@ -150,28 +138,21 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--solver",
+            help="Type of solver (only 'vbd' supports volumetric soft bodies)",
+            type=str,
+            choices=["vbd"],
+            default="vbd",
+        )
+        return parser
+
 
 if __name__ == "__main__":
-    # Create parser with base arguments
-    parser = newton.examples.create_parser()
-
-    # Add solver-specific arguments
-    parser.add_argument(
-        "--solver",
-        help="Type of solver (only 'vbd' supports volumetric soft bodies)",
-        type=str,
-        choices=["vbd"],
-        default="vbd",
-    )
-
-    # Parse arguments and initialize viewer
+    parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
-
-    # Create example and run
-    example = Example(
-        viewer=viewer,
-        args=args,
-        solver_type=args.solver,
-    )
-
+    example = Example(viewer, args)
     newton.examples.run(example, args)

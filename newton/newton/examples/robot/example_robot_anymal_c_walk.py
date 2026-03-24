@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Robot ANYmal C Walk
@@ -25,8 +13,6 @@
 
 import torch
 import warp as wp
-
-wp.config.enable_backward = False
 
 import newton
 import newton.examples
@@ -74,7 +60,7 @@ def compute_obs(actions, state: State, joint_pos_initial, device, indices, gravi
 
 
 class Example:
-    def __init__(self, viewer, args=None):
+    def __init__(self, viewer, args):
         self.viewer = viewer
         self.device = wp.get_device()
         self.torch_device = wp.device_to_torch(self.device)
@@ -172,8 +158,7 @@ class Example:
             builder.joint_target_kd[i] = 5
 
         self.model = builder.finalize()
-
-        use_mujoco_contacts = args.use_mujoco_contacts if args else False
+        use_mujoco_contacts = getattr(args, "use_mujoco_contacts", False)
 
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
@@ -350,10 +335,16 @@ class Example:
             indices=[0],
         )
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        newton.examples.add_mujoco_contacts_arg(parser)
+        return parser
+
 
 if __name__ == "__main__":
-    # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = Example.create_parser()
+    viewer, args = newton.examples.init(parser)
 
     example = Example(viewer, args)
 

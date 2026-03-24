@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import ctypes
 import io
@@ -372,7 +360,7 @@ class MeshGL:
             if self.texture_id is not None:
                 gl.glBindTexture(gl.GL_TEXTURE_2D, self.texture_id)
             else:
-                gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
 
             gl.glBindVertexArray(self.vao)
             gl.glDrawElements(gl.GL_TRIANGLES, self.num_indices, gl.GL_UNSIGNED_INT, None)
@@ -868,7 +856,7 @@ class MeshInstancerGL:
         if self.mesh.texture_id is not None:
             gl.glBindTexture(gl.GL_TEXTURE_2D, self.mesh.texture_id)
         else:
-            gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
 
         gl.glBindVertexArray(self.vao)
         gl.glDrawElementsInstanced(
@@ -879,6 +867,7 @@ class MeshInstancerGL:
 
 class RendererGL:
     gl = None  # Class-level variable to hold the imported module
+    _fallback_texture = None  # 1x1 white texture bound when no albedo is set (suppresses macOS GL warning)
 
     @classmethod
     def initialize_gl(cls):
@@ -886,6 +875,22 @@ class RendererGL:
             from pyglet import gl
 
             cls.gl = gl
+
+    @classmethod
+    def get_fallback_texture(cls):
+        """Return a 1x1 white RGBA texture, creating it on first use."""
+        if cls._fallback_texture is None:
+            gl = cls.gl
+            tex = gl.GLuint()
+            gl.glGenTextures(1, tex)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, tex)
+            pixel = (gl.GLubyte * 4)(255, 255, 255, 255)
+            gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, 1, 1, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, pixel)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+            gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+            cls._fallback_texture = tex
+        return cls._fallback_texture
 
     def __init__(self, title="Newton", screen_width=1920, screen_height=1080, vsync=True, headless=None, device=None):
         self.draw_sky = True
@@ -897,6 +902,32 @@ class RendererGL:
 
         self.sky_upper = self.background_color
         self.sky_lower = (40.0 / 255.0, 44.0 / 255.0, 55.0 / 255.0)
+
+        # Lighting settings
+        self._shadow_radius = 3.0
+        self._diffuse_scale = 1.0
+        self._specular_scale = 1.0
+        self.spotlight_enabled = True
+        self._shadow_extents = 10.0
+        self._exposure = 1.6
+
+        # Hemispherical ambient light colors, interpolated by dot(N, up).
+        # Decoupled from the sky background so the visible sky can be a
+        # saturated blue while the ambient fill stays neutral — a stand-in
+        # for a proper irradiance map that we don't precompute yet.
+        self.ambient_sky = (0.8, 0.8, 0.85)
+        self.ambient_ground = (0.3, 0.3, 0.35)
+
+        # On Wayland, PyOpenGL defaults to EGL which cannot see the GLX context
+        # that pyglet creates via XWayland. Force GLX so both libraries agree.
+        # Must be set before PyOpenGL is first imported (platform is selected
+        # once at import time).
+        if "PYOPENGL_PLATFORM" not in os.environ:
+            # WAYLAND_DISPLAY is the primary indicator; XDG_SESSION_TYPE is
+            # checked as a fallback for sessions where the socket is not yet set.
+            is_wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or os.environ.get("XDG_SESSION_TYPE") == "wayland"
+            if is_wayland:
+                os.environ["PYOPENGL_PLATFORM"] = "glx"
 
         try:
             import pyglet
@@ -990,8 +1021,7 @@ class RendererGL:
         self._frame_fbo = None
         self._frame_pbo = None
 
-        self._sun_direction = np.array((0.2, -0.3, 0.8))
-        self._sun_direction /= np.linalg.norm(self._sun_direction)
+        self._sun_direction = None  # set on first render based on camera up_axis
 
         self._light_color = (1.0, 1.0, 1.0)
 
@@ -1027,6 +1057,46 @@ class RendererGL:
         if not headless:
             self._setup_window_callbacks()
 
+    @property
+    def shadow_radius(self) -> float:
+        return self._shadow_radius
+
+    @shadow_radius.setter
+    def shadow_radius(self, value: float):
+        self._shadow_radius = max(float(value), 0.0)
+
+    @property
+    def diffuse_scale(self) -> float:
+        return self._diffuse_scale
+
+    @diffuse_scale.setter
+    def diffuse_scale(self, value: float):
+        self._diffuse_scale = max(float(value), 0.0)
+
+    @property
+    def specular_scale(self) -> float:
+        return self._specular_scale
+
+    @specular_scale.setter
+    def specular_scale(self, value: float):
+        self._specular_scale = max(float(value), 0.0)
+
+    @property
+    def shadow_extents(self) -> float:
+        return self._shadow_extents
+
+    @shadow_extents.setter
+    def shadow_extents(self, value: float):
+        self._shadow_extents = max(float(value), 1e-4)
+
+    @property
+    def exposure(self) -> float:
+        return self._exposure
+
+    @exposure.setter
+    def exposure(self, value: float):
+        self._exposure = max(float(value), 0.0)
+
     def update(self):
         self._make_current()
 
@@ -1054,6 +1124,16 @@ class RendererGL:
         gl.glDepthRange(0.0, 1.0)
 
         self.camera = camera
+
+        # Lazy-init sun direction based on camera up axis
+        if self._sun_direction is None:
+            _sun_dirs = {
+                0: np.array((0.8, 0.2, -0.3)),  # X-up
+                1: np.array((0.2, 0.8, -0.3)),  # Y-up
+                2: np.array((0.2, -0.3, 0.8)),  # Z-up
+            }
+            d = _sun_dirs.get(camera.up_axis, _sun_dirs[2])
+            self._sun_direction = d / np.linalg.norm(d)
 
         # Store matrices for other methods
         self._view_matrix = self.camera.get_view_matrix()
@@ -1186,6 +1266,7 @@ class RendererGL:
             self.app.event_loop.dispatch_event("on_exit")
             self.app.platform_event_loop.stop()
 
+        RendererGL._fallback_texture = None
         self.window.close()
 
     def _setup_window_callbacks(self):
@@ -1604,7 +1685,7 @@ class RendererGL:
 
         self._make_current()
 
-        extents = 10.0
+        extents = self.shadow_extents
 
         light_near = 1.0
         light_far = 1000.0
@@ -1617,9 +1698,10 @@ class RendererGL:
 
         self._shadow_shader.update(self._light_space_matrix)
 
-        # render from light's point of view
+        # render from light's point of view (skip objects that don't cast shadows)
+        shadow_objects = {k: v for k, v in objects.items() if getattr(v, "cast_shadow", True)}
         with self._shadow_shader:
-            self._draw_objects(objects)
+            self._draw_objects(shadow_objects)
 
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
 
@@ -1645,10 +1727,16 @@ class RendererGL:
             shadow_texture=self._shadow_texture,
             light_space_matrix=self._light_space_matrix,
             light_color=self._light_color,
-            sky_color=self.sky_upper,
-            ground_color=self.sky_lower,
+            sky_color=self.ambient_sky,
+            ground_color=self.ambient_ground,
             env_texture=self._env_texture,
             env_intensity=self._env_intensity,
+            shadow_radius=self.shadow_radius,
+            diffuse_scale=self.diffuse_scale,
+            specular_scale=self.specular_scale,
+            spotlight_enabled=self.spotlight_enabled,
+            shadow_extents=self.shadow_extents,
+            exposure=self.exposure,
         )
 
         with self._shape_shader:
@@ -1690,6 +1778,7 @@ class RendererGL:
             sky_upper=self.sky_upper,
             sky_lower=self.sky_lower,
             sun_direction=self._sun_direction,
+            up_axis=self.camera.up_axis,
         )
 
         gl.glBindVertexArray(self._sky_vao)

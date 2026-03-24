@@ -1,34 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import os
 import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, cast, overload
+from typing import cast, overload
 
 import numpy as np
 import warp as wp
 
 from ..geometry.types import Mesh
-
-try:
-    DeviceLike = wp.DeviceLike
-except AttributeError:  # warp<1.10 compatibility
-    DeviceLike = Any
 
 
 @wp.kernel
@@ -65,7 +48,7 @@ def compute_vertex_normals(
     indices: wp.array | np.ndarray,
     normals: wp.array | None = None,
     *,
-    device: DeviceLike = None,
+    device: wp.DeviceLike = None,
     normalize: bool = True,
 ) -> wp.array: ...
 
@@ -76,7 +59,7 @@ def compute_vertex_normals(
     indices: np.ndarray,
     normals: np.ndarray | None = None,
     *,
-    device: DeviceLike = None,
+    device: wp.DeviceLike = None,
     normalize: bool = True,
 ) -> np.ndarray: ...
 
@@ -86,7 +69,7 @@ def compute_vertex_normals(
     indices: wp.array | np.ndarray,
     normals: wp.array | np.ndarray | None = None,
     *,
-    device: DeviceLike = None,
+    device: wp.DeviceLike = None,
     normalize: bool = True,
 ) -> wp.array | np.ndarray:
     """Compute per-vertex normals from triangle indices.

@@ -1,18 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 
 ###########################################################################
 # Example Diffsim Spring Cage
@@ -54,7 +41,7 @@ def apply_gradient_kernel(
 
 
 class Example:
-    def __init__(self, viewer, verbose=False):
+    def __init__(self, viewer, args):
         # setup simulation parameters first
         self.fps = 30
         self.frame = 0
@@ -63,7 +50,7 @@ class Example:
         self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        self.verbose = verbose
+        self.verbose = args.verbose
 
         # setup training parameters
         self.train_iter = 0
@@ -231,6 +218,11 @@ class Example:
         self.train_iter += 1
 
     def render(self):
+        if self.viewer.is_paused():
+            self.viewer.begin_frame(self.viewer.time)
+            self.viewer.end_frame()
+            return
+
         # for interactive viewing, we just render the final state at every frame
         if isinstance(self.viewer, newton.viewer.ViewerGL):
             start_frame = self.sim_steps
@@ -280,19 +272,20 @@ class Example:
 
             self.frame += 1
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--verbose", action="store_true", help="Print out additional status messages during execution."
+        )
+        return parser
+
 
 if __name__ == "__main__":
-    # Create parser that inherits common arguments and adds example-specific ones
-    parser = newton.examples.create_parser()
-    parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
-
-    # Parse arguments and initialize viewer
+    parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
     if isinstance(viewer, newton.viewer.ViewerGL):
         viewer.show_particles = True
 
-    # Create example
-    example = Example(viewer, verbose=args.verbose)
-
-    # Run example
+    example = Example(viewer, args)
     newton.examples.run(example, args)

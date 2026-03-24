@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import warp as wp
 
@@ -50,6 +38,20 @@ class SolverSemiImplicit(SolverBase):
 
     See: https://en.wikipedia.org/wiki/Semi-implicit_Euler_method
 
+    Joint limitations:
+        - Supported joint types: PRISMATIC, REVOLUTE, BALL, FIXED, FREE, DISTANCE (treated as FREE), D6.
+          CABLE joints are not supported.
+        - :attr:`~newton.Model.joint_enabled`, :attr:`~newton.Model.joint_limit_ke`/:attr:`~newton.Model.joint_limit_kd`,
+          :attr:`~newton.Model.joint_target_ke`/:attr:`~newton.Model.joint_target_kd`, and :attr:`~newton.Control.joint_f`
+          are supported.
+        - Joint limits and targets are not enforced for BALL joints.
+        - :attr:`~newton.Model.joint_armature`, :attr:`~newton.Model.joint_friction`,
+          :attr:`~newton.Model.joint_effort_limit`, :attr:`~newton.Model.joint_velocity_limit`,
+          and :attr:`~newton.Model.joint_target_mode` are not supported.
+        - Equality and mimic constraints are not supported.
+
+        See :ref:`Joint feature support` for the full comparison across solvers.
+
     Example
     -------
 
@@ -75,12 +77,12 @@ class SolverSemiImplicit(SolverBase):
     ):
         """
         Args:
-            model (Model): the model to be simulated.
-            angular_damping (float, optional): Angular damping factor to be used in rigid body integration. Defaults to 0.05.
-            friction_smoothing (float, optional): Huber norm delta used for friction velocity normalization (see :func:`warp.math.norm_huber`). Defaults to 1.0.
-            joint_attach_ke (float, optional): Joint attachment spring stiffness. Defaults to 1.0e4.
-            joint_attach_kd (float, optional): Joint attachment spring damping. Defaults to 1.0e2.
-            enable_tri_contact (bool, optional): Enable triangle contact. Defaults to True.
+            model: The model to be simulated.
+            angular_damping: Angular damping factor to be used in rigid body integration. Defaults to 0.05.
+            friction_smoothing: Huber norm delta used for friction velocity normalization (see :func:`warp.math.norm_huber`). Defaults to 1.0.
+            joint_attach_ke: Joint attachment spring stiffness. Defaults to 1.0e4.
+            joint_attach_kd: Joint attachment spring damping. Defaults to 1.0e2.
+            enable_tri_contact: Enable triangle contact. Defaults to True.
         """
         super().__init__(model=model)
         self.angular_damping = angular_damping
@@ -97,7 +99,7 @@ class SolverSemiImplicit(SolverBase):
         control: Control | None,
         contacts: Contacts | None,
         dt: float,
-    ):
+    ) -> None:
         """
         Simulate the model for a given time step using the given control input.
 

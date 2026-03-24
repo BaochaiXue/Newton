@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
 from math import sqrt
@@ -2051,9 +2039,9 @@ class TestBroadPhase(unittest.TestCase):
         """Test SAP edge cases with tile sort."""
         self._test_sap_edge_cases_impl("tile")
 
-    def test_per_shape_contact_margin_broad_phase(self):
+    def test_per_shape_gap_broad_phase(self):
         """
-        Test that all broad phase modes correctly handle per-shape contact margins
+        Test that all broad phase modes correctly handle per-shape contact gaps
         by applying them during AABB overlap checks (not pre-expanded).
 
         Setup two spheres (A and B) at different separations from a ground plane:
@@ -2089,7 +2077,7 @@ class TestBroadPhase(unittest.TestCase):
         # - Ground AABB becomes [-0.01, 0.01] in z
         # - Sphere A AABB becomes [0.04-0.02, 0.44+0.02] = [0.02, 0.46] - does NOT overlap ground
         # - Sphere B AABB becomes [0.04-0.06, 0.44+0.06] = [-0.02, 0.50] - DOES overlap ground
-        shape_contact_margin = wp.array([0.01, 0.02, 0.06], dtype=wp.float32)
+        shape_gap = wp.array([0.01, 0.02, 0.06], dtype=wp.float32)
 
         # Use collision group 1 for all shapes (group -1 collides with everything, group 0 means no collision)
         collision_group = wp.array([1, 1, 1], dtype=wp.int32)
@@ -2103,7 +2091,7 @@ class TestBroadPhase(unittest.TestCase):
         nxn_bp.launch(
             aabb_lower,
             aabb_upper,
-            shape_contact_margin,
+            shape_gap,
             collision_group,
             shape_world,
             3,
@@ -2130,7 +2118,7 @@ class TestBroadPhase(unittest.TestCase):
         sap_bp.launch(
             aabb_lower,
             aabb_upper,
-            shape_contact_margin,
+            shape_gap,
             collision_group,
             shape_world,
             3,

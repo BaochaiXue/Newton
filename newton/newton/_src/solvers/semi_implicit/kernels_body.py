@@ -1,26 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
 import warp as wp
 
-from ...core import (
-    quat_decompose,
-    quat_twist,
-)
+from ...math import quat_decompose
 from ...sim import (
     Control,
     JointType,
@@ -212,7 +197,7 @@ def eval_body_joints(
         axis_c = wp.transform_vector(X_wc, axis)
 
         # swing twist decomposition
-        twist = quat_twist(axis, r_err)
+        twist = wp.quat_twist(axis, r_err)
 
         q = wp.acos(twist[3]) * 2.0 * wp.sign(wp.dot(axis, wp.vec3(twist[0], twist[1], twist[2])))
         qd = wp.dot(w_err, axis_p)
@@ -343,7 +328,7 @@ def eval_body_joints(
             axis_c = wp.transform_vector(X_wc, axis)
 
             # swing twist decomposition
-            twist = quat_twist(axis, r_err)
+            twist = wp.quat_twist(axis, r_err)
 
             q = wp.acos(twist[3]) * 2.0 * wp.sign(wp.dot(axis, wp.vec3(twist[0], twist[1], twist[2])))
             qd = wp.dot(w_err, axis_p)

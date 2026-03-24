@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Diffsim Bear
@@ -96,19 +84,19 @@ def network(
 
 
 class Example:
-    def __init__(self, viewer, verbose=False, sim_steps=300):
+    def __init__(self, viewer, args):
         # setup simulation parameters first
         fps = 60
         self.frame = 0
         self.frame_dt = 1.0 / fps
 
-        self.sim_steps = sim_steps
+        self.sim_steps = args.sim_steps
         self.sim_substeps = 80
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
         self.phase_count = PHASE_COUNT
-        self.verbose = verbose
+        self.verbose = args.verbose
 
         # setup training parameters
         self.train_iter = 0
@@ -303,6 +291,11 @@ class Example:
         self.train_iter += 1
 
     def render(self):
+        if self.viewer.is_paused():
+            self.viewer.begin_frame(self.viewer.time)
+            self.viewer.end_frame()
+            return
+
         # draw training run
         for i in range(self.sim_steps + 1):
             state = self.states[i * self.sim_substeps]
@@ -316,20 +309,21 @@ class Example:
     def test_final(self):
         assert most(np.diff(self.loss_history) < -0.0, min_ratio=0.8)
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--verbose", action="store_true", help="Print out additional status messages during execution."
+        )
+        parser.add_argument(
+            "--sim-steps", type=int, default=300, help="Number of simulation steps to execute in a training run."
+        )
+        return parser
+
 
 if __name__ == "__main__":
-    # Create parser that inherits common arguments and adds example-specific ones
-    parser = newton.examples.create_parser()
-    parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
-    parser.add_argument(
-        "--sim-steps", type=int, default=300, help="Number of simulation steps to execute in a training run."
-    )
-
-    # Parse arguments and initialize viewer
+    parser = Example.create_parser()
     viewer, args = newton.examples.init(parser)
 
-    # Create example
-    example = Example(viewer, verbose=args.verbose, sim_steps=args.sim_steps)
-
-    # Run example
+    example = Example(viewer, args)
     newton.examples.run(example, args)

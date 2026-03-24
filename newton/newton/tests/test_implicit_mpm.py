@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
 
@@ -59,7 +47,7 @@ def test_sand_cube_on_plane(test, device):
     state_0: newton.State = model.state()
     state_1: newton.State = model.state()
 
-    options = SolverImplicitMPM.Options()
+    options = SolverImplicitMPM.Config()
     options.grid_type = "dense"  # use dense grid as sparse grid is GPU-only
     options.voxel_size = voxel_size
 
@@ -150,7 +138,7 @@ def test_finite_difference_collider_velocity(test, device):
             compute_inertia=False,
         )
         shape_cfg = newton.ModelBuilder.ShapeConfig(density=0.0)  # kinematic
-        shape_cfg.thickness = 0.02
+        shape_cfg.margin = 0.02
         builder.add_shape_mesh(
             body=platform_body,
             mesh=platform_mesh,
@@ -162,7 +150,7 @@ def test_finite_difference_collider_velocity(test, device):
         state_0 = model.state()
         state_1 = model.state()
 
-        options = SolverImplicitMPM.Options()
+        options = SolverImplicitMPM.Config()
         options.voxel_size = voxel_size
         options.grid_type = "dense"
         options.collider_velocity_mode = velocity_mode

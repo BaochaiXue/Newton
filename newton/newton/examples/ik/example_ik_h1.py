@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example IK H1 (positions + rotations)
@@ -21,6 +9,7 @@
 #
 # - Uses both IKObjectivePosition and IKObjectiveRotation per end-effector
 # - Re-solves IK every frame from the latest gizmo transforms
+# - On gizmo release, snaps each target back to the solved link pose
 #
 # Command: python -m newton.examples ik_h1
 ###########################################################################
@@ -34,7 +23,7 @@ import newton.utils
 
 
 class Example:
-    def __init__(self, viewer):
+    def __init__(self, viewer, args):
         # frame timing
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -55,6 +44,7 @@ class Example:
         self.graph = None
         self.model = h1.finalize()
         self.viewer.set_model(self.model)
+        self.viewer.set_camera(wp.vec3(3.0, 1.3, 1.7), -12.0, -153.0)
 
         # states
         self.state = self.model.state()
@@ -112,7 +102,7 @@ class Example:
         )
 
         # Variables the solver will update
-        self.joint_q = wp.array(self.model.joint_q, shape=(1, self.model.joint_coord_count))
+        self.joint_q = self.model.joint_q.reshape((1, self.model.joint_coord_count))
 
         self.ik_iters = 24
         self.solver = ik.IKSolver(
@@ -162,12 +152,14 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
 
-        # Register gizmos (the viewer will draw & mutate transforms in-place)
-        for (name, _), tf in zip(self.ee, self.ee_tfs, strict=False):
-            self.viewer.log_gizmo(f"target_{name}", tf)
-
-        # Visualize the current articulated state
+        # Visualize the current articulated state.
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
+        body_q_np = self.state.body_q.numpy()
+
+        # Register gizmos (the viewer will draw & mutate transforms in-place)
+        for (name, link_idx), tf in zip(self.ee, self.ee_tfs, strict=False):
+            self.viewer.log_gizmo(f"target_{name}", tf, snap_to=wp.transform(*body_q_np[link_idx]))
+
         self.viewer.log_state(self.state)
 
         self.viewer.end_frame()
@@ -177,5 +169,5 @@ class Example:
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
     viewer, args = newton.examples.init()
-    example = Example(viewer)
+    example = Example(viewer, args)
     newton.examples.run(example, args)

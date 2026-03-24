@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import unittest
 import warnings
@@ -67,8 +55,8 @@ class TestViewerRerunHidden(unittest.TestCase):
         arr.__len__ = lambda self_: len(np_data)
         return arr
 
-    def test_log_mesh_hidden_skips_registration(self):
-        """log_mesh(hidden=True) should not store the mesh in _meshes."""
+    def test_log_mesh_hidden_skips_log(self):
+        """log_mesh(hidden=True) should store the mesh in _meshes but not render them."""
         viewer = self._create_viewer()
 
         points = self._make_mock_wp_array([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
@@ -77,7 +65,36 @@ class TestViewerRerunHidden(unittest.TestCase):
         with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
             viewer.log_mesh("hidden_mesh", points, indices, hidden=True)
 
-        self.assertNotIn("hidden_mesh", viewer._meshes)
+        self.assertIn("hidden_mesh", viewer._meshes)
+        self.mock_rr.log.assert_not_called()
+
+    def test_log_mesh_hidden_preserves_uvs_and_texture(self):
+        """Hidden mesh templates should retain shading data for later instancing."""
+        viewer = self._create_viewer()
+
+        points = self._make_mock_wp_array([[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+        indices = self._make_mock_wp_array([0, 1, 2])
+        normals = self._make_mock_wp_array([[0, 0, 1], [0, 0, 1], [0, 0, 1]])
+        uvs = self._make_mock_wp_array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
+        texture = np.array(
+            [
+                [[255, 0, 0], [0, 255, 0]],
+                [[0, 0, 255], [255, 255, 255]],
+            ],
+            dtype=np.uint8,
+        )
+
+        with patch("newton._src.viewer.viewer_rerun.rr", self.mock_rr):
+            viewer.log_mesh(
+                "hidden_mesh_textured", points, indices, normals=normals, uvs=uvs, texture=texture, hidden=True
+            )
+
+        mesh_data = viewer._meshes["hidden_mesh_textured"]
+        self.assertIsNotNone(mesh_data["normals"])
+        self.assertIsNotNone(mesh_data["uvs"])
+        self.assertIsNotNone(mesh_data["texture_image"])
+        np.testing.assert_allclose(mesh_data["uvs"][:, 1], np.array([0.8, 0.6, 0.4], dtype=np.float32))
+        self.mock_rr.log.assert_not_called()
 
     def test_log_instances_hidden_clears_entity(self):
         """log_instances(hidden=True) should clear a previously visible entity."""

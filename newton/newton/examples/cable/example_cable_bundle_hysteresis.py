@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 ###########################################################################
 # Example Cable Bundle Hysteresis
@@ -23,8 +11,6 @@
 # showing realistic memory effects in cable dynamics.
 #
 ###########################################################################
-
-import argparse
 
 import numpy as np
 import warp as wp
@@ -192,7 +178,7 @@ class Example:
         stretch_damping = 0.0
 
         builder = newton.ModelBuilder()
-        builder.rigid_contact_margin = 0.05
+        builder.rigid_gap = 0.05
 
         # Register solver-specific custom attributes (Dahl plasticity parameters live on the Model)
         newton.solvers.SolverVBD.register_custom_attributes(builder)
@@ -434,28 +420,29 @@ class Example:
         """Test cable bundle hysteresis simulation for stability and correctness (called after simulation)."""
         pass
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument("--segments", type=int, default=40, help="Number of cable segments")
+        parser.add_argument("--no-dahl", action="store_true", help="Disable Dahl friction (purely elastic)")
+        parser.add_argument("--eps-max", type=float, default=2.0, help="Maximum plastic strain [rad]")
+        parser.add_argument("--tau", type=float, default=0.1, help="Memory decay length [rad]")
+        return parser
+
 
 if __name__ == "__main__":
-    # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
-
-    # Parse example-specific arguments for Dahl friction experimentation
-    parser = argparse.ArgumentParser(description="Cable bundle hysteresis with Dahl friction")
-    parser.add_argument("--segments", type=int, default=40, help="Number of cable segments")
-    parser.add_argument("--no-dahl", action="store_true", help="Disable Dahl friction (purely elastic)")
-    parser.add_argument("--eps-max", type=float, default=2.0, help="Maximum plastic strain [rad]")
-    parser.add_argument("--tau", type=float, default=0.1, help="Memory decay length [rad]")
-    cli, _ = parser.parse_known_args()
+    parser = Example.create_parser()
+    viewer, args = newton.examples.init(parser)
 
     # Create example and run
     example = Example(
         viewer,
         args,
         num_cables=7,
-        segments=cli.segments,
-        with_dahl=not cli.no_dahl and cli.eps_max > 0.0 and cli.tau > 0.0,
-        eps_max=cli.eps_max,
-        tau=cli.tau,
+        segments=args.segments,
+        with_dahl=not args.no_dahl and args.eps_max > 0.0 and args.tau > 0.0,
+        eps_max=args.eps_max,
+        tau=args.tau,
     )
 
     newton.examples.run(example, args)

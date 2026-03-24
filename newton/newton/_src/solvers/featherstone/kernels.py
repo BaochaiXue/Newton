@@ -1,24 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
 import warp as wp
 
-from ...core import transform_twist
-from ...sim import JointType, Model, State
+from ...math import transform_twist
+from ...sim import BodyFlags, JointType, Model, State
 from ...sim.articulation import (
     compute_2d_rotational_dofs,
     compute_3d_rotational_dofs,
@@ -57,6 +45,18 @@ def compute_com_transforms(
     tid = wp.tid()
     com = body_com[tid]
     body_X_com[tid] = wp.transform(com, wp.quat_identity())
+
+
+@wp.kernel
+def zero_kinematic_body_forces(
+    body_flags: wp.array(dtype=wp.int32),
+    body_f: wp.array(dtype=wp.spatial_vector),
+):
+    """Zero accumulated spatial forces for kinematic bodies."""
+    tid = wp.tid()
+    if (body_flags[tid] & BodyFlags.KINEMATIC) == 0:
+        return
+    body_f[tid] = wp.spatial_vector()
 
 
 @wp.func
@@ -1235,6 +1235,7 @@ def adj_dense_cholesky(
 def eval_dense_cholesky_batched(
     A_starts: wp.array(dtype=int),
     A_dim: wp.array(dtype=int),
+    R_starts: wp.array(dtype=int),
     A: wp.array(dtype=float),
     R: wp.array(dtype=float),
     L: wp.array(dtype=float),
@@ -1243,7 +1244,7 @@ def eval_dense_cholesky_batched(
 
     n = A_dim[batch]
     A_start = A_starts[batch]
-    R_start = n * batch
+    R_start = R_starts[batch]
 
     dense_cholesky(n, A, R, A_start, R_start, L)
 
@@ -1379,6 +1380,53 @@ def integrate_generalized_joints(
         joint_q_new,
         joint_qd_new,
     )
+
+
+@wp.kernel
+def zero_kinematic_joint_qdd(
+    joint_child: wp.array(dtype=int),
+    body_flags: wp.array(dtype=wp.int32),
+    joint_qd_start: wp.array(dtype=int),
+    joint_qdd: wp.array(dtype=float),
+):
+    """Zero joint accelerations for joints whose child body is kinematic."""
+    joint_id = wp.tid()
+    child = joint_child[joint_id]
+    if (body_flags[child] & BodyFlags.KINEMATIC) == 0:
+        return
+
+    dof_start = joint_qd_start[joint_id]
+    dof_end = joint_qd_start[joint_id + 1]
+    for i in range(dof_start, dof_end):
+        joint_qdd[i] = 0.0
+
+
+@wp.kernel
+def copy_kinematic_joint_state(
+    joint_child: wp.array(dtype=int),
+    body_flags: wp.array(dtype=wp.int32),
+    joint_q_start: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_q_in: wp.array(dtype=float),
+    joint_qd_in: wp.array(dtype=float),
+    joint_q_out: wp.array(dtype=float),
+    joint_qd_out: wp.array(dtype=float),
+):
+    """Copy prescribed joint state through the solve for kinematic child bodies."""
+    joint_id = wp.tid()
+    child = joint_child[joint_id]
+    if (body_flags[child] & BodyFlags.KINEMATIC) == 0:
+        return
+
+    q_start = joint_q_start[joint_id]
+    q_end = joint_q_start[joint_id + 1]
+    for i in range(q_start, q_end):
+        joint_q_out[i] = joint_q_in[i]
+
+    qd_start = joint_qd_start[joint_id]
+    qd_end = joint_qd_start[joint_id + 1]
+    for i in range(qd_start, qd_end):
+        joint_qd_out[i] = joint_qd_in[i]
 
 
 # ============================================================================

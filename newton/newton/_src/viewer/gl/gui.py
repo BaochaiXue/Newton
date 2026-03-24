@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
@@ -40,9 +28,33 @@ class UI:
 
         self.window = window
         self.imgui.create_context()
-        self.impl = pyglet_backend.create_renderer(self.window)
+        try:
+            # Create without callbacks so we can fix the scroll handler first
+            self.impl = pyglet_backend.create_renderer(self.window, attach_callbacks=False)
+        except Exception as e:
+            # Unlikely to happen since RendererGL already sets PYOPENGL_PLATFORM=glx
+            # on Wayland, but just in case the auto-detection missed the session type.
+            if "no valid context" in str(e).lower() or "no current context" in str(e).lower():
+                raise RuntimeError(
+                    "Failed to initialize the OpenGL UI renderer. "
+                    "If you are on Wayland, try setting the environment variable:\n\n"
+                    "  PYOPENGL_PLATFORM=glx uv run -m newton.examples <example>\n"
+                ) from e
+            raise
 
         self.io = self.imgui.get_io()
+
+        # Fix inverted scroll direction in the pyglet imgui backend before
+        # attaching callbacks so pyglet captures the corrected handler.
+        # The replacement must be named "on_mouse_scroll" because pyglet
+        # matches handlers by __name__.
+        io = self.io
+
+        def on_mouse_scroll(x, y, scroll_x, scroll_y):
+            io.add_mouse_wheel_event(scroll_x, scroll_y)
+
+        self.impl.on_mouse_scroll = on_mouse_scroll
+        self.impl._attach_callbacks(self.window)
 
         # Set up proper DPI scaling for high-DPI displays
         window_width, window_height = self.window.get_size()
@@ -273,11 +285,23 @@ class UI:
 
         self.impl.render(self.imgui.get_draw_data())
 
+    def is_capturing_mouse(self):
+        if not self.is_available:
+            return False
+
+        return self.io.want_capture_mouse
+
+    def is_capturing_keyboard(self):
+        if not self.is_available:
+            return False
+
+        return self.io.want_capture_keyboard
+
     def is_capturing(self):
         if not self.is_available:
             return False
 
-        return self.io.want_capture_mouse or self.io.want_capture_keyboard
+        return self.is_capturing_mouse() or self.is_capturing_keyboard()
 
     def resize(self, width, height):
         if not self.is_available:
