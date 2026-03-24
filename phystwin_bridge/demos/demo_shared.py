@@ -2,12 +2,13 @@
 """Shared utilities for standalone PhysTwin bridge demos."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib.util
 import math
 import pickle
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import warp as wp
@@ -125,6 +126,75 @@ def apply_drag_range(
     scale = wp.exp(-dt * damping)
     particle_q[i] = particle_q[i] - v * dt * (1.0 - scale)
     particle_qd[i] = v * scale
+
+
+@wp.func
+def _pair_penalty_contact_force(
+    n: wp.vec3,
+    v_rel: wp.vec3,
+    signed_gap: float,
+    k_n: float,
+    k_d: float,
+    k_f: float,
+    k_mu: float,
+):
+    """Returns a pairwise penalty contact force.
+
+    Physics note:
+    - ``signed_gap < 0`` means the two particle spheres overlap.
+    - The normal response combines an elastic penalty ``k_n * signed_gap``
+      with approach-only damping ``k_d * min(v_n, 0)``.
+    - The tangential response is friction-limited so the lateral force does
+      not exceed ``mu * |f_n|``.
+    """
+
+    v_n = wp.dot(n, v_rel)
+    normal_impulse = signed_gap * k_n + wp.min(v_n, 0.0) * k_d
+
+    v_t = v_rel - n * v_n
+    v_t_mag = wp.length(v_t)
+    if v_t_mag > 0.0:
+        v_t = v_t / v_t_mag
+
+    tangential_impulse = wp.min(v_t_mag * k_f, k_mu * wp.abs(normal_impulse))
+    return -n * normal_impulse - v_t * tangential_impulse
+
+
+def compute_visual_particle_radii(
+    particle_radius: np.ndarray,
+    *,
+    radius_scale: float,
+    radius_cap: float,
+) -> np.ndarray:
+    """Builds render-only radii from physical radii.
+
+    The physics model keeps using the original ``particle_radius`` values.
+    Rendering intentionally caps the on-screen radius so thin cloth/rope
+    remains visible without changing the contact geometry used in simulation.
+    """
+
+    radii = np.array(particle_radius, dtype=np.float32, copy=False)
+    return np.minimum(radii * float(radius_scale), float(radius_cap)).astype(
+        np.float32, copy=False
+    )
+
+
+@contextmanager
+def temporary_particle_radius_override(
+    model: Any, render_radii: np.ndarray | None
+) -> Iterator[None]:
+    """Temporarily swaps in render-only radii and restores the physical ones."""
+
+    if render_radii is None or getattr(model, "particle_radius", None) is None:
+        yield
+        return
+
+    physical_radii = model.particle_radius.numpy().astype(np.float32, copy=False).copy()
+    model.particle_radius.assign(np.array(render_radii, dtype=np.float32, copy=False))
+    try:
+        yield
+    finally:
+        model.particle_radius.assign(physical_radii)
 
 
 def overlay_text_lines_rgb(

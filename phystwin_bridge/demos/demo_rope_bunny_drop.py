@@ -31,7 +31,13 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_shared import CORE_DIR, load_core_module, overlay_text_lines_rgb
+from demo_shared import (
+    CORE_DIR,
+    compute_visual_particle_radii,
+    load_core_module,
+    overlay_text_lines_rgb,
+    temporary_particle_radius_override,
+)
 
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))
@@ -41,6 +47,39 @@ if str(NEWTON_PY_ROOT) not in sys.path:
 
 path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
 newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
+
+if not hasattr(wp, "quat_twist"):
+    @wp.func
+    def _quat_twist_compat(axis: wp.vec3, q: wp.quat) -> wp.quat:
+        ax = wp.normalize(axis)
+        imag = wp.vec3(q[0], q[1], q[2])
+        proj = ax * wp.dot(imag, ax)
+        return wp.normalize(wp.quat(proj[0], proj[1], proj[2], q[3]))
+
+    wp.quat_twist = _quat_twist_compat
+
+if not hasattr(wp, "quat_to_euler"):
+    @wp.func
+    def _quat_to_euler_compat(q: wp.quat, i: int, j: int, k: int) -> wp.vec3:
+        # Newton only calls quat_to_euler(q, 2, 1, 0) in this demo stack.
+        x = q[0]
+        y = q[1]
+        z = q[2]
+        w = q[3]
+
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = wp.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (w * y - z * x)
+        pitch = wp.asin(wp.clamp(sinp, -1.0, 1.0))
+
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = wp.atan2(siny_cosp, cosy_cosp)
+        return wp.vec3(roll, pitch, yaw)
+
+    wp.quat_to_euler = _quat_to_euler_compat
 
 import newton  # noqa: E402
 
@@ -538,9 +577,11 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
             float(cam_yaw),
         )
 
-        radii = model.particle_radius.numpy().astype(np.float32, copy=False)
-        radii = np.minimum(radii * float(args.particle_radius_vis_scale), float(args.particle_radius_vis_min))
-        model.particle_radius.assign(radii)
+        render_radii = compute_visual_particle_radii(
+            model.particle_radius.numpy(),
+            radius_scale=float(args.particle_radius_vis_scale),
+            radius_cap=float(args.particle_radius_vis_min),
+        )
 
         try:
             shape_colors = {}
@@ -565,58 +606,59 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
         if state.body_qd is not None:
             state.body_qd.zero_()
 
-        ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        n_sim_frames = int(sim_data["particle_q_all"].shape[0])
-        sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
-        sim_duration = max(float(n_sim_frames - 1) * sim_frame_dt, 0.0)
-        video_duration = sim_duration * max(float(args.slowdown), 1.0e-6)
-        n_out_frames = max(1, int(round(video_duration * fps_out)))
-        if n_out_frames == 1 or sim_duration <= 0.0:
-            render_indices = np.zeros((1,), dtype=np.int32)
-        else:
-            sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
-            render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
+        with temporary_particle_radius_override(model, render_radii):
+            ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            n_sim_frames = int(sim_data["particle_q_all"].shape[0])
+            sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+            sim_duration = max(float(n_sim_frames - 1) * sim_frame_dt, 0.0)
+            video_duration = sim_duration * max(float(args.slowdown), 1.0e-6)
+            n_out_frames = max(1, int(round(video_duration * fps_out)))
+            if n_out_frames == 1 or sim_duration <= 0.0:
+                render_indices = np.zeros((1,), dtype=np.int32)
+            else:
+                sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
+                render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
 
-        for out_idx, sim_idx in enumerate(render_indices):
-            state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
-            state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
+            for out_idx, sim_idx in enumerate(render_indices):
+                state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
+                state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
 
-            sim_t = float(sim_idx) * sim_frame_dt
-            viewer.begin_frame(sim_t)
-            viewer.log_state(state)
+                sim_t = float(sim_idx) * sim_frame_dt
+                viewer.begin_frame(sim_t)
+                viewer.log_state(state)
 
-            if rope_edges.size and starts_wp is not None and ends_wp is not None:
-                q_obj = sim_data["particle_q_object"][sim_idx]
-                starts_wp.assign(q_obj[rope_edges[:, 0]].astype(np.float32, copy=False))
-                ends_wp.assign(q_obj[rope_edges[:, 1]].astype(np.float32, copy=False))
-                viewer.log_lines(
-                    "/demo/rope_springs",
-                    starts_wp,
-                    ends_wp,
-                    (0.60, 0.80, 0.98),
-                    width=float(args.rope_line_width),
-                    hidden=False,
-                )
+                if rope_edges.size and starts_wp is not None and ends_wp is not None:
+                    q_obj = sim_data["particle_q_object"][sim_idx]
+                    starts_wp.assign(q_obj[rope_edges[:, 0]].astype(np.float32, copy=False))
+                    ends_wp.assign(q_obj[rope_edges[:, 1]].astype(np.float32, copy=False))
+                    viewer.log_lines(
+                        "/demo/rope_springs",
+                        starts_wp,
+                        ends_wp,
+                        (0.60, 0.80, 0.98),
+                        width=float(args.rope_line_width),
+                        hidden=False,
+                    )
 
-            viewer.end_frame()
-            frame = viewer.get_frame(render_ui=False).numpy()
-            if args.overlay_label:
-                frame = overlay_text_lines_rgb(
-                    frame,
-                    [
-                        f"SLOW MOTION {float(args.slowdown):.1f}x",
-                        f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
-                    ],
-                    font_size=int(args.label_font_size),
-                )
+                viewer.end_frame()
+                frame = viewer.get_frame(render_ui=False).numpy()
+                if args.overlay_label:
+                    frame = overlay_text_lines_rgb(
+                        frame,
+                        [
+                            f"SLOW MOTION {float(args.slowdown):.1f}x",
+                            f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
+                        ],
+                        font_size=int(args.label_font_size),
+                    )
+                assert ffmpeg_proc.stdin is not None
+                ffmpeg_proc.stdin.write(frame.tobytes())
+
             assert ffmpeg_proc.stdin is not None
-            ffmpeg_proc.stdin.write(frame.tobytes())
-
-        assert ffmpeg_proc.stdin is not None
-        ffmpeg_proc.stdin.close()
-        if ffmpeg_proc.wait() != 0:
-            raise RuntimeError("ffmpeg failed")
-        ffmpeg_proc = None
+            ffmpeg_proc.stdin.close()
+            if ffmpeg_proc.wait() != 0:
+                raise RuntimeError("ffmpeg failed")
+            ffmpeg_proc = None
     finally:
         try:
             viewer.close()

@@ -21,24 +21,10 @@ from demo_rope_bunny_drop import (
     overlay_text_lines_rgb,
     path_defaults,
 )
+from demo_shared import _pair_penalty_contact_force, compute_visual_particle_radii
 
-
-@wp.func
-def _cross_object_particle_force(
-    n: wp.vec3, v: wp.vec3, c: float, k_n: float, k_d: float, k_f: float, k_mu: float
-):
-    vn = wp.dot(n, v)
-    jn = c * k_n
-    jd = min(vn, 0.0) * k_d
-    fn = jn + jd
-
-    vt = v - n * vn
-    vs = wp.length(vt)
-    if vs > 0.0:
-        vt = vt / vs
-
-    ft = wp.min(vs * k_f, k_mu * wp.abs(fn))
-    return -n * fn - vt * ft
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 
 
 @wp.kernel
@@ -88,7 +74,7 @@ def _eval_cross_object_contact(
         if err <= k_cohesion:
             n = n / d
             vrel = v - particle_v[index]
-            f += _cross_object_particle_force(
+            f += _pair_penalty_contact_force(
                 n, vrel, err, k_contact, k_damp, k_friction, k_mu
             )
 
@@ -122,7 +108,7 @@ def _eval_ground_contact_range(
     n = wp.vec3(0.0, 0.0, 1.0)
     c = x[2] - radius
     if c <= 0.0:
-        particle_f[i] = particle_f[i] + _cross_object_particle_force(
+        particle_f[i] = particle_f[i] + _pair_penalty_contact_force(
             n, v, c, k_contact, k_damp, k_friction, k_mu
         )
 
@@ -150,12 +136,15 @@ def _apply_drag_correction_ignore_axis_range(
 
 
 def _default_rope_ir() -> Path:
-    return Path("tmp/rope_double_hand_object_only_test_ir.npz")
+    return WORKSPACE_ROOT / "tmp" / "rope_double_hand_object_only_test_ir.npz"
 
 
 def _default_sloth_ir() -> Path:
-    return Path(
-        "Newton/phystwin_bridge/ir/double_lift_sloth_normal/phystwin_ir_v2_bf_strict.npz"
+    return (
+        BRIDGE_ROOT
+        / "ir"
+        / "double_lift_sloth_normal"
+        / "phystwin_ir_v2_bf_strict.npz"
     )
 
 
@@ -773,8 +762,11 @@ def render_video(
         except Exception:
             pass
 
-        radii = model.particle_radius.numpy().astype(np.float32, copy=False)
-        radii = np.minimum(radii * float(args.particle_radius_vis_scale), float(args.particle_radius_vis_min))
+        radii = compute_visual_particle_radii(
+            model.particle_radius.numpy(),
+            radius_scale=float(args.particle_radius_vis_scale),
+            radius_cap=float(args.particle_radius_vis_min),
+        )
         rope_start, rope_end = [int(v) for v in meta["rope_range"]]
         sloth_start, sloth_end = [int(v) for v in meta["sloth_range"]]
 

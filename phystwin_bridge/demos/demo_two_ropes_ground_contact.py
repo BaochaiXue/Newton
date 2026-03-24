@@ -31,6 +31,9 @@ from demo_rope_bunny_drop import (
     overlay_text_lines_rgb,
     path_defaults,
 )
+from demo_shared import _pair_penalty_contact_force, compute_visual_particle_radii
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 
 
 ROPE_SPECS = (
@@ -45,22 +48,6 @@ ROPE_SPECS = (
         "line_color": (0.99, 0.78, 0.49),
     },
 )
-
-
-@wp.func
-def _cross_rope_particle_force(n: wp.vec3, v: wp.vec3, c: float, k_n: float, k_d: float, k_f: float, k_mu: float):
-    vn = wp.dot(n, v)
-    jn = c * k_n
-    jd = min(vn, 0.0) * k_d
-    fn = jn + jd
-
-    vt = v - n * vn
-    vs = wp.length(vt)
-    if vs > 0.0:
-        vt = vt / vs
-
-    ft = wp.min(vs * k_f, k_mu * wp.abs(fn))
-    return -n * fn - vt * ft
 
 
 @wp.kernel
@@ -110,13 +97,15 @@ def _eval_cross_rope_contact(
         if err <= k_cohesion:
             n = n / d
             vrel = v - particle_v[index]
-            f += _cross_rope_particle_force(n, vrel, err, k_contact, k_damp, k_friction, k_mu)
+            f += _pair_penalty_contact_force(
+                n, vrel, err, k_contact, k_damp, k_friction, k_mu
+            )
 
     particle_f[i] = particle_f[i] + f
 
 
 def _default_rope_ir() -> Path:
-    return Path("tmp/rope_double_hand_object_only_test_ir.npz")
+    return WORKSPACE_ROOT / "tmp" / "rope_double_hand_object_only_test_ir.npz"
 
 
 def parse_args() -> argparse.Namespace:
@@ -557,8 +546,11 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
         except Exception:
             pass
 
-        radii = model.particle_radius.numpy().astype(np.float32, copy=False)
-        radii = np.minimum(radii * float(args.particle_radius_vis_scale), float(args.particle_radius_vis_min))
+        radii = compute_visual_particle_radii(
+            model.particle_radius.numpy(),
+            radius_scale=float(args.particle_radius_vis_scale),
+            radius_cap=float(args.particle_radius_vis_min),
+        )
         rope_ranges = np.asarray(meta["rope_particle_ranges"], dtype=np.int32)
         rope_radii_wp = []
         rope_color_wp = []

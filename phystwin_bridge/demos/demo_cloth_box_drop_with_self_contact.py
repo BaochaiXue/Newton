@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Object-only cloth drop onto a Stanford Bunny in Newton SemiImplicit.
+"""Object-only cloth drop onto a rigid box using Newton SemiImplicit.
 
 This script is intentionally ON-only:
 
 - SELF COLLISION: ON
 
-The cloth is loaded from a PhysTwin IR bundle, controllers are dropped, and the
-object particles are released from rest above the bunny.
+Unlike the previous VBD-based control experiment, this ON path now stays on the
+same bridge semantics as the OFF cloth-bunny demo:
+
+- load the PhysTwin strict IR directly
+- drop controller particles and keep only the object spring-mass cloth
+- run Newton :class:`newton.solvers.SolverSemiImplicit`
+- enable Newton's particle-particle contact kernel
+
+This preserves the core question we actually care about: what happens if we try
+to make ON work on the same spring-mass representation that OFF already uses.
 """
 from __future__ import annotations
 
@@ -22,15 +30,26 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from demo_cloth_bunny_common import (
+    _apply_particle_contact_scaling,
+    _apply_shape_contact_scaling,
+    _box_signed_distance,
+    _copy_object_only_ir,
+    _default_cloth_ir,
+    _effective_spring_scales,
+    _mass_tag,
+    _maybe_autoset_mass_spring_scale,
+    _validate_scaling_args,
+    load_ir,
+)
 from demo_rope_bunny_drop import (
     _apply_drag_correction_ignore_axis,
-    load_bunny_mesh,
     newton,
     newton_import_ir,
     overlay_text_lines_rgb,
     path_defaults,
-    quat_to_rotmat,
 )
+from demo_shared import compute_visual_particle_radii, temporary_particle_radius_override
 from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
 from newton._src.solvers.semi_implicit.kernels_contact import (
     eval_body_contact_forces,
@@ -46,35 +65,32 @@ from newton._src.solvers.semi_implicit.kernels_particle import (
 )
 
 
-
-def _default_cloth_ir() -> Path:
-    return Path("Newton/phystwin_bridge/ir/blue_cloth_double_lift_around/phystwin_ir_v2_bf_strict.npz")
-
-
-def load_ir(path: Path) -> dict[str, np.ndarray]:
-    with np.load(path.resolve(), allow_pickle=False) as data:
-        return {k: data[k] for k in data.files}
-
-
-def _mass_tag(value: float) -> str:
-    text = f"{float(value):g}"
-    text = text.replace("-", "neg")
-    return "m" + text.replace(".", "p")
+DEFAULT_TARGET_TOTAL_MASS = 0.1
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Object-only cloth drops onto a Stanford Bunny.")
+    p = argparse.ArgumentParser(description="Object-only cloth drops onto a rigid box.")
     p.add_argument("--ir", type=Path, default=_default_cloth_ir(), help="Path to PhysTwin cloth IR .npz")
     p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--prefix", default="cloth_bunny_drop")
+    p.add_argument("--prefix", default="cloth_box_drop")
     p.add_argument("--device", default=path_defaults.default_device())
 
-    p.add_argument("--frames", type=int, default=300)
-    p.add_argument("--sim-dt", type=float, default=5.0e-5)
-    p.add_argument("--substeps", type=int, default=667)
+    p.add_argument("--frames", type=int, default=240)
+    p.add_argument("--sim-dt", type=float, default=1.0 / 600.0)
+    p.add_argument("--substeps", type=int, default=10)
     p.add_argument("--gravity-mag", type=float, default=9.8)
-    p.add_argument("--drop-height", type=float, default=0.5, help="Cloth bottom height above bunny top, in meters.")
+    p.add_argument("--drop-height", type=float, default=0.5, help="Cloth bottom height above box top, in meters.")
     p.add_argument("--object-mass", type=float, default=None, help="Optional per-particle cloth object mass override.")
+    p.add_argument(
+        "--target-total-mass",
+        type=float,
+        default=DEFAULT_TARGET_TOTAL_MASS,
+        help=(
+            "If neither --object-mass nor --mass-spring-scale is provided, "
+            "auto-compute a stable cloth mass scale so the total object mass "
+            "matches this value."
+        ),
+    )
     p.add_argument(
         "--mass-spring-scale",
         type=float,
@@ -134,21 +150,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
-        "--bunny-shape-contact-scale",
+        "--box-shape-contact-scale",
         type=float,
         default=None,
         help=(
-            "Optional override for bunny shape_material_ke scaling. "
-            "If omitted, bunny uses --shape-contact-scale."
+            "Optional override for box shape_material_ke scaling. "
+            "If omitted, the box uses --shape-contact-scale."
         ),
     )
     p.add_argument(
-        "--bunny-shape-contact-damping-multiplier",
+        "--box-shape-contact-damping-multiplier",
         type=float,
         default=None,
         help=(
-            "Optional override for bunny shape_material_kd/kf scaling multiplier. "
-            "If omitted, bunny uses --shape-contact-damping-multiplier."
+            "Optional override for box shape_material_kd/kf scaling multiplier. "
+            "If omitted, the box uses --shape-contact-damping-multiplier."
         ),
     )
     p.add_argument("--disable-particle-contact-kernel", action=argparse.BooleanOptionalAction, default=False)
@@ -165,10 +181,10 @@ def parse_args() -> argparse.Namespace:
         help="Scale factor applied only to ON-case contact_collision_dist before Newton particle-contact radius mapping.",
     )
     p.add_argument(
-        "--add-bunny",
+        "--add-box",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Include the Stanford Bunny rigid body in the scene.",
+        help="Include the rigid box in the scene.",
     )
     p.add_argument(
         "--add-ground-plane",
@@ -180,23 +196,37 @@ def parse_args() -> argparse.Namespace:
         "--shape-contacts",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable particle-vs-shape contacts for rigid shapes such as the bunny.",
+        help="Enable particle-vs-shape contacts for the rigid box.",
     )
 
     p.add_argument("--rigid-mass", type=float, default=4000.0)
     p.add_argument("--body-mu", type=float, default=0.5)
-    p.add_argument("--body-ke", type=float, default=5.0e4)
-    p.add_argument("--body-kd", type=float, default=5.0e2)
-    p.add_argument("--bunny-scale", type=float, default=0.12)
-    p.add_argument("--bunny-asset", default="bunny.usd")
-    p.add_argument("--bunny-prim", default="/root/bunny")
+    p.add_argument("--body-ke", type=float, default=1.0e4)
+    p.add_argument("--body-kd", type=float, default=1.0e-2)
     p.add_argument(
-        "--bunny-quat-xyzw",
-        type=float,
-        nargs=4,
-        default=(0.70710678, 0.0, 0.0, 0.70710678),
-        metavar=("X", "Y", "Z", "W"),
+        "--dynamic-box",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use a dynamic rigid box body. Disabled by default because the ON "
+            "self-collision demo is meant to isolate stable cloth self-contact "
+            "against a fixed support shape."
+        ),
     )
+    p.add_argument("--box-hx", type=float, default=0.12)
+    p.add_argument("--box-hy", type=float, default=0.12)
+    p.add_argument("--box-hz", type=float, default=0.08)
+
+    # Compatibility-only knobs retained so older CLI invocations keep working.
+    p.add_argument("--vbd-iterations", type=int, default=15)
+    p.add_argument("--vbd-tri-ke", type=float, default=1.0e4)
+    p.add_argument("--vbd-tri-ka", type=float, default=1.0e4)
+    p.add_argument("--vbd-tri-kd", type=float, default=1.0e-1)
+    p.add_argument("--vbd-edge-ke", type=float, default=1.0e4)
+    p.add_argument("--vbd-edge-kd", type=float, default=1.0e0)
+    p.add_argument("--self-contact-radius-scale", type=float, default=0.35)
+    p.add_argument("--self-contact-margin-scale", type=float, default=0.60)
+    p.add_argument("--soft-contact-margin-scale", type=float, default=1.0)
 
     p.add_argument("--angular-damping", type=float, default=0.05)
     p.add_argument("--friction-smoothing", type=float, default=1.0)
@@ -229,7 +259,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Experimental: use baseline shape_material_ke/kd/kf for rigid-rigid contacts, "
             "but scaled shape_material_ke/kd/kf for particle-shape contacts. "
-            "This avoids softening bunny-ground support when low-mass cloth contact is rescaled."
+            "This avoids softening box-ground support when low-mass cloth contact is rescaled."
         ),
     )
     p.add_argument(
@@ -237,145 +267,44 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help=(
-            "Extra scale applied to model.particle_ke/kd/kf after bridge mapping. "
-            "Useful for diagnosing whether ON instability is dominated by particle-particle contact magnitude."
+            "Compatibility knob for older ON experiments. The current SemiImplicit ON path "
+            "does not use it directly because particle contact coefficients are loaded from "
+            "the PhysTwin bridge mapping, but we keep it in the summary for bookkeeping."
         ),
     )
     return p.parse_args()
 
 
-def _validate_scaling_args(args: argparse.Namespace) -> None:
-    if args.mass_spring_scale is None:
-        return
-    scale = float(args.mass_spring_scale)
-    if scale <= 0.0:
-        raise ValueError(f"--mass-spring-scale must be > 0, got {scale}")
-    if args.object_mass is not None:
-        raise ValueError(
-            "--mass-spring-scale cannot be used together with --object-mass. "
-            "Use only one source of mass scaling."
-        )
-    if not np.isclose(float(args.spring_ke_scale), 1.0):
-        raise ValueError(
-            "--mass-spring-scale cannot be used together with --spring-ke-scale. "
-            "The unified scale already controls spring_ke."
-        )
-    if not np.isclose(float(args.spring_kd_scale), 1.0):
-        raise ValueError(
-            "--mass-spring-scale cannot be used together with --spring-kd-scale. "
-            "The unified scale already controls spring_kd."
-        )
+def _box_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "add_box", getattr(args, "add_bunny", True)))
 
 
-def _effective_object_mass_array(ir_demo: dict[str, Any], args: argparse.Namespace, n_obj: int) -> np.ndarray:
-    mass = np.asarray(ir_demo["mass"], dtype=np.float32).copy()[:n_obj]
-    if args.object_mass is not None:
-        mass.fill(float(args.object_mass))
-    elif args.mass_spring_scale is not None:
-        mass *= float(args.mass_spring_scale)
-    return mass
-
-
-def _effective_spring_scales(args: argparse.Namespace) -> tuple[float, float]:
-    if args.mass_spring_scale is not None:
-        scale = float(args.mass_spring_scale)
-        return scale, scale
-    return float(args.spring_ke_scale), float(args.spring_kd_scale)
-
-
-def _apply_shape_contact_scaling(model, args: argparse.Namespace) -> None:
-    if args.shape_contact_scale is None:
-        return
-    alpha = float(args.shape_contact_scale)
-    if alpha <= 0.0:
-        raise ValueError(f"--shape-contact-scale must be > 0, got {alpha}")
-    damping_mult = float(args.shape_contact_damping_multiplier)
-    if damping_mult <= 0.0:
-        raise ValueError(
-            f"--shape-contact-damping-multiplier must be > 0, got {damping_mult}"
-        )
-
-    # Scale the actual particle-shape soft-contact path used by
-    # eval_particle_body_contact_forces():
-    # - model.soft_contact_ke/kd/kf
-    # - model.shape_material_ke/kd/kf
-    model.soft_contact_ke = float(model.soft_contact_ke * alpha)
-    model.soft_contact_kd = float(model.soft_contact_kd * alpha * damping_mult)
-    model.soft_contact_kf = float(model.soft_contact_kf * alpha * damping_mult)
-
-    labels = [str(label).lower() for label in list(model.shape_label)]
-    has_ground = any(("ground" in label or "plane" in label) for label in labels)
-
-    ground_alpha = alpha if args.ground_shape_contact_scale is None else float(args.ground_shape_contact_scale)
-    ground_dmult = (
-        damping_mult
-        if args.ground_shape_contact_damping_multiplier is None
-        else float(args.ground_shape_contact_damping_multiplier)
+def _shape_scaling_args(args: argparse.Namespace) -> argparse.Namespace:
+    alias_args = copy.copy(args)
+    alias_args.add_bunny = _box_enabled(args)
+    alias_args.bunny_shape_contact_scale = getattr(
+        args,
+        "box_shape_contact_scale",
+        getattr(args, "bunny_shape_contact_scale", None),
     )
-    bunny_alpha = alpha if args.bunny_shape_contact_scale is None else float(args.bunny_shape_contact_scale)
-    bunny_dmult = (
-        damping_mult
-        if args.bunny_shape_contact_damping_multiplier is None
-        else float(args.bunny_shape_contact_damping_multiplier)
+    alias_args.bunny_shape_contact_damping_multiplier = getattr(
+        args,
+        "box_shape_contact_damping_multiplier",
+        getattr(args, "bunny_shape_contact_damping_multiplier", None),
     )
-
-    for arr_name in ("shape_material_ke", "shape_material_kd", "shape_material_kf"):
-        arr = getattr(model, arr_name)
-        vals = arr.numpy().astype(np.float32, copy=False).copy()
-        for idx, label in enumerate(labels):
-            scale = np.float32(alpha)
-            dmult = np.float32(damping_mult)
-            if "ground" in label or "plane" in label:
-                scale = np.float32(ground_alpha)
-                dmult = np.float32(ground_dmult)
-            elif "bunny" in label or (bool(args.add_bunny) and (not ("ground" in label or "plane" in label)) and has_ground):
-                scale = np.float32(bunny_alpha)
-                dmult = np.float32(bunny_dmult)
-            vals[idx] *= scale
-            if arr_name != "shape_material_ke":
-                vals[idx] *= dmult
-        arr.assign(vals)
+    return alias_args
 
 
-def _copy_object_only_ir(ir: dict[str, np.ndarray], args: argparse.Namespace) -> dict[str, Any]:
-    ir_demo: dict[str, Any] = {}
-    for key, value in ir.items():
-        ir_demo[key] = np.array(value, copy=True) if isinstance(value, np.ndarray) else value
-
-    reverse_z = bool(newton_import_ir.ir_bool(ir_demo, "reverse_z", default=False))
-    n_obj = int(np.asarray(ir_demo["num_object_points"]).ravel()[0])
-
-    x0 = np.asarray(ir_demo["x0"], dtype=np.float32).copy()[:n_obj]
-    v0 = np.asarray(ir_demo["v0"], dtype=np.float32).copy()[:n_obj]
-    if reverse_z:
-        x0[:, 2] *= -1.0
-        v0[:, 2] *= -1.0
-    v0[:] = 0.0
-
-    mass = _effective_object_mass_array(ir_demo, args, n_obj)
-
-    ir_demo["x0"] = x0
-    ir_demo["v0"] = v0
-    ir_demo["mass"] = mass
-    ir_demo["collision_radius"] = np.asarray(ir_demo["collision_radius"], dtype=np.float32).copy()[:n_obj]
-    ir_demo["num_object_points"] = np.asarray(n_obj, dtype=np.int32)
-    ir_demo["reverse_z"] = np.asarray(False)
-
-    edges = np.asarray(ir_demo["spring_edges"], dtype=np.int32)
-    keep = (edges[:, 0] < n_obj) & (edges[:, 1] < n_obj)
-    ir_demo["spring_edges"] = edges[keep].astype(np.int32, copy=True)
-    for key in ("spring_ke", "spring_kd", "spring_rest_length", "spring_y", "spring_y_raw"):
-        if key in ir_demo:
-            ir_demo[key] = np.asarray(ir_demo[key], dtype=np.float32).copy().ravel()[keep]
-
-    ir_demo.pop("controller_idx", None)
-    ir_demo.pop("controller_traj", None)
-    return ir_demo
+def _assign_shape_material_triplet(model, ke: np.ndarray, kd: np.ndarray, kf: np.ndarray) -> None:
+    model.shape_material_ke.assign(np.asarray(ke, dtype=np.float32))
+    model.shape_material_kd.assign(np.asarray(kd, dtype=np.float32))
+    model.shape_material_kf.assign(np.asarray(kf, dtype=np.float32))
 
 
 def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
-    shape_contacts_enabled = bool(args.shape_contacts) and bool(args.add_bunny)
-    spring_ke_scale, spring_kd_scale = _effective_spring_scales(args)
+    box_enabled = _box_enabled(args)
+    shape_contacts_enabled = bool(args.shape_contacts) and box_enabled
+    spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
@@ -405,29 +334,18 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
     newton_import_ir._add_ground_plane(builder, ir_obj, cfg, checks)
 
-    qx, qy, qz, qw = [float(v) for v in args.bunny_quat_xyzw]
-    bunny_quat_xyzw = [qx, qy, qz, qw]
-    bunny_quat = wp.quat(qx, qy, qz, qw)
-    mesh_verts_local = np.zeros((0, 3), dtype=np.float32)
-    mesh_render_edges = np.zeros((0, 2), dtype=np.int32)
-    mesh_asset_path = ""
-    bunny_pos = np.zeros((3,), dtype=np.float32)
-    bunny_top_z = 0.0
-    if bool(args.add_bunny):
-        mesh, mesh_verts_local, _, mesh_render_edges, mesh_asset_path = load_bunny_mesh(
-            args.bunny_asset, args.bunny_prim
-        )
-        verts_rotated = (mesh_verts_local * float(args.bunny_scale)) @ quat_to_rotmat(bunny_quat_xyzw).T
-        bunny_z_min = float(verts_rotated[:, 2].min())
-        bunny_z_max = float(verts_rotated[:, 2].max())
-        bunny_pos = np.array([0.0, 0.0, -bunny_z_min], dtype=np.float32)
-        bunny_top_z = bunny_pos[2] + bunny_z_max
+    box_half_extents = np.array(
+        [float(args.box_hx), float(args.box_hy), float(args.box_hz)],
+        dtype=np.float32,
+    )
+    box_pos = np.array([0.0, 0.0, float(args.box_hz)], dtype=np.float32)
+    box_top_z = float(args.box_hz * 2.0) if box_enabled else 0.0
 
     x0 = np.asarray(ir_obj["x0"], dtype=np.float32).copy()
     bbox_min = x0.min(axis=0)
     bbox_max = x0.max(axis=0)
     cloth_center_xy = 0.5 * (bbox_min[:2] + bbox_max[:2])
-    reference_top_z = float(bunny_top_z) if bool(args.add_bunny) else 0.0
+    reference_top_z = float(box_top_z) if box_enabled else 0.0
     shift = np.array(
         [
             -float(cloth_center_xy[0]),
@@ -439,39 +357,53 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     shifted_q = x0 + shift
     builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
 
-    if bool(args.add_bunny):
-        body = builder.add_body(
-            xform=wp.transform(wp.vec3(*bunny_pos.tolist()), bunny_quat),
-            mass=float(args.rigid_mass),
-            inertia=wp.mat33(0.05, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.05),
-            lock_inertia=True,
-            label="bunny",
-        )
+    if box_enabled:
         rigid_cfg = builder.default_shape_cfg.copy()
         rigid_cfg.mu = float(args.body_mu)
         rigid_cfg.ke = float(args.body_ke)
         rigid_cfg.kd = float(args.body_kd)
-        builder.add_shape_mesh(
-            body=body,
-            mesh=mesh,
-            scale=(float(args.bunny_scale), float(args.bunny_scale), float(args.bunny_scale)),
-            cfg=rigid_cfg,
-        )
+        if bool(args.dynamic_box):
+            body = builder.add_body(
+                xform=wp.transform(wp.vec3(*box_pos.tolist()), wp.quat_identity()),
+                mass=float(args.rigid_mass),
+                inertia=wp.mat33(0.05, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.05),
+                lock_inertia=True,
+                label="box",
+            )
+            builder.add_shape_box(
+                body=body,
+                hx=float(args.box_hx),
+                hy=float(args.box_hy),
+                hz=float(args.box_hz),
+                cfg=rigid_cfg,
+            )
+        else:
+            builder.add_shape_box(
+                body=-1,
+                xform=wp.transform(wp.vec3(*box_pos.tolist()), wp.quat_identity()),
+                hx=float(args.box_hx),
+                hy=float(args.box_hy),
+                hz=float(args.box_hz),
+                cfg=rigid_cfg,
+                label="box",
+            )
 
     model = builder.finalize(device=device)
     shape_material_ke_base = model.shape_material_ke.numpy().astype(np.float32, copy=False).copy()
     shape_material_kd_base = model.shape_material_kd.numpy().astype(np.float32, copy=False).copy()
     shape_material_kf_base = model.shape_material_kf.numpy().astype(np.float32, copy=False).copy()
+
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     model.set_gravity(gravity_vec)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
-    psc = float(args.particle_self_contact_scale)
-    if psc <= 0.0:
-        raise ValueError(f"--particle-self-contact-scale must be > 0, got {psc}")
-    model.particle_ke = float(model.particle_ke * psc)
-    model.particle_kd = float(model.particle_kd * psc)
-    model.particle_kf = float(model.particle_kf * psc)
-    _apply_shape_contact_scaling(model, args)
+    _apply_particle_contact_scaling(
+        model, weight_scale=float(ir_obj.get("weight_scale", 1.0))
+    )
+    _apply_shape_contact_scaling(
+        model,
+        _shape_scaling_args(args),
+        weight_scale=float(ir_obj.get("weight_scale", 1.0)),
+    )
     shape_material_ke_scaled = model.shape_material_ke.numpy().astype(np.float32, copy=False).copy()
     shape_material_kd_scaled = model.shape_material_kd.numpy().astype(np.float32, copy=False).copy()
     shape_material_kf_scaled = model.shape_material_kf.numpy().astype(np.float32, copy=False).copy()
@@ -480,15 +412,15 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
     meta = {
-        "mesh_verts_local": mesh_verts_local.astype(np.float32, copy=False),
-        "mesh_scale": float(args.bunny_scale),
-        "mesh_render_edges": mesh_render_edges.astype(np.int32, copy=False),
-        "mesh_asset_path": mesh_asset_path,
-        "bunny_quat_xyzw": bunny_quat_xyzw,
-        "bunny_pos": bunny_pos.astype(np.float32, copy=False),
-        "bunny_top_z": float(bunny_top_z),
-        "has_bunny": bool(args.add_bunny),
+        "solver_name": "semiimplicit",
+        "rigid_shape": "box",
+        "box_half_extents": box_half_extents,
+        "box_pos": box_pos.astype(np.float32, copy=False),
+        "box_top_z": float(box_top_z),
+        "box_is_dynamic": bool(args.dynamic_box),
+        "has_box": box_enabled,
         "has_ground_plane": bool(args.add_ground_plane),
+        "gravity_vec": np.asarray(gravity_vec, dtype=np.float32),
         "cloth_shift": shift.astype(np.float32, copy=False),
         "render_edges": render_edges,
         "particle_contacts_enabled": True,
@@ -503,12 +435,6 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     return model, meta, n_obj
 
 
-def _assign_shape_material_triplet(model, ke: np.ndarray, kd: np.ndarray, kf: np.ndarray) -> None:
-    model.shape_material_ke.assign(np.asarray(ke, dtype=np.float32))
-    model.shape_material_kd.assign(np.asarray(kd, dtype=np.float32))
-    model.shape_material_kf.assign(np.asarray(kf, dtype=np.float32))
-
-
 def simulate(
     model: newton.Model,
     ir_obj: dict[str, Any],
@@ -517,7 +443,7 @@ def simulate(
     n_obj: int,
     device: str,
 ) -> dict[str, Any]:
-    shape_contacts_enabled = bool(args.shape_contacts) and bool(args.add_bunny)
+    shape_contacts_enabled = bool(args.shape_contacts) and _box_enabled(args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
@@ -570,6 +496,9 @@ def simulate(
     gravity_norm = float(np.linalg.norm(gravity_vec))
     if bool(args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
         gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
+    use_decoupled_shape_materials = bool(args.decouple_shape_materials) or (
+        not np.isclose(float(ir_obj.get("weight_scale", 1.0)), 1.0)
+    )
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -601,7 +530,7 @@ def simulate(
             if contacts is not None:
                 model.collide(state_in, contacts)
 
-            if not bool(args.decouple_shape_materials):
+            if not use_decoupled_shape_materials:
                 solver.step(state_in, state_out, control, contacts, sim_dt)
             else:
                 particle_f = state_in.particle_f if state_in.particle_count else None
@@ -628,7 +557,11 @@ def simulate(
                     meta["shape_material_kf_base"],
                 )
                 eval_body_contact_forces(
-                    model, state_in, contacts, friction_smoothing=solver.friction_smoothing, body_f_out=body_f_work
+                    model,
+                    state_in,
+                    contacts,
+                    friction_smoothing=solver.friction_smoothing,
+                    body_f_out=body_f_work,
                 )
 
                 _assign_shape_material_triplet(
@@ -650,6 +583,7 @@ def simulate(
                     solver.integrate_bodies(model, state_in, state_out, sim_dt, solver.angular_damping)
                     state_in.body_f = body_f_prev
             state_in, state_out = state_out, state_in
+
             if drag > 0.0:
                 if gravity_axis is not None:
                     wp.launch(
@@ -753,15 +687,17 @@ def render_video(
             float(args.camera_yaw),
         )
 
-        radii = model.particle_radius.numpy().astype(np.float32, copy=False)
-        radii = np.minimum(radii * float(args.particle_radius_vis_scale), float(args.particle_radius_vis_min))
-        model.particle_radius.assign(radii)
+        render_radii = compute_visual_particle_radii(
+            model.particle_radius.numpy(),
+            radius_scale=float(args.particle_radius_vis_scale),
+            radius_cap=float(args.particle_radius_vis_min),
+        )
 
         try:
             shape_colors = {}
             for idx, label in enumerate(list(model.shape_label)):
                 name = str(label).lower()
-                if "bunny" in name:
+                if "box" in name:
                     shape_colors[idx] = (0.88, 0.35, 0.28)
                 elif "ground" in name or "plane" in name:
                     shape_colors[idx] = (0.23, 0.26, 0.31)
@@ -780,63 +716,65 @@ def render_video(
         if state.body_qd is not None:
             state.body_qd.zero_()
 
-        ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        n_sim_frames = int(sim_data["particle_q_all"].shape[0])
-        sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
-        sim_duration = max(float(n_sim_frames - 1) * sim_frame_dt, 0.0)
-        video_duration = sim_duration * max(float(args.slowdown), 1.0e-6)
-        n_out_frames = max(1, int(round(video_duration * fps_out)))
-        if n_out_frames == 1 or sim_duration <= 0.0:
-            render_indices = np.zeros((1,), dtype=np.int32)
-        else:
-            sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
-            render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
+        with temporary_particle_radius_override(model, render_radii):
+            ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            n_sim_frames = int(sim_data["particle_q_all"].shape[0])
+            sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+            sim_duration = max(float(n_sim_frames - 1) * sim_frame_dt, 0.0)
+            video_duration = sim_duration * max(float(args.slowdown), 1.0e-6)
+            n_out_frames = max(1, int(round(video_duration * fps_out)))
+            if n_out_frames == 1 or sim_duration <= 0.0:
+                render_indices = np.zeros((1,), dtype=np.int32)
+            else:
+                sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
+                render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
 
-        mass_label = (
-            f"CLOTH TOTAL MASS: {float(meta.get('total_object_mass', 0.0)):.3g} kg"
-            f" | BUNNY MASS: {float(args.rigid_mass):.3g} kg"
-        )
-        for out_idx, sim_idx in enumerate(render_indices):
-            state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
-            state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
+            mass_label = (
+                f"CLOTH TOTAL MASS: {float(meta.get('total_object_mass', 0.0)):.3g} kg"
+                f" | BOX MASS: {float(args.rigid_mass):.3g} kg"
+            )
+            for out_idx, sim_idx in enumerate(render_indices):
+                state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
+                if state.body_q is not None and sim_data["body_q"].shape[1] > 0:
+                    state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
 
-            sim_t = float(sim_idx) * sim_frame_dt
-            viewer.begin_frame(sim_t)
-            viewer.log_state(state)
+                sim_t = float(sim_idx) * sim_frame_dt
+                viewer.begin_frame(sim_t)
+                viewer.log_state(state)
 
-            if args.render_springs and cloth_edges.size and starts_wp is not None and ends_wp is not None:
-                q_obj = sim_data["particle_q_object"][sim_idx]
-                starts_wp.assign(q_obj[cloth_edges[:, 0]].astype(np.float32, copy=False))
-                ends_wp.assign(q_obj[cloth_edges[:, 1]].astype(np.float32, copy=False))
-                viewer.log_lines(
-                    "/demo/cloth_springs",
-                    starts_wp,
-                    ends_wp,
-                    (0.28, 0.54, 0.88),
-                    width=0.01,
-                    hidden=False,
-                )
+                if args.render_springs and cloth_edges.size and starts_wp is not None and ends_wp is not None:
+                    q_obj = sim_data["particle_q_object"][sim_idx]
+                    starts_wp.assign(q_obj[cloth_edges[:, 0]].astype(np.float32, copy=False))
+                    ends_wp.assign(q_obj[cloth_edges[:, 1]].astype(np.float32, copy=False))
+                    viewer.log_lines(
+                        "/demo/cloth_springs",
+                        starts_wp,
+                        ends_wp,
+                        (0.28, 0.54, 0.88),
+                        width=0.01,
+                        hidden=False,
+                    )
 
-            viewer.end_frame()
-            frame = viewer.get_frame(render_ui=False).numpy()
-            if args.overlay_label:
-                frame = overlay_text_lines_rgb(
-                    frame,
-                    [
-                        "CLOTH BUNNY DROP",
-                        "SELF COLLISION: ON",
-                        mass_label,
-                        f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
-                    ],
-                    font_size=int(args.label_font_size),
-                )
+                viewer.end_frame()
+                frame = viewer.get_frame(render_ui=False).numpy()
+                if args.overlay_label:
+                    frame = overlay_text_lines_rgb(
+                        frame,
+                        [
+                            "CLOTH BOX DROP",
+                            "SELF COLLISION: ON",
+                            mass_label,
+                            f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
+                        ],
+                        font_size=int(args.label_font_size),
+                    )
+                assert ffmpeg_proc.stdin is not None
+                ffmpeg_proc.stdin.write(frame.tobytes())
+
             assert ffmpeg_proc.stdin is not None
-            ffmpeg_proc.stdin.write(frame.tobytes())
-
-        assert ffmpeg_proc.stdin is not None
-        ffmpeg_proc.stdin.close()
-        if ffmpeg_proc.wait() != 0:
-            raise RuntimeError("ffmpeg failed")
+            ffmpeg_proc.stdin.close()
+            if ffmpeg_proc.wait() != 0:
+                raise RuntimeError("ffmpeg failed")
     finally:
         try:
             viewer.close()
@@ -857,9 +795,7 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
         body_vel=sim_data["body_vel"],
         sim_dt=np.float32(sim_data["sim_dt"]),
         substeps=np.int32(sim_data["substeps"]),
-        rigid_mesh_vertices_local=meta["mesh_verts_local"],
-        rigid_mesh_scale=np.float32(meta["mesh_scale"]),
-        rigid_mesh_render_edges=meta["mesh_render_edges"],
+        rigid_box_half_extents=np.asarray(meta["box_half_extents"], dtype=np.float32),
         rigid_mass=np.float32(args.rigid_mass),
         drop_height=np.float32(args.drop_height),
         num_object_points=np.int32(n_obj),
@@ -878,22 +814,31 @@ def build_summary(
     particle_contacts_enabled: bool,
     disable_particle_contact_kernel: bool,
 ) -> dict[str, Any]:
+    use_decoupled_shape_materials = bool(args.decouple_shape_materials)
     cloth_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
     body_q = np.asarray(sim_data["body_q"], dtype=np.float32)
-    if body_q.ndim == 3 and body_q.shape[1] > 0 and bool(meta.get("has_bunny", False)):
+    if body_q.ndim == 3 and body_q.shape[1] > 0 and bool(meta.get("has_box", False)):
         body_speed = np.linalg.norm(sim_data["body_vel"][:, 0, :], axis=1)
         body_z = body_q[:, 0, 2]
-        bunny_top_offset = float(meta["bunny_top_z"]) - float(body_z[0])
-        dynamic_bunny_top = body_z + bunny_top_offset
+        box_top_offset = float(meta["box_top_z"]) - float(body_z[0])
+        dynamic_box_top = body_z + box_top_offset
+        box_positions = body_q[:, 0, :3].astype(np.float32, copy=False)
     else:
         body_speed = np.zeros((cloth_q.shape[0],), dtype=np.float32)
-        dynamic_bunny_top = np.zeros((cloth_q.shape[0],), dtype=np.float32)
+        dynamic_box_top = np.full(
+            (cloth_q.shape[0],), float(meta["box_top_z"]), dtype=np.float32
+        )
+        box_positions = np.repeat(
+            np.asarray(meta["box_pos"], dtype=np.float32)[None, :],
+            cloth_q.shape[0],
+            axis=0,
+        )
     cloth_z_min = cloth_q[:, :, 2].min(axis=1)
     cloth_z_mean = cloth_q[:, :, 2].mean(axis=1)
     cloth_z_max = cloth_q[:, :, 2].max(axis=1)
-    clearance_min = cloth_z_min - dynamic_bunny_top
-    clearance_mean = cloth_z_mean - dynamic_bunny_top
-    clearance_max = cloth_z_max - dynamic_bunny_top
+    clearance_min = cloth_z_min - dynamic_box_top
+    clearance_mean = cloth_z_mean - dynamic_box_top
+    clearance_max = cloth_z_max - dynamic_box_top
 
     def _first_negative(values: np.ndarray) -> int | None:
         idx = np.flatnonzero(values < 0.0)
@@ -903,27 +848,44 @@ def build_summary(
     sim_duration = max((sim_data["particle_q_all"].shape[0] - 1) * sim_frame_dt, 0.0)
     video_duration = sim_duration * float(args.slowdown)
     rendered_frame_count = max(1, int(round(video_duration * float(args.render_fps))))
-    object_mass = float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].mean())
-    spring_ke_scale, spring_kd_scale = _effective_spring_scales(args)
+    object_mass = float(np.asarray(ir_obj["mass"], dtype=np.float32).mean())
+    spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
+    bbox_span = cloth_q.reshape(-1, 3).max(axis=0) - cloth_q.reshape(-1, 3).min(axis=0)
+    radii = model.particle_radius.numpy().astype(np.float32)[:n_obj]
+    max_penetration_depth = None
+    final_penetration_p99 = None
+    if bool(meta.get("has_box", False)):
+        hx, hy, hz = [float(v) for v in np.asarray(meta["box_half_extents"]).ravel()]
+        penetration = np.zeros((cloth_q.shape[0], cloth_q.shape[1]), dtype=np.float32)
+        for frame_idx in range(cloth_q.shape[0]):
+            pos = box_positions[frame_idx].astype(np.float32, copy=False)
+            local = cloth_q[frame_idx] - pos[None, :]
+            sdf = _box_signed_distance(local.astype(np.float32, copy=False), hx, hy, hz)
+            penetration[frame_idx] = np.maximum(radii - sdf, 0.0)
+        max_penetration_depth = float(np.max(penetration))
+        final_penetration_p99 = float(np.quantile(penetration[-1], 0.99))
     return {
-        "experiment": "cloth_bunny_drop_object_only",
+        "experiment": "cloth_box_drop_object_only",
         "self_collision_case": "on",
         "ir_path": str(args.ir.resolve()),
         "object_only": True,
         "drop_height_m": float(args.drop_height),
         "object_mass_per_particle": object_mass,
+        "weight_scale": float(ir_obj.get("weight_scale", 1.0)),
         "mass_spring_scale": (
             None if args.mass_spring_scale is None else float(args.mass_spring_scale)
         ),
+        "weight_scale": float(ir_obj.get("weight_scale", 1.0)),
         "n_object_particles": int(n_obj),
-        "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
+        "total_object_mass": float(meta["total_object_mass"]),
         "rigid_mass": float(args.rigid_mass),
-        "mass_ratio": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum() / max(args.rigid_mass, 1.0e-8)),
-        "has_bunny": bool(meta.get("has_bunny", False)),
+        "mass_ratio": float(meta["total_object_mass"] / max(args.rigid_mass, 1.0e-8)),
+        "rigid_geometry": "box",
+        "has_box": bool(meta.get("has_box", False)),
+        "box_is_dynamic": bool(meta.get("box_is_dynamic", False)),
         "has_ground_plane": bool(meta.get("has_ground_plane", False)),
-        "bunny_scale": float(args.bunny_scale),
-        "bunny_quat_xyzw": [float(v) for v in meta["bunny_quat_xyzw"]],
-        "bunny_top_z": float(meta["bunny_top_z"]),
+        "box_half_extents": [float(v) for v in np.asarray(meta["box_half_extents"]).ravel()],
+        "box_top_z": float(meta["box_top_z"]),
         "reverse_z": bool(newton_import_ir.ir_bool(ir_obj, "reverse_z", default=False)),
         "sim_coord_system": "newton_z_up_gravity_negative_z",
         "contact_collision_dist_used": float(np.asarray(ir_obj["contact_collision_dist"]).ravel()[0]),
@@ -939,19 +901,21 @@ def build_summary(
         "render_fps": float(args.render_fps),
         "rendered_frame_count": int(rendered_frame_count),
         "video_duration_target_sec": float(video_duration),
+        "all_particle_positions_finite": bool(np.isfinite(cloth_q).all()),
+        "particle_bbox_span_xyz_m": [float(v) for v in bbox_span],
         "body_speed_initial": float(body_speed[0]),
         "body_speed_final": float(body_speed[-1]),
         "body_speed_max": float(np.max(body_speed)),
-        "dynamic_bunny_top_final_z": float(dynamic_bunny_top[-1]),
+        "dynamic_box_top_final_z": float(dynamic_box_top[-1]),
         "first_min_below_top_frame": _first_negative(clearance_min),
         "first_mean_below_top_frame": _first_negative(clearance_mean),
         "first_all_below_top_frame": _first_negative(clearance_max),
-        "min_clearance_min_to_bunny_top": float(np.min(clearance_min)),
-        "min_clearance_mean_to_bunny_top": float(np.min(clearance_mean)),
-        "min_clearance_max_to_bunny_top": float(np.min(clearance_max)),
-        "final_clearance_min_to_bunny_top": float(clearance_min[-1]),
-        "final_clearance_mean_to_bunny_top": float(clearance_mean[-1]),
-        "final_clearance_max_to_bunny_top": float(clearance_max[-1]),
+        "min_clearance_min_to_box_top": float(np.min(clearance_min)),
+        "min_clearance_mean_to_box_top": float(np.min(clearance_mean)),
+        "min_clearance_max_to_box_top": float(np.min(clearance_max)),
+        "final_clearance_min_to_box_top": float(clearance_min[-1]),
+        "final_clearance_mean_to_box_top": float(clearance_mean[-1]),
+        "final_clearance_max_to_box_top": float(clearance_max[-1]),
         "apply_drag": bool(args.apply_drag),
         "drag_damping_scale": float(args.drag_damping_scale),
         "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
@@ -961,9 +925,12 @@ def build_summary(
             None if args.shape_contact_scale is None else float(args.shape_contact_scale)
         ),
         "shape_contact_damping_multiplier": float(args.shape_contact_damping_multiplier),
+        "use_decoupled_shape_materials": bool(use_decoupled_shape_materials),
         "soft_contact_ke_final": float(model.soft_contact_ke),
         "soft_contact_kd_final": float(model.soft_contact_kd),
         "soft_contact_kf_final": float(model.soft_contact_kf),
+        "max_penetration_depth_box_m": max_penetration_depth,
+        "final_penetration_p99_box_m": final_penetration_p99,
         "particle_contact_ke_final": float(model.particle_ke),
         "particle_contact_kd_final": float(model.particle_kd),
         "particle_contact_kf_final": float(model.particle_kf),
@@ -1002,7 +969,7 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
         scaled_dist *= float(args.on_contact_dist_scale)
         ir_obj["contact_collision_dist"] = np.asarray(scaled_dist, dtype=np.float32)
 
-    print(f"Building cloth+bunny model (on) from {args.ir.resolve()}", flush=True)
+    print(f"Building cloth+box model (on) from {args.ir.resolve()}", flush=True)
     model, meta, n_obj = build_model(ir_obj, args, device)
 
     print("Running simulation (on)...", flush=True)
@@ -1048,6 +1015,9 @@ def main() -> int:
     wp.init()
     device = newton_import_ir.resolve_device(args.device)
     raw_ir = load_ir(args.ir)
+    _maybe_autoset_mass_spring_scale(
+        args, raw_ir, target_total_mass=float(args.target_total_mass)
+    )
 
     run_case(args, raw_ir, device)
     return 0

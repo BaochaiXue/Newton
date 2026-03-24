@@ -59,11 +59,12 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 import demo_cloth_bunny_drop_without_self_contact as off_case
-import demo_cloth_bunny_drop_with_self_contact as on_case
+import demo_cloth_box_drop_with_self_contact as on_case
 
 
 DEFAULT_IR = WORKSPACE_ROOT / "Newton/phystwin_bridge/ir/blue_cloth_double_lift_around/phystwin_ir_v2_bf_strict.npz"
 DEFAULT_TARGET_TOTAL_MASS = 0.1
+DEFAULT_VBD_ITERATIONS = 15
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -96,16 +97,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cloth-shift-y", type=float, default=0.0)
 
     parser.add_argument("--object-mass", type=float, default=None)
+    parser.add_argument("--target-total-mass", type=float, default=DEFAULT_TARGET_TOTAL_MASS)
     parser.add_argument(
-        "--target-total-mass",
-        type=float,
-        default=DEFAULT_TARGET_TOTAL_MASS,
-        help=(
-            "If --mass-spring-scale is omitted, compute alpha = target_total_mass / original_total_object_mass. "
-            "This keeps the stable low-mass OFF playground as the default."
-        ),
+        "--mass-spring-scale", type=float, default=None
     )
-    parser.add_argument("--mass-spring-scale", type=float, default=None)
     parser.add_argument("--spring-ke-scale", type=float, default=1.0)
     parser.add_argument("--spring-kd-scale", type=float, default=1.0)
 
@@ -155,11 +150,21 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--box-hx", type=float, default=0.12)
     parser.add_argument("--box-hy", type=float, default=0.12)
     parser.add_argument("--box-hz", type=float, default=0.08)
+    parser.add_argument("--dynamic-box", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--vbd-iterations", type=int, default=DEFAULT_VBD_ITERATIONS)
+    parser.add_argument("--vbd-tri-ke", type=float, default=1.0e4)
+    parser.add_argument("--vbd-tri-ka", type=float, default=1.0e4)
+    parser.add_argument("--vbd-tri-kd", type=float, default=1.0e-1)
+    parser.add_argument("--vbd-edge-ke", type=float, default=1.0e4)
+    parser.add_argument("--vbd-edge-kd", type=float, default=1.0e0)
+    parser.add_argument("--self-contact-radius-scale", type=float, default=0.35)
+    parser.add_argument("--self-contact-margin-scale", type=float, default=0.6)
+    parser.add_argument("--soft-contact-margin-scale", type=float, default=1.0)
 
     parser.add_argument("--angular-damping", type=float, default=0.05)
     parser.add_argument("--friction-smoothing", type=float, default=1.0)
 
-    parser.add_argument("--on-contact-dist-scale", type=float, default=0.5)
+    parser.add_argument("--on-contact-dist-scale", type=float, default=1.0)
     parser.add_argument("--particle-self-contact-scale", type=float, default=0.1)
 
     parser.add_argument("--camera-pos", type=float, nargs=3, default=(-1.55, 1.35, 1.18), metavar=("X", "Y", "Z"))
@@ -222,8 +227,23 @@ class NewtonClothBunnyPlayground:
         self.args.out_dir = _resolve_workspace_path(self.args.out_dir)
         self.args.out_dir.mkdir(parents=True, exist_ok=True)
 
-        if args.mode == "on" and args.rigid_shape != "bunny":
-            raise ValueError("The current ON build_model supports bunny only. Use --mode off for box.")
+        if args.mode == "on":
+            self.args.rigid_shape = "box"
+            self.args.add_box = bool(getattr(self.args, "add_bunny", True))
+            if self.args.prefix == "cloth_bunny_playground":
+                self.args.prefix = "cloth_box_playground"
+            if float(self.args.sim_dt) == 5.0e-5:
+                self.args.sim_dt = 1.0 / 600.0
+            if int(self.args.substeps) == 667:
+                self.args.substeps = 10
+            if self.args.steps_per_render is None:
+                self.args.steps_per_render = self.args.substeps
+            if float(self.args.rigid_mass) == 0.5:
+                self.args.rigid_mass = 4000.0
+            if float(self.args.body_ke) == 5.0e4:
+                self.args.body_ke = 1.0e4
+            if float(self.args.body_kd) == 5.0e2:
+                self.args.body_kd = 1.0e-2
 
         self.module._validate_scaling_args(self.args)
         self.device = self.module.newton_import_ir.resolve_device(
@@ -232,7 +252,8 @@ class NewtonClothBunnyPlayground:
         self.ir_obj = _prepare_ir_for_runtime(self.module, self.args)
         self.model, self.meta, self.n_obj = self.module.build_model(self.ir_obj, self.args, self.device)
 
-        self.shape_contacts_enabled = bool(self.args.shape_contacts) and bool(self.args.add_bunny)
+        add_rigid_shape = bool(getattr(self.args, "add_box", getattr(self.args, "add_bunny", True)))
+        self.shape_contacts_enabled = bool(self.args.shape_contacts) and add_rigid_shape
         self.cfg = self.module.newton_import_ir.SimConfig(
             ir_path=self.args.ir.resolve(),
             out_dir=self.args.out_dir,
@@ -261,6 +282,7 @@ class NewtonClothBunnyPlayground:
             friction_smoothing=self.cfg.friction_smoothing,
             enable_tri_contact=self.cfg.enable_tri_contact,
         )
+        self.collision_pipeline = None
 
         self.steps_per_render = max(1, int(self.args.steps_per_render or self.args.substeps))
         self.sim_dt = float(self.args.sim_dt)
@@ -338,7 +360,13 @@ class NewtonClothBunnyPlayground:
         self.state_in = self.model.state()
         self.state_out = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts() if self.module.newton_import_ir._use_collision_pipeline(self.cfg, self.ir_obj) else None
+        self.contacts = (
+            self.model.contacts()
+            if self.module.newton_import_ir._use_collision_pipeline(
+                self.cfg, self.ir_obj
+            )
+            else None
+        )
         self.sim_time = 0.0
         self.frame_index = 0
         self.pending_reset = False
@@ -478,8 +506,9 @@ class NewtonClothBunnyPlayground:
             imgui.text(f"shape-contact-scale: {float(self.args.shape_contact_scale):.6e}")
             imgui.text(f"sim_dt: {float(self.sim_dt):.2e}")
             if self.args.mode == "on":
-                imgui.text(f"on_contact_dist_scale: {float(self.args.on_contact_dist_scale):.3f}")
-                imgui.text(f"particle_self_contact_scale: {float(self.args.particle_self_contact_scale):.3f}")
+                imgui.text("Solver: VBD")
+                imgui.text(f"self_contact_radius_scale: {float(self.args.self_contact_radius_scale):.3f}")
+                imgui.text(f"self_contact_margin_scale: {float(self.args.self_contact_margin_scale):.3f}")
             imgui.separator()
             imgui.text(f"sim_time: {self.sim_time:.4f} s")
             imgui.text(f"frame_index: {self.frame_index}")
