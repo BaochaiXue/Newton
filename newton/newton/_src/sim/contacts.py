@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import warp as wp
-from warp import DeviceLike as Devicelike
+try:
+    from warp import DeviceLike as Devicelike
+except ImportError:  # warp<1.10 compatibility
+    Devicelike = object
 
 
 class Contacts:

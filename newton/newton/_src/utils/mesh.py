@@ -18,12 +18,17 @@ import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast, overload
+from typing import Any, cast, overload
 
 import numpy as np
 import warp as wp
 
 from ..geometry.types import Mesh
+
+try:
+    DeviceLike = wp.DeviceLike
+except AttributeError:  # warp<1.10 compatibility
+    DeviceLike = Any
 
 
 @wp.kernel
@@ -60,7 +65,7 @@ def compute_vertex_normals(
     indices: wp.array | np.ndarray,
     normals: wp.array | None = None,
     *,
-    device: wp.DeviceLike = None,
+    device: DeviceLike = None,
     normalize: bool = True,
 ) -> wp.array: ...
 
@@ -71,7 +76,7 @@ def compute_vertex_normals(
     indices: np.ndarray,
     normals: np.ndarray | None = None,
     *,
-    device: wp.DeviceLike = None,
+    device: DeviceLike = None,
     normalize: bool = True,
 ) -> np.ndarray: ...
 
@@ -81,7 +86,7 @@ def compute_vertex_normals(
     indices: wp.array | np.ndarray,
     normals: wp.array | np.ndarray | None = None,
     *,
-    device: wp.DeviceLike = None,
+    device: DeviceLike = None,
     normalize: bool = True,
 ) -> wp.array | np.ndarray:
     """Compute per-vertex normals from triangle indices.

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Two object-only ropes drop onto a Stanford Bunny with real rope-rope contact.
+"""Two object-only ropes interact on the ground with real rope-rope contact.
 
-This demo intentionally targets a stable, readable multi-rope interaction video:
+This demo targets a simpler multi-rope interaction setup:
 
 - duplicate one object-only rope IR into two ropes in one Newton particle system
-- enable Newton particle-particle contact so rope-rope interaction is real
-- keep bunny + ground as rigid external contacts
+- place the lower rope resting on the ground
+- drop the upper rope onto the lower rope
+- keep Newton particle-particle contact enabled only for cross-rope pairs
 - use a fixed close camera for a deterministic offline MP4
 """
 from __future__ import annotations
@@ -24,28 +25,22 @@ import warp as wp
 from rope_bunny_drop_experiment import (
     _apply_drag_correction_ignore_axis,
     _copy_object_only_ir,
-    load_bunny_mesh,
     load_ir,
     newton,
     newton_import_ir,
     overlay_text_lines_rgb,
     path_defaults,
-    quat_to_rotmat,
 )
 
 
 ROPE_SPECS = (
     {
         "name": "rope_a",
-        "offset": np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        "velocity": np.array([0.0, 0.0, 0.0], dtype=np.float32),
         "point_color": (0.27, 0.54, 0.88),
         "line_color": (0.60, 0.80, 0.98),
     },
     {
         "name": "rope_b",
-        "offset": np.array([0.0, 0.0, 0.5], dtype=np.float32),
-        "velocity": np.array([0.0, 0.0, 0.0], dtype=np.float32),
         "point_color": (0.96, 0.63, 0.26),
         "line_color": (0.99, 0.78, 0.49),
     },
@@ -125,10 +120,10 @@ def _default_rope_ir() -> Path:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Two ropes drop onto a Stanford Bunny with rope-rope particle contact.")
+    p = argparse.ArgumentParser(description="One rope rests on the ground while another rope drops onto it with real cross-rope particle contact.")
     p.add_argument("--ir", type=Path, default=_default_rope_ir(), help="Path to rope PhysTwin IR .npz")
     p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--prefix", default="rope_multi_bunny_drop")
+    p.add_argument("--prefix", default="rope_ground_drop")
     p.add_argument("--device", default=path_defaults.default_device())
 
     p.add_argument("--frames", type=int, default=3000)
@@ -136,7 +131,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--substeps", type=int, default=4)
     p.add_argument("--gravity-mag", type=float, default=9.8)
 
-    p.add_argument("--drop-height", type=float, default=0.5, help="Lower rope bottom height above bunny top, in meters.")
+    p.add_argument(
+        "--drop-height",
+        type=float,
+        default=0.35,
+        help="Vertical gap between the lower rope bottom and the upper rope bottom, in meters.",
+    )
+    p.add_argument(
+        "--lower-rope-bottom-z",
+        type=float,
+        default=-1.0,
+        help="Target lower-rope bottom height in world z. Use negative value for automatic radius-based resting height.",
+    )
     p.add_argument("--object-mass", type=float, default=1.0, help="Per-particle rope object mass.")
     p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drag-damping-scale", type=float, default=1.0)
@@ -149,21 +155,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spring-ke-scale", type=float, default=1.0)
     p.add_argument("--spring-kd-scale", type=float, default=1.0)
     p.add_argument("--disable-particle-contact-kernel", action=argparse.BooleanOptionalAction, default=False)
-
-    p.add_argument("--rigid-mass", type=float, default=5.0)
-    p.add_argument("--body-mu", type=float, default=0.5)
-    p.add_argument("--body-ke", type=float, default=5.0e4)
-    p.add_argument("--body-kd", type=float, default=5.0e2)
-    p.add_argument("--bunny-scale", type=float, default=0.12)
-    p.add_argument("--bunny-asset", default="bunny.usd")
-    p.add_argument("--bunny-prim", default="/root/bunny")
-    p.add_argument(
-        "--bunny-quat-xyzw",
-        type=float,
-        nargs=4,
-        default=(0.70710678, 0.0, 0.0, 0.70710678),
-        metavar=("X", "Y", "Z", "W"),
-    )
 
     p.add_argument("--angular-damping", type=float, default=0.05)
     p.add_argument("--friction-smoothing", type=float, default=1.0)
@@ -223,10 +214,14 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
         end = start + n_obj
 
         x = base_x.copy()
-        x += spec["offset"][None, :]
+        offset = np.array(
+            [0.0, 0.0, 0.0 if rope_id == 0 else float(args.drop_height)],
+            dtype=np.float32,
+        )
+        x += offset[None, :]
 
         v = np.zeros_like(base_v)
-        v[:] = spec["velocity"][None, :]
+        v[:] = np.array([0.0, 0.0, 0.0], dtype=np.float32)[None, :]
 
         xs.append(x)
         vs.append(v)
@@ -235,8 +230,8 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
         edges.append(base_edges + start)
         render_edges.append(base_edges[:: max(1, int(args.spring_stride))] + start)
         rope_ranges.append([start, end])
-        rope_offsets.append([float(v) for v in spec["offset"]])
-        rope_velocities.append([float(v) for v in spec["velocity"]])
+        rope_offsets.append([float(v) for v in offset])
+        rope_velocities.append([0.0, 0.0, 0.0])
 
     ir_multi: dict[str, Any] = {}
     for key, value in ir_obj.items():
@@ -296,51 +291,24 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
     newton_import_ir._add_ground_plane(builder, ir_obj, cfg, checks)
 
-    mesh, mesh_verts_local, mesh_tris, mesh_render_edges, mesh_asset_path = load_bunny_mesh(
-        args.bunny_asset, args.bunny_prim
-    )
-    qx, qy, qz, qw = [float(v) for v in args.bunny_quat_xyzw]
-    bunny_quat_xyzw = [qx, qy, qz, qw]
-    bunny_quat = wp.quat(qx, qy, qz, qw)
-
-    verts_rotated = (mesh_verts_local * float(args.bunny_scale)) @ quat_to_rotmat(bunny_quat_xyzw).T
-    bunny_z_min = float(verts_rotated[:, 2].min())
-    bunny_z_max = float(verts_rotated[:, 2].max())
-    bunny_pos = np.array([0.0, 0.0, -bunny_z_min], dtype=np.float32)
-    bunny_top_z = bunny_pos[2] + bunny_z_max
-
     x0 = np.asarray(ir_obj["x0"], dtype=np.float32).copy()
     bbox_min = x0.min(axis=0)
     bbox_max = x0.max(axis=0)
     rope_center_xy = 0.5 * (bbox_min[:2] + bbox_max[:2])
+    base_radius = float(np.asarray(ir_obj["collision_radius"], dtype=np.float32).max())
+    lower_rope_bottom_z = (
+        base_radius if float(args.lower_rope_bottom_z) < 0.0 else float(args.lower_rope_bottom_z)
+    )
     shift = np.array(
         [
             -float(rope_center_xy[0]),
             -float(rope_center_xy[1]),
-            bunny_top_z + float(args.drop_height) - float(bbox_min[2]),
+            lower_rope_bottom_z - float(bbox_min[2]),
         ],
         dtype=np.float32,
     )
     shifted_q = x0 + shift
     builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
-
-    body = builder.add_body(
-        xform=wp.transform(wp.vec3(*bunny_pos.tolist()), bunny_quat),
-        mass=float(args.rigid_mass),
-        inertia=wp.mat33(0.05, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.05),
-        lock_inertia=True,
-        label="bunny",
-    )
-    rigid_cfg = builder.default_shape_cfg.copy()
-    rigid_cfg.mu = float(args.body_mu)
-    rigid_cfg.ke = float(args.body_ke)
-    rigid_cfg.kd = float(args.body_kd)
-    builder.add_shape_mesh(
-        body=body,
-        mesh=mesh,
-        scale=(float(args.bunny_scale), float(args.bunny_scale), float(args.bunny_scale)),
-        cfg=rigid_cfg,
-    )
 
     model = builder.finalize(device=device)
     cross_rope_contact_grid = model.particle_grid
@@ -350,14 +318,9 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
 
     meta = {
-        "mesh_verts_local": mesh_verts_local.astype(np.float32, copy=False),
-        "mesh_scale": float(args.bunny_scale),
-        "mesh_render_edges": mesh_render_edges.astype(np.int32, copy=False),
-        "mesh_asset_path": mesh_asset_path,
-        "bunny_quat_xyzw": bunny_quat_xyzw,
-        "bunny_pos": bunny_pos.astype(np.float32, copy=False),
-        "bunny_top_z": float(bunny_top_z),
         "rope_shift": shift.astype(np.float32, copy=False),
+        "lower_rope_bottom_z": float(lower_rope_bottom_z),
+        "upper_rope_gap_z": float(args.drop_height),
         "rope_particle_ranges": np.asarray(ir_obj["_rope_particle_ranges"], dtype=np.int32),
         "rope_initial_offsets": np.asarray(ir_obj["_rope_initial_offsets"], dtype=np.float32),
         "rope_initial_velocities": np.asarray(ir_obj["_rope_initial_velocities"], dtype=np.float32),
@@ -443,8 +406,14 @@ def simulate(
         q = state_in.particle_q.numpy().astype(np.float32)
         particle_q_all.append(q.copy())
         particle_q_object.append(q[:n_obj].copy())
-        body_q.append(state_in.body_q.numpy().astype(np.float32).copy())
-        body_vel.append(state_in.body_qd.numpy().astype(np.float32)[:, :3].copy())
+        if state_in.body_q is None:
+            body_q.append(np.zeros((0, 7), dtype=np.float32))
+        else:
+            body_q.append(state_in.body_q.numpy().astype(np.float32).copy())
+        if state_in.body_qd is None:
+            body_vel.append(np.zeros((0, 3), dtype=np.float32))
+        else:
+            body_vel.append(state_in.body_qd.numpy().astype(np.float32)[:, :3].copy())
 
         for _ in range(substeps):
             state_in.clear_forces()
@@ -529,7 +498,7 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
     width = int(args.screen_width)
     height = int(args.screen_height)
     fps_out = float(args.render_fps)
-    out_mp4 = args.out_dir / f"{args.prefix}_m{int(args.rigid_mass)}.mp4"
+    out_mp4 = args.out_dir / f"{args.prefix}.mp4"
     cmd = [
         ffmpeg,
         "-y",
@@ -581,9 +550,7 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
             shape_colors = {}
             for idx, label in enumerate(list(model.shape_label)):
                 name = str(label).lower()
-                if "bunny" in name:
-                    shape_colors[idx] = (0.88, 0.35, 0.28)
-                elif "ground" in name or "plane" in name:
+                if "ground" in name or "plane" in name:
                     shape_colors[idx] = (0.23, 0.26, 0.31)
             if shape_colors:
                 viewer.update_shape_colors(shape_colors)
@@ -631,7 +598,8 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
 
         for out_idx, sim_idx in enumerate(render_indices):
             state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
-            state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
+            if state.body_q is not None and sim_data["body_q"].shape[1] > 0:
+                state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
 
             sim_t = float(sim_idx) * sim_frame_dt
             viewer.begin_frame(sim_t)
@@ -668,7 +636,7 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
                     frame,
                     [
                         f"SLOW MOTION {float(args.slowdown):.1f}x",
-                        "Scene: two ropes free-fall onto bunny",
+                        "Scene: lower rope rests on ground, upper rope drops onto it",
                         f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
                     ],
                     font_size=int(args.label_font_size),
@@ -691,7 +659,7 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
 
 
 def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dict[str, Any], n_obj: int) -> Path:
-    scene_npz = args.out_dir / f"{args.prefix}_m{int(args.rigid_mass)}_scene.npz"
+    scene_npz = args.out_dir / f"{args.prefix}_scene.npz"
     np.savez_compressed(
         scene_npz,
         particle_q_all=sim_data["particle_q_all"],
@@ -700,11 +668,8 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
         body_vel=sim_data["body_vel"],
         sim_dt=np.float32(sim_data["sim_dt"]),
         substeps=np.int32(sim_data["substeps"]),
-        rigid_mesh_vertices_local=meta["mesh_verts_local"],
-        rigid_mesh_scale=np.float32(meta["mesh_scale"]),
-        rigid_mesh_render_edges=meta["mesh_render_edges"],
-        rigid_mass=np.float32(args.rigid_mass),
         drop_height=np.float32(args.drop_height),
+        lower_rope_bottom_z=np.float32(meta["lower_rope_bottom_z"]),
         num_object_points=np.int32(n_obj),
         rope_count=np.int32(meta["rope_count"]),
         rope_particle_ranges=np.asarray(meta["rope_particle_ranges"], dtype=np.int32),
@@ -715,13 +680,17 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
 
 
 def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: dict[str, Any], meta: dict[str, Any], n_obj: int, out_mp4: Path) -> dict[str, Any]:
-    body_speed = np.linalg.norm(sim_data["body_vel"][:, 0, :], axis=1)
+    body_speed = (
+        np.linalg.norm(sim_data["body_vel"][:, 0, :], axis=1)
+        if sim_data["body_vel"].shape[1] > 0
+        else np.zeros((sim_data["body_vel"].shape[0],), dtype=np.float32)
+    )
     sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
     sim_duration = max((sim_data["particle_q_all"].shape[0] - 1) * sim_frame_dt, 0.0)
     video_duration = sim_duration * float(args.slowdown)
     rendered_frame_count = max(1, int(round(video_duration * float(args.render_fps))))
     return {
-        "experiment": "rope_multi_bunny_drop_object_only",
+        "experiment": "rope_ground_drop_object_only",
         "ir_path": str(args.ir.resolve()),
         "object_only": True,
         "rope_count": int(meta["rope_count"]),
@@ -729,14 +698,12 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "rope_initial_offsets": np.asarray(meta["rope_initial_offsets"], dtype=np.float32).tolist(),
         "rope_initial_velocities": np.asarray(meta["rope_initial_velocities"], dtype=np.float32).tolist(),
         "drop_height_m": float(args.drop_height),
+        "lower_rope_bottom_z": float(meta["lower_rope_bottom_z"]),
         "object_mass_per_particle": float(args.object_mass),
         "n_object_particles": int(n_obj),
         "total_object_mass": float(n_obj * args.object_mass),
-        "rigid_mass": float(args.rigid_mass),
-        "mass_ratio": float(n_obj * args.object_mass / max(args.rigid_mass, 1.0e-8)),
-        "bunny_scale": float(args.bunny_scale),
-        "bunny_quat_xyzw": [float(v) for v in meta["bunny_quat_xyzw"]],
-        "bunny_top_z": float(meta["bunny_top_z"]),
+        "has_ground_plane": True,
+        "has_rigid_body": False,
         "reverse_z": bool(newton_import_ir.ir_bool(ir_obj, "reverse_z", default=False)),
         "sim_coord_system": "newton_z_up_gravity_negative_z",
         "frames": int(args.frames),
@@ -767,7 +734,7 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
 
 
 def save_summary_json(args: argparse.Namespace, summary: dict[str, Any]) -> Path:
-    summary_path = args.out_dir / f"{args.prefix}_m{int(args.rigid_mass)}_summary.json"
+    summary_path = args.out_dir / f"{args.prefix}_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary_path
 
@@ -788,7 +755,7 @@ def main() -> int:
     ir_multi["_render_edges"] = ir_multi_meta["render_edges"]
     ir_multi["_rope_count"] = np.asarray(ir_multi_meta["rope_count"], dtype=np.int32)
 
-    print(f"Building dual-rope+bunny model from {args.ir.resolve()}", flush=True)
+    print(f"Building dual-rope ground-drop model from {args.ir.resolve()}", flush=True)
     model, meta, n_obj, cross_rope_contact_grid = build_model(ir_multi, args, device)
 
     print("Running simulation...", flush=True)

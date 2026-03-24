@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import trimesh
 import warp as wp
 
 from rope_bunny_drop_experiment import (
@@ -73,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--substeps", type=int, default=667)
     p.add_argument("--gravity-mag", type=float, default=9.8)
     p.add_argument("--drop-height", type=float, default=0.5, help="Cloth bottom height above bunny top, in meters.")
+    p.add_argument("--cloth-shift-x", type=float, default=0.0)
+    p.add_argument("--cloth-shift-y", type=float, default=0.0)
     p.add_argument("--object-mass", type=float, default=None, help="Optional per-particle cloth object mass override.")
     p.add_argument(
         "--mass-spring-scale",
@@ -177,6 +180,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--rigid-mass", type=float, default=4000.0)
+    p.add_argument("--rigid-shape", choices=["bunny", "box"], default="bunny")
     p.add_argument("--body-mu", type=float, default=0.5)
     p.add_argument("--body-ke", type=float, default=5.0e4)
     p.add_argument("--body-kd", type=float, default=5.0e2)
@@ -190,6 +194,9 @@ def parse_args() -> argparse.Namespace:
         default=(0.70710678, 0.0, 0.0, 0.70710678),
         metavar=("X", "Y", "Z", "W"),
     )
+    p.add_argument("--box-hx", type=float, default=0.12)
+    p.add_argument("--box-hy", type=float, default=0.12)
+    p.add_argument("--box-hz", type=float, default=0.08)
 
     p.add_argument("--angular-damping", type=float, default=0.05)
     p.add_argument("--friction-smoothing", type=float, default=1.0)
@@ -357,6 +364,13 @@ def _copy_object_only_ir(ir: dict[str, np.ndarray], args: argparse.Namespace) ->
     return ir_demo
 
 
+def _box_signed_distance(local_points: np.ndarray, hx: float, hy: float, hz: float) -> np.ndarray:
+    q = np.abs(local_points) - np.array([hx, hy, hz], dtype=np.float32)
+    outside = np.linalg.norm(np.maximum(q, 0.0), axis=1)
+    inside = np.minimum(np.max(q, axis=1), 0.0)
+    return outside + inside
+
+
 def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     shape_contacts_enabled = bool(args.shape_contacts) and bool(args.add_bunny)
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(args)
@@ -393,29 +407,39 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     bunny_quat_xyzw = [qx, qy, qz, qw]
     bunny_quat = wp.quat(qx, qy, qz, qw)
     mesh_verts_local = np.zeros((0, 3), dtype=np.float32)
+    mesh_tri_indices = np.zeros((0, 3), dtype=np.int32)
     mesh_render_edges = np.zeros((0, 2), dtype=np.int32)
     mesh_asset_path = ""
-    bunny_pos = np.zeros((3,), dtype=np.float32)
-    bunny_top_z = 0.0
-    if bool(args.add_bunny):
-        mesh, mesh_verts_local, _, mesh_render_edges, mesh_asset_path = load_bunny_mesh(
+    rigid_pos = np.zeros((3,), dtype=np.float32)
+    rigid_top_z = 0.0
+    rigid_quat_xyzw = [1.0, 0.0, 0.0, 0.0]
+    rigid_quat = wp.quat(0.0, 0.0, 0.0, 1.0)
+    rigid_shape = str(args.rigid_shape)
+    box_half_extents = np.array([float(args.box_hx), float(args.box_hy), float(args.box_hz)], dtype=np.float32)
+    if bool(args.add_bunny) and rigid_shape == "bunny":
+        mesh, mesh_verts_local, mesh_tri_indices, mesh_render_edges, mesh_asset_path = load_bunny_mesh(
             args.bunny_asset, args.bunny_prim
         )
         verts_rotated = (mesh_verts_local * float(args.bunny_scale)) @ quat_to_rotmat(bunny_quat_xyzw).T
         bunny_z_min = float(verts_rotated[:, 2].min())
         bunny_z_max = float(verts_rotated[:, 2].max())
-        bunny_pos = np.array([0.0, 0.0, -bunny_z_min], dtype=np.float32)
-        bunny_top_z = bunny_pos[2] + bunny_z_max
+        rigid_pos = np.array([0.0, 0.0, -bunny_z_min], dtype=np.float32)
+        rigid_top_z = rigid_pos[2] + bunny_z_max
+        rigid_quat_xyzw = bunny_quat_xyzw
+        rigid_quat = bunny_quat
+    elif bool(args.add_bunny) and rigid_shape == "box":
+        rigid_pos = np.array([0.0, 0.0, float(args.box_hz)], dtype=np.float32)
+        rigid_top_z = float(args.box_hz * 2.0)
 
     x0 = np.asarray(ir_obj["x0"], dtype=np.float32).copy()
     bbox_min = x0.min(axis=0)
     bbox_max = x0.max(axis=0)
     cloth_center_xy = 0.5 * (bbox_min[:2] + bbox_max[:2])
-    reference_top_z = float(bunny_top_z) if bool(args.add_bunny) else 0.0
+    reference_top_z = float(rigid_top_z) if bool(args.add_bunny) else 0.0
     shift = np.array(
         [
-            -float(cloth_center_xy[0]),
-            -float(cloth_center_xy[1]),
+            -float(cloth_center_xy[0]) + float(args.cloth_shift_x),
+            -float(cloth_center_xy[1]) + float(args.cloth_shift_y),
             reference_top_z + float(args.drop_height) - float(bbox_min[2]),
         ],
         dtype=np.float32,
@@ -425,22 +449,31 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
 
     if bool(args.add_bunny):
         body = builder.add_body(
-            xform=wp.transform(wp.vec3(*bunny_pos.tolist()), bunny_quat),
+            xform=wp.transform(wp.vec3(*rigid_pos.tolist()), rigid_quat),
             mass=float(args.rigid_mass),
             inertia=wp.mat33(0.05, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.05),
             lock_inertia=True,
-            label="bunny",
+            label=str(rigid_shape),
         )
         rigid_cfg = builder.default_shape_cfg.copy()
         rigid_cfg.mu = float(args.body_mu)
         rigid_cfg.ke = float(args.body_ke)
         rigid_cfg.kd = float(args.body_kd)
-        builder.add_shape_mesh(
-            body=body,
-            mesh=mesh,
-            scale=(float(args.bunny_scale), float(args.bunny_scale), float(args.bunny_scale)),
-            cfg=rigid_cfg,
-        )
+        if rigid_shape == "bunny":
+            builder.add_shape_mesh(
+                body=body,
+                mesh=mesh,
+                scale=(float(args.bunny_scale), float(args.bunny_scale), float(args.bunny_scale)),
+                cfg=rigid_cfg,
+            )
+        else:
+            builder.add_shape_box(
+                body=body,
+                hx=float(args.box_hx),
+                hy=float(args.box_hy),
+                hz=float(args.box_hz),
+                cfg=rigid_cfg,
+            )
 
     model = builder.finalize(device=device)
     shape_material_ke_base = model.shape_material_ke.numpy().astype(np.float32, copy=False).copy()
@@ -460,12 +493,15 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
     meta = {
         "mesh_verts_local": mesh_verts_local.astype(np.float32, copy=False),
+        "mesh_tri_indices": mesh_tri_indices.astype(np.int32, copy=False),
         "mesh_scale": float(args.bunny_scale),
         "mesh_render_edges": mesh_render_edges.astype(np.int32, copy=False),
         "mesh_asset_path": mesh_asset_path,
-        "bunny_quat_xyzw": bunny_quat_xyzw,
-        "bunny_pos": bunny_pos.astype(np.float32, copy=False),
-        "bunny_top_z": float(bunny_top_z),
+        "rigid_shape": rigid_shape,
+        "bunny_quat_xyzw": rigid_quat_xyzw,
+        "bunny_pos": rigid_pos.astype(np.float32, copy=False),
+        "bunny_top_z": float(rigid_top_z),
+        "box_half_extents": box_half_extents,
         "has_bunny": bool(args.add_bunny),
         "has_ground_plane": bool(args.add_ground_plane),
         "cloth_shift": shift.astype(np.float32, copy=False),
@@ -739,7 +775,7 @@ def render_video(
             shape_colors = {}
             for idx, label in enumerate(list(model.shape_label)):
                 name = str(label).lower()
-                if "bunny" in name:
+                if "bunny" in name or (meta.get("rigid_shape") == "box" and "shape_1" in name):
                     shape_colors[idx] = (0.88, 0.35, 0.28)
                 elif "ground" in name or "plane" in name:
                     shape_colors[idx] = (0.23, 0.26, 0.31)
@@ -836,8 +872,11 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
         sim_dt=np.float32(sim_data["sim_dt"]),
         substeps=np.int32(sim_data["substeps"]),
         rigid_mesh_vertices_local=meta["mesh_verts_local"],
+        rigid_mesh_indices=meta["mesh_tri_indices"],
         rigid_mesh_scale=np.float32(meta["mesh_scale"]),
         rigid_mesh_render_edges=meta["mesh_render_edges"],
+        rigid_shape_kind=np.asarray(str(meta.get("rigid_shape", "bunny"))),
+        rigid_box_half_extents=np.asarray(meta.get("box_half_extents", np.zeros(3, dtype=np.float32)), dtype=np.float32),
         rigid_mass=np.float32(args.rigid_mass),
         drop_height=np.float32(args.drop_height),
         num_object_points=np.int32(n_obj),
@@ -883,12 +922,56 @@ def build_summary(
     rendered_frame_count = max(1, int(round(video_duration * float(args.render_fps))))
     object_mass = float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].mean())
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(args)
+    max_penetration_depth = None
+    final_penetration_p99 = None
+    if str(meta.get("rigid_shape")) == "box" and body_q.ndim == 3 and body_q.shape[1] > 0:
+        hx, hy, hz = [float(v) for v in np.asarray(meta["box_half_extents"]).ravel()]
+        radii = model.particle_radius.numpy().astype(np.float32)[:n_obj]
+        penetration = np.zeros((cloth_q.shape[0], cloth_q.shape[1]), dtype=np.float32)
+        for frame_idx in range(cloth_q.shape[0]):
+            pos = body_q[frame_idx, 0, :3].astype(np.float32)
+            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
+            rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+            local = (cloth_q[frame_idx] - pos[None, :]) @ rot
+            sdf = _box_signed_distance(local.astype(np.float32, copy=False), hx, hy, hz)
+            penetration[frame_idx] = np.maximum(radii - sdf, 0.0)
+        max_penetration_depth = float(np.max(penetration))
+        final_penetration_p99 = float(np.quantile(penetration[-1], 0.99))
+    bunny_mesh_max_penetration = None
+    bunny_mesh_final_p99_penetration = None
+    if str(meta.get("rigid_shape")) == "bunny" and body_q.ndim == 3 and body_q.shape[1] > 0:
+        faces = np.asarray(meta.get("mesh_tri_indices", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
+        verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+        if faces.size and verts_local.size:
+            radius = model.particle_radius.numpy().astype(np.float32)[:n_obj]
+            scale = float(meta["mesh_scale"])
+            sampled_max = 0.0
+            frame_ids = list(range(0, cloth_q.shape[0], 15))
+            if frame_ids[-1] != cloth_q.shape[0] - 1:
+                frame_ids.append(cloth_q.shape[0] - 1)
+            final_penetration = None
+            for frame_idx in frame_ids:
+                pos = body_q[frame_idx, 0, :3].astype(np.float32)
+                quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
+                rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+                verts = (verts_local * scale) @ rot.T + pos[None, :]
+                tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                _, dist, _ = trimesh.proximity.closest_point(tri, cloth_q[frame_idx].astype(np.float64))
+                penetration = np.maximum(radius - dist.astype(np.float32, copy=False), 0.0)
+                sampled_max = max(sampled_max, float(np.max(penetration)))
+                if frame_idx == cloth_q.shape[0] - 1:
+                    final_penetration = penetration
+            bunny_mesh_max_penetration = float(sampled_max)
+            if final_penetration is not None:
+                bunny_mesh_final_p99_penetration = float(np.quantile(final_penetration, 0.99))
     return {
         "experiment": "cloth_bunny_drop_object_only",
         "self_collision_case": "off",
         "ir_path": str(args.ir.resolve()),
         "object_only": True,
         "drop_height_m": float(args.drop_height),
+        "cloth_shift_x_m": float(args.cloth_shift_x),
+        "cloth_shift_y_m": float(args.cloth_shift_y),
         "object_mass_per_particle": object_mass,
         "mass_spring_scale": (
             None if args.mass_spring_scale is None else float(args.mass_spring_scale)
@@ -897,6 +980,7 @@ def build_summary(
         "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
         "rigid_mass": float(args.rigid_mass),
         "mass_ratio": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum() / max(args.rigid_mass, 1.0e-8)),
+        "rigid_geometry": str(meta.get("rigid_shape", "bunny")),
         "has_bunny": bool(meta.get("has_bunny", False)),
         "has_ground_plane": bool(meta.get("has_ground_plane", False)),
         "bunny_scale": float(args.bunny_scale),
@@ -941,6 +1025,10 @@ def build_summary(
         "soft_contact_ke_final": float(model.soft_contact_ke),
         "soft_contact_kd_final": float(model.soft_contact_kd),
         "soft_contact_kf_final": float(model.soft_contact_kf),
+        "max_penetration_depth_rigid_m": max_penetration_depth,
+        "final_penetration_p99_rigid_m": final_penetration_p99,
+        "max_penetration_depth_bunny_mesh_m": bunny_mesh_max_penetration,
+        "final_penetration_p99_bunny_mesh_m": bunny_mesh_final_p99_penetration,
         "particle_contact_ke_final": float(model.particle_ke),
         "particle_contact_kd_final": float(model.particle_kd),
         "particle_contact_kf_final": float(model.particle_kf),

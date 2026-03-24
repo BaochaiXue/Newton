@@ -64,7 +64,9 @@ def compute_body_forces(
         X_wb = body_q[body_index]
         X_com = body_com[body_index]
         r = collider_impulse_pos[i] - wp.transform_point(X_wb, X_com)
-        wp.atomic_add(body_f, body_index, wp.spatial_vector(f_world, wp.cross(r, f_world)))
+        wp.atomic_add(
+            body_f, body_index, wp.spatial_vector(f_world, wp.cross(r, f_world))
+        )
 
 
 @wp.kernel
@@ -91,7 +93,9 @@ def subtract_body_force(
     delta_v = dt * body_inv_mass[body_id] * wp.spatial_top(f)
     r = wp.transform_get_rotation(body_q[body_id])
 
-    delta_w = dt * wp.quat_rotate(r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f)))
+    delta_w = dt * wp.quat_rotate(
+        r, body_inv_inertia[body_id] * wp.quat_rotate_inv(r, wp.spatial_bottom(f))
+    )
 
     body_q_res[body_id] = body_q[body_id]
     body_qd_res[body_id] = body_qd[body_id] - wp.spatial_vector(delta_v, delta_w)
@@ -169,13 +173,21 @@ class Example:
         self.show_impulses = False
 
         # not required for MuJoCo, but required for other solvers
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(
+            self.model, self.model.joint_q, self.model.joint_qd, self.state_0
+        )
 
         # Additional buffers for tracking two-way coupling forces
         max_nodes = 1 << 20
-        self.collider_impulses = wp.zeros(max_nodes, dtype=wp.vec3, device=self.model.device)
-        self.collider_impulse_pos = wp.zeros(max_nodes, dtype=wp.vec3, device=self.model.device)
-        self.collider_impulse_ids = wp.full(max_nodes, value=-1, dtype=int, device=self.model.device)
+        self.collider_impulses = wp.zeros(
+            max_nodes, dtype=wp.vec3, device=self.model.device
+        )
+        self.collider_impulse_pos = wp.zeros(
+            max_nodes, dtype=wp.vec3, device=self.model.device
+        )
+        self.collider_impulse_ids = wp.full(
+            max_nodes, value=-1, dtype=int, device=self.model.device
+        )
         self.collect_collider_impulses()
 
         # map from collider index to body index
@@ -185,7 +197,10 @@ class Example:
         self.body_sand_forces = wp.zeros_like(self.state_0.body_f)
 
         self.particle_render_colors = wp.full(
-            self.sand_model.particle_count, value=wp.vec3(0.7, 0.6, 0.4), dtype=wp.vec3, device=self.sand_model.device
+            self.sand_model.particle_count,
+            value=wp.vec3(0.7, 0.6, 0.4),
+            dtype=wp.vec3,
+            device=self.sand_model.device,
         )
 
         self.capture()
@@ -223,7 +238,9 @@ class Example:
             self.viewer.apply_forces(self.state_0)
 
             self.model.collide(self.state_0, self.contacts)
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.solver.step(
+                self.state_0, self.state_1, self.control, self.contacts, self.sim_dt
+            )
 
             # swap states
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -231,14 +248,18 @@ class Example:
         self.simulate_sand()
 
     def collect_collider_impulses(self):
-        collider_impulses, collider_impulse_pos, collider_impulse_ids = self.mpm_solver.collect_collider_impulses(
-            self.sand_state_0
+        collider_impulses, collider_impulse_pos, collider_impulse_ids = (
+            self.mpm_solver.collect_collider_impulses(self.sand_state_0)
         )
         self.collider_impulse_ids.fill_(-1)
         n_colliders = min(collider_impulses.shape[0], self.collider_impulses.shape[0])
         self.collider_impulses[:n_colliders].assign(collider_impulses[:n_colliders])
-        self.collider_impulse_pos[:n_colliders].assign(collider_impulse_pos[:n_colliders])
-        self.collider_impulse_ids[:n_colliders].assign(collider_impulse_ids[:n_colliders])
+        self.collider_impulse_pos[:n_colliders].assign(
+            collider_impulse_pos[:n_colliders]
+        )
+        self.collider_impulse_ids[:n_colliders].assign(
+            collider_impulse_ids[:n_colliders]
+        )
 
     def simulate_sand(self):
         # Subtract previously applied impulses from body velocities
@@ -259,7 +280,13 @@ class Example:
                 ],
             )
 
-        self.mpm_solver.step(self.sand_state_0, self.sand_state_0, contacts=None, control=None, dt=self.frame_dt)
+        self.mpm_solver.step(
+            self.sand_state_0,
+            self.sand_state_0,
+            contacts=None,
+            control=None,
+            dt=self.frame_dt,
+        )
 
         # Save impulses to apply back to rigid bodies
         self.collect_collider_impulses()
@@ -300,12 +327,16 @@ class Example:
         )
 
         if self.show_impulses:
-            impulses, pos, _cid = self.mpm_solver.collect_collider_impulses(self.sand_state_0)
+            impulses, pos, _cid = self.mpm_solver.collect_collider_impulses(
+                self.sand_state_0
+            )
             self.viewer.log_lines(
                 "/impulses",
                 starts=pos,
                 ends=pos + impulses,
-                colors=wp.full(pos.shape[0], value=wp.vec3(1.0, 0.0, 0.0), dtype=wp.vec3),
+                colors=wp.full(
+                    pos.shape[0], value=wp.vec3(1.0, 0.0, 0.0), dtype=wp.vec3
+                ),
             )
         else:
             self.viewer.log_lines("/impulses", None, None, None)
@@ -313,7 +344,9 @@ class Example:
         self.viewer.end_frame()
 
     def render_ui(self, imgui):
-        _changed, self.show_impulses = imgui.checkbox("Show Impulses", self.show_impulses)
+        _changed, self.show_impulses = imgui.checkbox(
+            "Show Impulses", self.show_impulses
+        )
 
     def _emit_rigid_bodies(self, builder: newton.ModelBuilder):
         # z height to drop shapes from
@@ -356,7 +389,10 @@ class Example:
             pz = drop_z + float(z_index) * z_separation
             z_index += 1
             body = builder.add_body(
-                xform=wp.transform(p=wp.vec3(float(ox), float(oy), pz), q=wp.normalize(wp.quatf(0.0, 0.0, 0.0, 1.0))),
+                xform=wp.transform(
+                    p=wp.vec3(float(ox), float(oy), pz),
+                    q=wp.normalize(wp.quatf(0.0, 0.0, 0.0, 1.0)),
+                ),
                 mass=75.0,
             )
             builder.add_shape_box(body, hx=float(hx), hy=float(hy), hz=float(hz))
@@ -371,7 +407,9 @@ class Example:
 
         bed_lo = np.array([-1.0, -1.0, 0.0])
         bed_hi = np.array([1.0, 1.0, 0.5])
-        bed_res = np.array(np.ceil(particles_per_cell * (bed_hi - bed_lo) / voxel_size), dtype=int)
+        bed_res = np.array(
+            np.ceil(particles_per_cell * (bed_hi - bed_lo) / voxel_size), dtype=int
+        )
 
         cell_size = (bed_hi - bed_lo) / bed_res
         cell_volume = np.prod(cell_size)
