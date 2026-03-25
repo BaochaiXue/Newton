@@ -50,6 +50,19 @@ ROPE_SPECS = (
 )
 
 
+def _rotate_points_z(points: np.ndarray, yaw_deg: float, center_xy: np.ndarray) -> np.ndarray:
+    yaw = np.deg2rad(float(yaw_deg))
+    if np.isclose(yaw, 0.0):
+        return points
+    c = float(np.cos(yaw))
+    s = float(np.sin(yaw))
+    rot = np.array([[c, -s], [s, c]], dtype=np.float32)
+    rotated = points.copy()
+    xy = rotated[:, :2] - center_xy[None, :]
+    rotated[:, :2] = xy @ rot.T + center_xy[None, :]
+    return rotated
+
+
 @wp.kernel
 def _eval_cross_rope_contact(
     grid: wp.uint64,
@@ -104,6 +117,38 @@ def _eval_cross_rope_contact(
     particle_f[i] = particle_f[i] + f
 
 
+@wp.kernel
+def _eval_ground_contact_range(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_v: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    start: int,
+    count: int,
+    k_contact: float,
+    k_damp: float,
+    k_friction: float,
+    k_mu: float,
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    local_id = wp.tid()
+    i = start + local_id
+    if local_id >= count:
+        return
+    if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
+        return
+
+    x = particle_x[i]
+    v = particle_v[i]
+    radius = particle_radius[i]
+    n = wp.vec3(0.0, 0.0, 1.0)
+    c = x[2] - radius
+    if c <= 0.0:
+        particle_f[i] = particle_f[i] + _pair_penalty_contact_force(
+            n, v, c, k_contact, k_damp, k_friction, k_mu
+        )
+
+
 def _default_rope_ir() -> Path:
     return WORKSPACE_ROOT / "tmp" / "rope_double_hand_object_only_test_ir.npz"
 
@@ -132,7 +177,51 @@ def parse_args() -> argparse.Namespace:
         default=-1.0,
         help="Target lower-rope bottom height in world z. Use negative value for automatic radius-based resting height.",
     )
-    p.add_argument("--object-mass", type=float, default=1.0, help="Per-particle rope object mass.")
+    p.add_argument(
+        "--lower-rope-yaw-deg",
+        type=float,
+        default=0.0,
+        help="World-space yaw rotation [deg] applied to the lower rope before placement.",
+    )
+    p.add_argument(
+        "--upper-rope-yaw-deg",
+        type=float,
+        default=90.0,
+        help="World-space yaw rotation [deg] applied to the upper rope before placement. Default 90 makes a cross.",
+    )
+    p.add_argument(
+        "--object-mass",
+        type=float,
+        default=1.0,
+        help="Fallback per-particle rope mass for ropes without an auto-set total-mass target.",
+    )
+    p.add_argument(
+        "--mass-spring-scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional shared scale applied to both ropes before any rope-specific auto-set-weight target. "
+            "This exists for compatibility with the object-only rope helpers."
+        ),
+    )
+    p.add_argument(
+        "--lower-rope-auto-set-weight",
+        type=float,
+        default=None,
+        help=(
+            "Target lower-rope total deformable mass [kg]. If provided, auto-compute one rope-specific "
+            "scale so lower-rope mass + spring_ke + spring_kd follow the same ratio."
+        ),
+    )
+    p.add_argument(
+        "--upper-rope-auto-set-weight",
+        type=float,
+        default=None,
+        help=(
+            "Target upper-rope total deformable mass [kg]. If provided, auto-compute one rope-specific "
+            "scale so upper-rope mass + spring_ke + spring_kd follow the same ratio."
+        ),
+    )
     p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drag-damping-scale", type=float, default=1.0)
     p.add_argument(
@@ -173,12 +262,124 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _validate_weight_args(args: argparse.Namespace) -> None:
+    if args.mass_spring_scale is not None and float(args.mass_spring_scale) <= 0.0:
+        raise ValueError(f"--mass-spring-scale must be > 0, got {args.mass_spring_scale}")
+    use_auto = (
+        args.lower_rope_auto_set_weight is not None
+        or args.upper_rope_auto_set_weight is not None
+    )
+    if use_auto and not np.isclose(float(args.object_mass), 1.0):
+        raise ValueError(
+            "Per-rope auto-set-weight cannot be used together with a non-default --object-mass. "
+            "Use only one source of rope mass control."
+        )
+    if use_auto and args.mass_spring_scale is not None:
+        raise ValueError(
+            "Per-rope auto-set-weight cannot be used together with --mass-spring-scale. "
+            "The rope-specific weight scales already control mass + spring + contact."
+        )
+    if use_auto and not np.isclose(float(args.spring_ke_scale), 1.0):
+        raise ValueError(
+            "Per-rope auto-set-weight cannot be used together with --spring-ke-scale. "
+            "The rope-specific weight scales already control spring_ke."
+        )
+    if use_auto and not np.isclose(float(args.spring_kd_scale), 1.0):
+        raise ValueError(
+            "Per-rope auto-set-weight cannot be used together with --spring-kd-scale. "
+            "The rope-specific weight scales already control spring_kd."
+        )
+    for flag in ("lower_rope_auto_set_weight", "upper_rope_auto_set_weight"):
+        value = getattr(args, flag)
+        if value is not None and float(value) <= 0.0:
+            raise ValueError(f"--{flag.replace('_', '-')} must be > 0, got {value}")
+
+
+def _resolve_rope_mass_scales(ir_obj: dict[str, Any], args: argparse.Namespace, n_obj: int) -> tuple[np.ndarray, float]:
+    base_mass = np.asarray(ir_obj["mass"], dtype=np.float32).copy()[:n_obj]
+    base_total_mass = float(base_mass.sum())
+    if base_total_mass <= 0.0:
+        raise ValueError(f"Base rope total mass must be > 0, got {base_total_mass}")
+
+    scales = np.ones((len(ROPE_SPECS),), dtype=np.float32)
+    targets = (
+        args.lower_rope_auto_set_weight,
+        args.upper_rope_auto_set_weight,
+    )
+    for rope_id, target_total in enumerate(targets):
+        if target_total is not None:
+            scales[rope_id] = np.float32(float(target_total) / base_total_mass)
+    return scales, base_total_mass
+
+
+def _make_single_rope_contact_ir(
+    ir_multi: dict[str, Any], rope_range: tuple[int, int]
+) -> dict[str, Any]:
+    start, end = [int(v) for v in rope_range]
+    ir_single: dict[str, Any] = {
+        "mass": np.asarray(ir_multi["mass"], dtype=np.float32)[start:end].copy(),
+        "num_object_points": np.asarray(end - start, dtype=np.int32),
+    }
+    for key in (
+        "contact_collide_object_elas",
+        "contact_collide_object_fric",
+        "contact_collide_elas",
+        "contact_collide_fric",
+    ):
+        if key in ir_multi:
+            ir_single[key] = np.array(ir_multi[key], copy=True)
+    return ir_single
+
+
+def _map_object_contact_params(ir: dict[str, Any], cfg: newton_import_ir.SimConfig) -> dict[str, float]:
+    elas_raw = float(newton_import_ir.ir_scalar(ir, "contact_collide_object_elas"))
+    fric_raw = float(newton_import_ir.ir_scalar(ir, "contact_collide_object_fric"))
+    mu = float(np.clip(fric_raw, 0.0, newton_import_ir.MU_MAX))
+    zeta = float(newton_import_ir._restitution_to_damping_ratio(elas_raw))
+    ke = 1.0e3 if cfg.particle_contact_ke is None else float(cfg.particle_contact_ke)
+    ke = max(ke, float(newton_import_ir.EPSILON))
+    m_ref = float(newton_import_ir._resolve_object_mass_reference(ir))
+    m_eff_ref = max(0.5 * m_ref, float(newton_import_ir.EPSILON))
+    kd = 2.0 * zeta * np.sqrt(ke * m_eff_ref)
+    kf = float(cfg.particle_contact_kf_scale) * kd
+    return {"ke": float(ke), "kd": float(kd), "kf": float(kf), "mu": float(mu)}
+
+
+def _map_ground_contact_params(ir: dict[str, Any], cfg: newton_import_ir.SimConfig) -> dict[str, float]:
+    tmp_builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
+    gcfg = tmp_builder.default_shape_cfg.copy()
+    checks: dict[str, Any] = {}
+    newton_import_ir._configure_ground_contact_material(gcfg, ir, cfg, checks, context="two_ropes_ground")
+    return {"ke": float(gcfg.ke), "kd": float(gcfg.kd), "kf": float(gcfg.kf), "mu": float(gcfg.mu)}
+
+
+def _scale_contact_params(params: dict[str, float], weight_scale: float) -> dict[str, float]:
+    alpha = float(weight_scale)
+    if np.isclose(alpha, 1.0):
+        return dict(params)
+    if alpha <= 0.0:
+        raise ValueError(f"weight_scale must be > 0, got {alpha}")
+    scaled = dict(params)
+    scaled["ke"] = float(scaled["ke"] * alpha)
+    scaled["kd"] = float(scaled["kd"] * alpha)
+    scaled["kf"] = float(scaled["kf"] * alpha)
+    return scaled
+
+
 def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
     base_x = np.asarray(ir_obj["x0"], dtype=np.float32).copy()[:n_obj]
     base_v = np.asarray(ir_obj["v0"], dtype=np.float32).copy()[:n_obj]
-    base_mass = np.full(n_obj, float(args.object_mass), dtype=np.float32)
+    base_mass = np.asarray(ir_obj["mass"], dtype=np.float32).copy()[:n_obj]
     base_radius = np.asarray(ir_obj["collision_radius"], dtype=np.float32).copy()[:n_obj]
+    rope_mass_scales, base_total_mass = _resolve_rope_mass_scales(ir_obj, args, n_obj)
+    base_bbox_min = base_x.min(axis=0)
+    base_bbox_max = base_x.max(axis=0)
+    base_center_xy = (0.5 * (base_bbox_min[:2] + base_bbox_max[:2])).astype(np.float32)
+    rope_yaws = np.asarray(
+        [float(args.lower_rope_yaw_deg), float(args.upper_rope_yaw_deg)],
+        dtype=np.float32,
+    )
 
     base_edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
     keep = (base_edges[:, 0] < n_obj) & (base_edges[:, 1] < n_obj)
@@ -202,7 +403,7 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
         start = rope_id * n_obj
         end = start + n_obj
 
-        x = base_x.copy()
+        x = _rotate_points_z(base_x, float(rope_yaws[rope_id]), base_center_xy)
         offset = np.array(
             [0.0, 0.0, 0.0 if rope_id == 0 else float(args.drop_height)],
             dtype=np.float32,
@@ -214,7 +415,7 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
 
         xs.append(x)
         vs.append(v)
-        masses.append(base_mass.copy())
+        masses.append((base_mass * rope_mass_scales[rope_id]).astype(np.float32, copy=False))
         radii.append(base_radius.copy())
         edges.append(base_edges + start)
         render_edges.append(base_edges[:: max(1, int(args.spring_stride))] + start)
@@ -232,7 +433,13 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
     ir_multi["collision_radius"] = np.concatenate(radii, axis=0).astype(np.float32, copy=False)
     ir_multi["spring_edges"] = np.concatenate(edges, axis=0).astype(np.int32, copy=False)
     for key, arr in spring_data.items():
-        ir_multi[key] = np.concatenate([arr.copy() for _ in ROPE_SPECS], axis=0).astype(np.float32, copy=False)
+        if key in ("spring_ke", "spring_kd"):
+            ir_multi[key] = np.concatenate(
+                [(arr * rope_mass_scales[rope_id]).astype(np.float32, copy=False) for rope_id in range(len(ROPE_SPECS))],
+                axis=0,
+            ).astype(np.float32, copy=False)
+        else:
+            ir_multi[key] = np.concatenate([arr.copy() for _ in ROPE_SPECS], axis=0).astype(np.float32, copy=False)
     ir_multi["num_object_points"] = np.asarray(len(ROPE_SPECS) * n_obj, dtype=np.int32)
     ir_multi["self_collision"] = np.asarray(True)
     ir_multi["reverse_z"] = np.asarray(False)
@@ -245,6 +452,11 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
         "rope_initial_velocities": np.asarray(rope_velocities, dtype=np.float32),
         "render_edges": [np.asarray(e, dtype=np.int32) for e in render_edges],
         "rope_count": len(ROPE_SPECS),
+        "rope_mass_scales": rope_mass_scales.astype(np.float32, copy=False),
+        "rope_total_masses": np.asarray([float(m.sum()) for m in masses], dtype=np.float32),
+        "rope_object_mass_per_particle": np.asarray([float(m.mean()) for m in masses], dtype=np.float32),
+        "base_rope_total_mass": float(base_total_mass),
+        "rope_yaws_deg": rope_yaws.astype(np.float32, copy=False),
     }
     return ir_multi, meta
 
@@ -306,6 +518,23 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     model.set_gravity(gravity_vec)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
 
+    rope_ranges = np.asarray(ir_obj["_rope_particle_ranges"], dtype=np.int32)
+    rope_a_ir = _make_single_rope_contact_ir(ir_obj, tuple(rope_ranges[0].tolist()))
+    rope_b_ir = _make_single_rope_contact_ir(ir_obj, tuple(rope_ranges[1].tolist()))
+    rope_mass_scales = np.asarray(ir_obj["_rope_mass_scales"], dtype=np.float32)
+    rope_contact_params = [
+        _scale_contact_params(_map_object_contact_params(rope_a_ir, cfg), float(rope_mass_scales[0])),
+        _scale_contact_params(_map_object_contact_params(rope_b_ir, cfg), float(rope_mass_scales[1])),
+    ]
+    rope_ground_params = [
+        _scale_contact_params(_map_ground_contact_params(rope_a_ir, cfg), float(rope_mass_scales[0])),
+        _scale_contact_params(_map_ground_contact_params(rope_b_ir, cfg), float(rope_mass_scales[1])),
+    ]
+    cross_rope_contact = {
+        key: float(0.5 * (rope_contact_params[0][key] + rope_contact_params[1][key]))
+        for key in ("ke", "kd", "kf", "mu")
+    }
+
     meta = {
         "rope_shift": shift.astype(np.float32, copy=False),
         "lower_rope_bottom_z": float(lower_rope_bottom_z),
@@ -315,6 +544,14 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "rope_initial_velocities": np.asarray(ir_obj["_rope_initial_velocities"], dtype=np.float32),
         "render_edges": [np.asarray(e, dtype=np.int32) for e in ir_obj["_render_edges"]],
         "rope_count": int(ir_obj["_rope_count"]),
+        "rope_mass_scales": np.asarray(ir_obj["_rope_mass_scales"], dtype=np.float32),
+        "rope_total_masses": np.asarray(ir_obj["_rope_total_masses"], dtype=np.float32),
+        "rope_object_mass_per_particle": np.asarray(ir_obj["_rope_object_mass_per_particle"], dtype=np.float32),
+        "base_rope_total_mass": float(np.asarray(ir_obj["_base_rope_total_mass"]).ravel()[0]),
+        "rope_yaws_deg": np.asarray(ir_obj["_rope_yaws_deg"], dtype=np.float32),
+        "rope_contact_params": rope_contact_params,
+        "rope_ground_params": rope_ground_params,
+        "cross_rope_contact_params": cross_rope_contact,
         "cross_rope_contact_enabled": True,
     }
     n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
@@ -324,6 +561,7 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
 def simulate(
     model: newton.Model,
     ir_obj: dict[str, Any],
+    meta: dict[str, Any],
     args: argparse.Namespace,
     n_obj: int,
     device: str,
@@ -360,7 +598,7 @@ def simulate(
     state_in = model.state()
     state_out = model.state()
     control = model.control()
-    contacts = model.contacts() if newton_import_ir._use_collision_pipeline(cfg, ir_obj) else None
+    contacts = None
 
     sim_dt = float(args.sim_dt)
     substeps = max(1, int(args.substeps))
@@ -374,6 +612,12 @@ def simulate(
         search_radius = max(search_radius, float(getattr(newton_import_ir, "EPSILON", 1.0e-6)))
     rope_ranges = np.asarray(ir_obj["_rope_particle_ranges"], dtype=np.int32)
     split_index = int(rope_ranges[1, 0])
+    rope_a_start, rope_a_end = [int(v) for v in rope_ranges[0]]
+    rope_b_start, rope_b_end = [int(v) for v in rope_ranges[1]]
+    rope_a_count = rope_a_end - rope_a_start
+    rope_b_count = rope_b_end - rope_b_start
+    cross_rope_contact = dict(meta["cross_rope_contact_params"])
+    rope_ground_params = list(meta["rope_ground_params"])
 
     drag = 0.0
     if args.apply_drag and "drag_damping" in ir_obj:
@@ -420,10 +664,10 @@ def simulate(
                         model.particle_radius,
                         model.particle_flags,
                         split_index,
-                        float(model.particle_ke),
-                        float(model.particle_kd),
-                        float(model.particle_kf),
-                        float(model.particle_mu),
+                        float(cross_rope_contact["ke"]),
+                        float(cross_rope_contact["kd"]),
+                        float(cross_rope_contact["kf"]),
+                        float(cross_rope_contact["mu"]),
                         float(model.particle_cohesion),
                         float(model.particle_max_radius),
                         state_in.particle_f,
@@ -431,8 +675,42 @@ def simulate(
                     device=device,
                 )
 
-            if contacts is not None:
-                model.collide(state_in, contacts)
+            wp.launch(
+                _eval_ground_contact_range,
+                dim=rope_a_count,
+                inputs=[
+                    state_in.particle_q,
+                    state_in.particle_qd,
+                    model.particle_radius,
+                    model.particle_flags,
+                    rope_a_start,
+                    rope_a_count,
+                    float(rope_ground_params[0]["ke"]),
+                    float(rope_ground_params[0]["kd"]),
+                    float(rope_ground_params[0]["kf"]),
+                    float(rope_ground_params[0]["mu"]),
+                    state_in.particle_f,
+                ],
+                device=device,
+            )
+            wp.launch(
+                _eval_ground_contact_range,
+                dim=rope_b_count,
+                inputs=[
+                    state_in.particle_q,
+                    state_in.particle_qd,
+                    model.particle_radius,
+                    model.particle_flags,
+                    rope_b_start,
+                    rope_b_count,
+                    float(rope_ground_params[1]["ke"]),
+                    float(rope_ground_params[1]["kd"]),
+                    float(rope_ground_params[1]["kf"]),
+                    float(rope_ground_params[1]["mu"]),
+                    state_in.particle_f,
+                ],
+                device=device,
+            )
 
             solver.step(state_in, state_out, control, contacts, sim_dt)
             state_in, state_out = state_out, state_in
@@ -628,7 +906,11 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
                     frame,
                     [
                         f"SLOW MOTION {float(args.slowdown):.1f}x",
-                        "Scene: lower rope rests on ground, upper rope drops onto it",
+                        (
+                            "Scene: lower rope rests on ground, upper rope drops in a cross layout"
+                            if abs(float(meta["rope_yaws_deg"][1] - meta["rope_yaws_deg"][0])) > 1.0e-3
+                            else "Scene: lower rope rests on ground, upper rope drops onto it"
+                        ),
                         f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
                     ],
                     font_size=int(args.label_font_size),
@@ -689,11 +971,22 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "rope_particle_ranges": np.asarray(meta["rope_particle_ranges"], dtype=np.int32).tolist(),
         "rope_initial_offsets": np.asarray(meta["rope_initial_offsets"], dtype=np.float32).tolist(),
         "rope_initial_velocities": np.asarray(meta["rope_initial_velocities"], dtype=np.float32).tolist(),
+        "rope_mass_scales": np.asarray(meta["rope_mass_scales"], dtype=np.float32).tolist(),
+        "base_rope_total_mass": float(meta["base_rope_total_mass"]),
+        "rope_total_masses": np.asarray(meta["rope_total_masses"], dtype=np.float32).tolist(),
+        "rope_object_mass_per_particle": np.asarray(meta["rope_object_mass_per_particle"], dtype=np.float32).tolist(),
+        "rope_yaws_deg": np.asarray(meta["rope_yaws_deg"], dtype=np.float32).tolist(),
+        "cross_rope_contact_params": {k: float(v) for k, v in meta["cross_rope_contact_params"].items()},
+        "rope_ground_contact_params": [
+            {k: float(v) for k, v in rope_params.items()} for rope_params in meta["rope_ground_params"]
+        ],
+        "rope_particle_contact_params": [
+            {k: float(v) for k, v in rope_params.items()} for rope_params in meta["rope_contact_params"]
+        ],
         "drop_height_m": float(args.drop_height),
         "lower_rope_bottom_z": float(meta["lower_rope_bottom_z"]),
-        "object_mass_per_particle": float(args.object_mass),
         "n_object_particles": int(n_obj),
-        "total_object_mass": float(n_obj * args.object_mass),
+        "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
         "has_ground_plane": True,
         "has_rigid_body": False,
         "reverse_z": bool(newton_import_ir.ir_bool(ir_obj, "reverse_z", default=False)),
@@ -733,6 +1026,7 @@ def save_summary_json(args: argparse.Namespace, summary: dict[str, Any]) -> Path
 
 def main() -> int:
     args = parse_args()
+    _validate_weight_args(args)
     args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -746,12 +1040,17 @@ def main() -> int:
     ir_multi["_rope_initial_velocities"] = ir_multi_meta["rope_initial_velocities"]
     ir_multi["_render_edges"] = ir_multi_meta["render_edges"]
     ir_multi["_rope_count"] = np.asarray(ir_multi_meta["rope_count"], dtype=np.int32)
+    ir_multi["_rope_mass_scales"] = np.asarray(ir_multi_meta["rope_mass_scales"], dtype=np.float32)
+    ir_multi["_rope_total_masses"] = np.asarray(ir_multi_meta["rope_total_masses"], dtype=np.float32)
+    ir_multi["_rope_object_mass_per_particle"] = np.asarray(ir_multi_meta["rope_object_mass_per_particle"], dtype=np.float32)
+    ir_multi["_base_rope_total_mass"] = np.asarray(ir_multi_meta["base_rope_total_mass"], dtype=np.float32)
+    ir_multi["_rope_yaws_deg"] = np.asarray(ir_multi_meta["rope_yaws_deg"], dtype=np.float32)
 
     print(f"Building dual-rope ground-drop model from {args.ir.resolve()}", flush=True)
     model, meta, n_obj, cross_rope_contact_grid = build_model(ir_multi, args, device)
 
     print("Running simulation...", flush=True)
-    sim_data = simulate(model, ir_multi, args, n_obj, device, cross_rope_contact_grid)
+    sim_data = simulate(model, ir_multi, meta, args, n_obj, device, cross_rope_contact_grid)
 
     scene_npz = save_scene_npz(args, sim_data, meta, n_obj)
     print(f"  Scene NPZ: {scene_npz}", flush=True)
