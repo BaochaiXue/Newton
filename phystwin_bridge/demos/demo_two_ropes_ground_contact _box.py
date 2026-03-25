@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Two object-only ropes interact on the ground with real rope-rope contact.
+"""Two crossed object-only ropes drop onto a stack of boxes with real rope-rope contact.
 
 This demo targets a simpler multi-rope interaction setup:
 
 - duplicate one object-only rope IR into two ropes in one Newton particle system
-- place the lower rope resting on the ground
-- drop the upper rope onto the lower rope
+- place two crossed ropes above the box stack at different heights
+- drop both ropes onto the same three-box tower
 - keep Newton particle-particle contact enabled only for cross-rope pairs
 - use a fixed close camera for a deterministic offline MP4
 """
@@ -48,6 +48,32 @@ ROPE_SPECS = (
         "line_color": (0.99, 0.78, 0.49),
     },
 )
+
+STACK_BOX_SIZE_M = 0.1
+STACK_BOX_HALF_EXTENTS = np.array(
+    [STACK_BOX_SIZE_M * 0.5, STACK_BOX_SIZE_M * 0.5, STACK_BOX_SIZE_M * 0.5],
+    dtype=np.float32,
+)
+STACK_BOX_COUNT = 3
+STACK_BOX_MASS_KG = 0.1
+
+
+def _stack_box_centers() -> np.ndarray:
+    centers = []
+    hz = float(STACK_BOX_HALF_EXTENTS[2])
+    for box_idx in range(STACK_BOX_COUNT):
+        centers.append([0.0, 0.0, hz + float(box_idx) * (2.0 * hz)])
+    return np.asarray(centers, dtype=np.float32)
+
+
+def _box_inertia_diag(mass: float, hx: float, hy: float, hz: float) -> tuple[float, float, float]:
+    sx = 2.0 * float(hx)
+    sy = 2.0 * float(hy)
+    sz = 2.0 * float(hz)
+    ixx = float(mass) * (sy * sy + sz * sz) / 12.0
+    iyy = float(mass) * (sx * sx + sz * sz) / 12.0
+    izz = float(mass) * (sx * sx + sy * sy) / 12.0
+    return ixx, iyy, izz
 
 
 def _rotate_points_z(points: np.ndarray, yaw_deg: float, center_xy: np.ndarray) -> np.ndarray:
@@ -149,15 +175,97 @@ def _eval_ground_contact_range(
         )
 
 
+@wp.kernel
+def _eval_box_contact_range(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_v: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    box_centers: wp.array(dtype=wp.vec3),
+    box_count: int,
+    start: int,
+    count: int,
+    hx: float,
+    hy: float,
+    hz: float,
+    k_contact: float,
+    k_damp: float,
+    k_friction: float,
+    k_mu: float,
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    local_id = wp.tid()
+    i = start + local_id
+    if local_id >= count:
+        return
+    if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
+        return
+
+    x = particle_x[i]
+    v = particle_v[i]
+    radius = particle_radius[i]
+    f = wp.vec3(0.0)
+
+    box_idx = int(0)
+    while box_idx < box_count:
+        center = box_centers[box_idx]
+        local = x - center
+
+        inside_x = wp.abs(local[0]) <= hx
+        inside_y = wp.abs(local[1]) <= hy
+        inside_z = wp.abs(local[2]) <= hz
+        inside = inside_x and inside_y and inside_z
+
+        n = wp.vec3(0.0, 0.0, 1.0)
+        signed_dist = 0.0
+
+        if inside:
+            dx = hx - wp.abs(local[0])
+            dy = hy - wp.abs(local[1])
+            dz = hz - wp.abs(local[2])
+            if dx <= dy and dx <= dz:
+                n = wp.vec3(1.0 if local[0] >= 0.0 else -1.0, 0.0, 0.0)
+                signed_dist = -dx
+            elif dy <= dz:
+                n = wp.vec3(0.0, 1.0 if local[1] >= 0.0 else -1.0, 0.0)
+                signed_dist = -dy
+            else:
+                n = wp.vec3(0.0, 0.0, 1.0 if local[2] >= 0.0 else -1.0)
+                signed_dist = -dz
+        else:
+            closest = wp.vec3(
+                wp.clamp(local[0], -hx, hx),
+                wp.clamp(local[1], -hy, hy),
+                wp.clamp(local[2], -hz, hz),
+            )
+            delta = local - closest
+            dist = wp.length(delta)
+            if dist > 1.0e-8:
+                n = delta / dist
+                signed_dist = dist
+            else:
+                n = wp.vec3(0.0, 0.0, 1.0)
+                signed_dist = 0.0
+
+        c = signed_dist - radius
+        if c <= 0.0:
+            f += _pair_penalty_contact_force(
+                n, v, c, k_contact, k_damp, k_friction, k_mu
+            )
+        box_idx += 1
+
+    particle_f[i] = particle_f[i] + f
+
+
 def _default_rope_ir() -> Path:
     return WORKSPACE_ROOT / "tmp" / "rope_double_hand_object_only_test_ir.npz"
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="One rope rests on the ground while another rope drops onto it with real cross-rope particle contact.")
+    p = argparse.ArgumentParser(description="Two crossed ropes drop onto a three-box stack with real cross-rope particle contact.")
     p.add_argument("--ir", type=Path, default=_default_rope_ir(), help="Path to rope PhysTwin IR .npz")
     p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--prefix", default="rope_ground_drop")
+    p.add_argument("--prefix", default="rope_box_stack_drop")
     p.add_argument("--device", default=path_defaults.default_device())
 
     p.add_argument("--frames", type=int, default=3000)
@@ -168,14 +276,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--drop-height",
         type=float,
-        default=0.35,
-        help="Vertical gap between the lower rope bottom and the upper rope bottom, in meters.",
+        default=0.15,
+        help="Vertical gap between the lower-rope bottom height and the upper-rope bottom height, in meters.",
     )
     p.add_argument(
         "--lower-rope-bottom-z",
         type=float,
-        default=-1.0,
-        help="Target lower-rope bottom height in world z. Use negative value for automatic radius-based resting height.",
+        default=0.35,
+        help="Target lower-rope bottom height in world z. Default 0.35 m places it just above the 0.3 m box stack.",
     )
     p.add_argument(
         "--lower-rope-yaw-deg",
@@ -501,6 +609,34 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
     newton_import_ir._add_ground_plane(builder, ir_obj, cfg, checks)
 
+    box_centers = _stack_box_centers()
+    box_cfg = builder.default_shape_cfg.copy()
+    box_ixx, box_iyy, box_izz = _box_inertia_diag(
+        STACK_BOX_MASS_KG,
+        float(STACK_BOX_HALF_EXTENTS[0]),
+        float(STACK_BOX_HALF_EXTENTS[1]),
+        float(STACK_BOX_HALF_EXTENTS[2]),
+    )
+    for box_idx, box_center in enumerate(box_centers):
+        box_body = builder.add_body(
+            xform=wp.transform(wp.vec3(*box_center.tolist()), wp.quat_identity()),
+            mass=float(STACK_BOX_MASS_KG),
+            inertia=wp.mat33(
+                box_ixx, 0.0, 0.0,
+                0.0, box_iyy, 0.0,
+                0.0, 0.0, box_izz,
+            ),
+            lock_inertia=True,
+            label=f"stack_box_{box_idx}",
+        )
+        builder.add_shape_box(
+            body=box_body,
+            hx=float(STACK_BOX_HALF_EXTENTS[0]),
+            hy=float(STACK_BOX_HALF_EXTENTS[1]),
+            hz=float(STACK_BOX_HALF_EXTENTS[2]),
+            cfg=box_cfg,
+        )
+
     x0 = np.asarray(ir_obj["x0"], dtype=np.float32).copy()
     bbox_min = x0.min(axis=0)
     bbox_max = x0.max(axis=0)
@@ -522,7 +658,6 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
 
     model = builder.finalize(device=device)
     cross_rope_contact_grid = model.particle_grid
-    model.particle_grid = None
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     model.set_gravity(gravity_vec)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
@@ -547,6 +682,7 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     meta = {
         "rope_shift": shift.astype(np.float32, copy=False),
         "lower_rope_bottom_z": float(lower_rope_bottom_z),
+        "upper_rope_bottom_z": float(lower_rope_bottom_z + float(args.drop_height)),
         "upper_rope_gap_z": float(args.drop_height),
         "rope_particle_ranges": np.asarray(ir_obj["_rope_particle_ranges"], dtype=np.int32),
         "rope_initial_offsets": np.asarray(ir_obj["_rope_initial_offsets"], dtype=np.float32),
@@ -562,6 +698,11 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "rope_ground_params": rope_ground_params,
         "cross_rope_contact_params": cross_rope_contact,
         "cross_rope_contact_enabled": True,
+        "box_centers": box_centers.astype(np.float32, copy=False),
+        "box_half_extents": STACK_BOX_HALF_EXTENTS.astype(np.float32, copy=False),
+        "box_count": int(STACK_BOX_COUNT),
+        "box_stack_top_z": float(np.max(box_centers[:, 2] + STACK_BOX_HALF_EXTENTS[2])),
+        "box_mass_each_kg": float(STACK_BOX_MASS_KG),
     }
     n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
     return model, meta, n_obj, cross_rope_contact_grid
@@ -607,7 +748,7 @@ def simulate(
     state_in = model.state()
     state_out = model.state()
     control = model.control()
-    contacts = None
+    contacts = model.contacts() if newton_import_ir._use_collision_pipeline(cfg, ir_obj) else None
 
     sim_dt = float(args.sim_dt)
     substeps = max(1, int(args.substeps))
@@ -684,42 +825,8 @@ def simulate(
                     device=device,
                 )
 
-            wp.launch(
-                _eval_ground_contact_range,
-                dim=rope_a_count,
-                inputs=[
-                    state_in.particle_q,
-                    state_in.particle_qd,
-                    model.particle_radius,
-                    model.particle_flags,
-                    rope_a_start,
-                    rope_a_count,
-                    float(rope_ground_params[0]["ke"]),
-                    float(rope_ground_params[0]["kd"]),
-                    float(rope_ground_params[0]["kf"]),
-                    float(rope_ground_params[0]["mu"]),
-                    state_in.particle_f,
-                ],
-                device=device,
-            )
-            wp.launch(
-                _eval_ground_contact_range,
-                dim=rope_b_count,
-                inputs=[
-                    state_in.particle_q,
-                    state_in.particle_qd,
-                    model.particle_radius,
-                    model.particle_flags,
-                    rope_b_start,
-                    rope_b_count,
-                    float(rope_ground_params[1]["ke"]),
-                    float(rope_ground_params[1]["kd"]),
-                    float(rope_ground_params[1]["kf"]),
-                    float(rope_ground_params[1]["mu"]),
-                    state_in.particle_f,
-                ],
-                device=device,
-            )
+            if contacts is not None:
+                model.collide(state_in, contacts)
 
             solver.step(state_in, state_out, control, contacts, sim_dt)
             state_in, state_out = state_out, state_in
@@ -828,6 +935,8 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
                 name = str(label).lower()
                 if "ground" in name or "plane" in name:
                     shape_colors[idx] = (0.23, 0.26, 0.31)
+                elif "stack_box" in name:
+                    shape_colors[idx] = (0.82, 0.73, 0.58)
             if shape_colors:
                 viewer.update_shape_colors(shape_colors)
         except Exception:
@@ -979,11 +1088,7 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
                     frame,
                     [
                         f"SLOW MOTION {float(args.slowdown):.1f}x",
-                        (
-                            "Scene: lower rope rests on ground, upper rope drops in a cross layout"
-                            if abs(float(meta["rope_yaws_deg"][1] - meta["rope_yaws_deg"][0])) > 1.0e-3
-                            else "Scene: lower rope rests on ground, upper rope drops onto it"
-                        ),
+                        "Scene: two crossed ropes drop onto a 3-box stack",
                         f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
                     ],
                     font_size=int(args.label_font_size),
@@ -1017,21 +1122,38 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
         substeps=np.int32(sim_data["substeps"]),
         drop_height=np.float32(args.drop_height),
         lower_rope_bottom_z=np.float32(meta["lower_rope_bottom_z"]),
+        upper_rope_bottom_z=np.float32(meta["upper_rope_bottom_z"]),
         num_object_points=np.int32(n_obj),
         rope_count=np.int32(meta["rope_count"]),
         rope_particle_ranges=np.asarray(meta["rope_particle_ranges"], dtype=np.int32),
         rope_initial_offsets=np.asarray(meta["rope_initial_offsets"], dtype=np.float32),
         rope_initial_velocities=np.asarray(meta["rope_initial_velocities"], dtype=np.float32),
+        box_centers=np.asarray(meta["box_centers"], dtype=np.float32),
+        box_half_extents=np.asarray(meta["box_half_extents"], dtype=np.float32),
     )
     return scene_npz
 
 
 def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: dict[str, Any], meta: dict[str, Any], n_obj: int, out_mp4: Path) -> dict[str, Any]:
-    body_speed = (
-        np.linalg.norm(sim_data["body_vel"][:, 0, :], axis=1)
-        if sim_data["body_vel"].shape[1] > 0
-        else np.zeros((sim_data["body_vel"].shape[0],), dtype=np.float32)
-    )
+    if sim_data["body_vel"].shape[1] > 0:
+        body_speed_all = np.linalg.norm(sim_data["body_vel"], axis=2).astype(np.float32, copy=False)
+        body_speed = body_speed_all[:, 0]
+        body_speed_max_all = float(np.max(body_speed_all))
+        body_speed_final_all = body_speed_all[-1].astype(np.float32, copy=False)
+    else:
+        body_speed_all = np.zeros((sim_data["body_vel"].shape[0], 0), dtype=np.float32)
+        body_speed = np.zeros((sim_data["body_vel"].shape[0],), dtype=np.float32)
+        body_speed_max_all = 0.0
+        body_speed_final_all = np.zeros((0,), dtype=np.float32)
+
+    if sim_data["body_q"].shape[1] > 0:
+        body_pos_all = sim_data["body_q"][:, :, :3].astype(np.float32, copy=False)
+        body_displacement = np.linalg.norm(body_pos_all - body_pos_all[0:1], axis=2).astype(np.float32, copy=False)
+        body_displacement_final = body_displacement[-1].astype(np.float32, copy=False)
+        body_displacement_max = body_displacement.max(axis=0).astype(np.float32, copy=False)
+    else:
+        body_displacement_final = np.zeros((0,), dtype=np.float32)
+        body_displacement_max = np.zeros((0,), dtype=np.float32)
     sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
     sim_duration = max((sim_data["particle_q_all"].shape[0] - 1) * sim_frame_dt, 0.0)
     video_duration = sim_duration * float(args.slowdown)
@@ -1041,7 +1163,7 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
     if "video_duration_target_sec" in sim_data:
         video_duration = float(sim_data["video_duration_target_sec"])
     return {
-        "experiment": "rope_ground_drop_object_only",
+        "experiment": "rope_box_stack_drop_object_only",
         "ir_path": str(args.ir.resolve()),
         "object_only": True,
         "rope_count": int(meta["rope_count"]),
@@ -1062,10 +1184,18 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         ],
         "drop_height_m": float(args.drop_height),
         "lower_rope_bottom_z": float(meta["lower_rope_bottom_z"]),
+        "upper_rope_bottom_z": float(meta["upper_rope_bottom_z"]),
         "n_object_particles": int(n_obj),
         "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
         "has_ground_plane": True,
-        "has_rigid_body": False,
+        "has_rigid_body": True,
+        "has_box_stack": True,
+        "box_count": int(meta["box_count"]),
+        "box_mass_each_kg": float(meta["box_mass_each_kg"]),
+        "box_total_mass_kg": float(meta["box_mass_each_kg"]) * int(meta["box_count"]),
+        "box_half_extents": [float(v) for v in np.asarray(meta["box_half_extents"], dtype=np.float32)],
+        "box_centers": np.asarray(meta["box_centers"], dtype=np.float32).tolist(),
+        "box_stack_top_z": float(meta["box_stack_top_z"]),
         "reverse_z": bool(newton_import_ir.ir_bool(ir_obj, "reverse_z", default=False)),
         "sim_coord_system": "newton_z_up_gravity_negative_z",
         "frames": int(args.frames),
@@ -1088,6 +1218,10 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "body_speed_initial": float(body_speed[0]),
         "body_speed_final": float(body_speed[-1]),
         "body_speed_max": float(np.max(body_speed)),
+        "body_speed_final_all": body_speed_final_all.tolist(),
+        "body_speed_max_all": float(body_speed_max_all),
+        "box_displacement_final_m": body_displacement_final.tolist(),
+        "box_displacement_max_m": body_displacement_max.tolist(),
         "apply_drag": bool(args.apply_drag),
         "drag_damping_scale": float(args.drag_damping_scale),
         "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
