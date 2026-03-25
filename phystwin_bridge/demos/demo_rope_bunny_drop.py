@@ -30,6 +30,14 @@ from typing import Any
 
 import numpy as np
 import warp as wp
+from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
+from newton._src.solvers.semi_implicit.kernels_contact import (
+    eval_body_contact_forces,
+    eval_particle_body_contact_forces,
+    eval_particle_contact_forces,
+    eval_triangle_contact_forces,
+)
+from newton._src.solvers.semi_implicit.kernels_particle import eval_spring_forces
 
 from demo_shared import (
     CORE_DIR,
@@ -116,8 +124,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--substeps", type=int, default=4)
     p.add_argument("--gravity-mag", type=float, default=9.8)
 
-    p.add_argument("--drop-height", type=float, default=5.0, help="Rope bottom height above bunny top, in meters.")
+    p.add_argument("--drop-height", type=float, default=1.0, help="Rope bottom height above bunny top, in meters.")
     p.add_argument("--object-mass", type=float, default=1.0, help="Per-particle rope object mass.")
+    p.add_argument(
+        "--auto-set-weight",
+        type=float,
+        default=None,
+        help=(
+            "Target total deformable mass [kg]. If provided, auto-compute the needed "
+            "weight_scale so mass + spring + contact all follow the same ratio."
+        ),
+    )
+    p.add_argument(
+        "--mass-spring-scale",
+        type=float,
+        default=None,
+        help=(
+            "Single scale factor applied consistently to object mass, spring_ke, and spring_kd. "
+            "Use this instead of separately changing mass / spring-ke-scale / spring-kd-scale."
+        ),
+    )
     p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drag-damping-scale", type=float, default=1.0)
     p.add_argument(
@@ -128,6 +154,61 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--spring-ke-scale", type=float, default=1.0)
     p.add_argument("--spring-kd-scale", type=float, default=1.0)
+    p.add_argument(
+        "--shape-contact-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale factor applied to the actual particle-shape contact stiffness chain used by "
+            "SemiImplicit: soft_contact_ke and shape_material_ke. "
+            "If omitted, particle-shape contact stays at baseline values."
+        ),
+    )
+    p.add_argument(
+        "--shape-contact-damping-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Extra multiplier applied on top of shape-contact-scale for kd/kf terms in the "
+            "actual particle-shape contact chain."
+        ),
+    )
+    p.add_argument(
+        "--ground-shape-contact-scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for ground shape_material_ke scaling. "
+            "If omitted, ground uses --shape-contact-scale."
+        ),
+    )
+    p.add_argument(
+        "--ground-shape-contact-damping-multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for ground shape_material_kd/kf scaling multiplier. "
+            "If omitted, ground uses --shape-contact-damping-multiplier."
+        ),
+    )
+    p.add_argument(
+        "--bunny-shape-contact-scale",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for bunny shape_material_ke scaling. "
+            "If omitted, bunny uses --shape-contact-scale."
+        ),
+    )
+    p.add_argument(
+        "--bunny-shape-contact-damping-multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for bunny shape_material_kd/kf scaling multiplier. "
+            "If omitted, bunny uses --shape-contact-damping-multiplier."
+        ),
+    )
     p.add_argument("--disable-particle-contact-kernel", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--rigid-mass", type=float, default=5.0)
@@ -174,6 +255,181 @@ def parse_args() -> argparse.Namespace:
 
 def load_ir(path: Path) -> dict[str, np.ndarray]:
     return newton_import_ir.load_ir(path.resolve())
+
+
+def _validate_scaling_args(args: argparse.Namespace) -> None:
+    if args.auto_set_weight is not None and float(args.auto_set_weight) <= 0.0:
+        raise ValueError(f"--auto-set-weight must be > 0, got {args.auto_set_weight}")
+    if args.auto_set_weight is not None and not np.isclose(float(args.object_mass), 1.0):
+        raise ValueError(
+            "--auto-set-weight cannot be used together with a non-default --object-mass. "
+            "Use only one source of deformable mass control."
+        )
+    if args.auto_set_weight is not None and args.mass_spring_scale is not None:
+        raise ValueError(
+            "--auto-set-weight cannot be used together with --mass-spring-scale. "
+            "Use only one source of deformable mass scaling."
+        )
+    if args.auto_set_weight is not None and not np.isclose(float(args.spring_ke_scale), 1.0):
+        raise ValueError(
+            "--auto-set-weight cannot be used together with --spring-ke-scale. "
+            "The auto-computed weight_scale already controls spring_ke."
+        )
+    if args.auto_set_weight is not None and not np.isclose(float(args.spring_kd_scale), 1.0):
+        raise ValueError(
+            "--auto-set-weight cannot be used together with --spring-kd-scale. "
+            "The auto-computed weight_scale already controls spring_kd."
+        )
+    if args.mass_spring_scale is None:
+        return
+    scale = float(args.mass_spring_scale)
+    if scale <= 0.0:
+        raise ValueError(f"--mass-spring-scale must be > 0, got {scale}")
+    if args.object_mass is not None and not np.isclose(float(args.object_mass), 1.0):
+        raise ValueError(
+            "--mass-spring-scale cannot be used together with a non-default --object-mass. "
+            "Use either the unified scale or an absolute per-particle mass override."
+        )
+    if not np.isclose(float(args.spring_ke_scale), 1.0):
+        raise ValueError(
+            "--mass-spring-scale cannot be used together with --spring-ke-scale. "
+            "The unified scale already controls spring_ke."
+        )
+    if not np.isclose(float(args.spring_kd_scale), 1.0):
+        raise ValueError(
+            "--mass-spring-scale cannot be used together with --spring-kd-scale. "
+            "The unified scale already controls spring_kd."
+        )
+
+
+def _effective_object_mass_array(
+    ir_demo: dict[str, Any], args: argparse.Namespace, n_obj: int
+) -> np.ndarray:
+    mass = np.asarray(ir_demo["mass"], dtype=np.float32).copy()[:n_obj]
+    if args.mass_spring_scale is not None:
+        mass *= float(args.mass_spring_scale)
+    elif args.object_mass is not None:
+        mass.fill(float(args.object_mass))
+    return mass
+
+
+def _mass_ratio_scale(original_mass: np.ndarray, current_mass: np.ndarray) -> float:
+    original_total = float(np.asarray(original_mass, dtype=np.float32).sum())
+    current_total = float(np.asarray(current_mass, dtype=np.float32).sum())
+    if original_total <= 0.0:
+        raise ValueError(f"Original total mass must be > 0, got {original_total}")
+    return current_total / original_total
+
+
+def _effective_spring_scales(
+    ir_demo: dict[str, Any], args: argparse.Namespace
+) -> tuple[float, float]:
+    weight_scale = float(ir_demo.get("weight_scale", 1.0))
+    return (
+        float(args.spring_ke_scale) * weight_scale,
+        float(args.spring_kd_scale) * weight_scale,
+    )
+
+
+def _maybe_autoset_mass_spring_scale(
+    args: argparse.Namespace, raw_ir: dict[str, np.ndarray]
+) -> None:
+    if args.auto_set_weight is None:
+        return
+    if args.mass_spring_scale is not None:
+        return
+    n_obj = int(np.asarray(raw_ir["num_object_points"]).ravel()[0])
+    total_mass = float(np.asarray(raw_ir["mass"], dtype=np.float32)[:n_obj].sum())
+    if total_mass <= 0.0:
+        raise ValueError(f"IR total object mass must be > 0, got {total_mass}")
+    args.mass_spring_scale = float(args.auto_set_weight) / total_mass
+
+
+def _apply_particle_contact_scaling(model: Any, *, weight_scale: float) -> None:
+    alpha = float(weight_scale)
+    if np.isclose(alpha, 1.0):
+        return
+    if alpha <= 0.0:
+        raise ValueError(f"weight_scale must be > 0, got {alpha}")
+    model.particle_ke = float(model.particle_ke * alpha)
+    model.particle_kd = float(model.particle_kd * alpha)
+    model.particle_kf = float(model.particle_kf * alpha)
+
+
+def _apply_shape_contact_scaling(
+    model: Any, args: argparse.Namespace, *, weight_scale: float = 1.0
+) -> None:
+    explicit_alpha = args.shape_contact_scale
+    base_alpha = 1.0 if explicit_alpha is None else float(explicit_alpha)
+    auto_alpha = float(weight_scale)
+    alpha = base_alpha * auto_alpha
+    if (
+        explicit_alpha is None
+        and np.isclose(auto_alpha, 1.0)
+        and args.ground_shape_contact_scale is None
+        and args.bunny_shape_contact_scale is None
+    ):
+        return
+    if alpha <= 0.0:
+        raise ValueError(f"shape-contact-scale must be > 0, got {alpha}")
+    damping_mult = float(args.shape_contact_damping_multiplier)
+    if damping_mult <= 0.0:
+        raise ValueError(
+            f"--shape-contact-damping-multiplier must be > 0, got {damping_mult}"
+        )
+
+    model.soft_contact_ke = float(model.soft_contact_ke * alpha)
+    model.soft_contact_kd = float(model.soft_contact_kd * alpha * damping_mult)
+    model.soft_contact_kf = float(model.soft_contact_kf * alpha * damping_mult)
+
+    labels = [str(label).lower() for label in list(model.shape_label)]
+    has_ground = any(("ground" in label or "plane" in label) for label in labels)
+
+    ground_alpha = (
+        base_alpha
+        if args.ground_shape_contact_scale is None
+        else float(args.ground_shape_contact_scale)
+    )
+    ground_dmult = (
+        (damping_mult if explicit_alpha is not None else 1.0)
+        if args.ground_shape_contact_damping_multiplier is None
+        else float(args.ground_shape_contact_damping_multiplier)
+    )
+    bunny_alpha = (
+        base_alpha
+        if args.bunny_shape_contact_scale is None
+        else float(args.bunny_shape_contact_scale)
+    )
+    bunny_dmult = (
+        damping_mult
+        if args.bunny_shape_contact_damping_multiplier is None
+        else float(args.bunny_shape_contact_damping_multiplier)
+    )
+
+    for arr_name in ("shape_material_ke", "shape_material_kd", "shape_material_kf"):
+        arr = getattr(model, arr_name)
+        vals = arr.numpy().astype(np.float32, copy=False).copy()
+        for idx, label in enumerate(labels):
+            scale = np.float32(alpha)
+            dmult = np.float32(damping_mult)
+            if "ground" in label or "plane" in label:
+                scale = np.float32(ground_alpha * auto_alpha)
+                dmult = np.float32(ground_dmult)
+            elif "bunny" in label or has_ground:
+                scale = np.float32(bunny_alpha * auto_alpha)
+                dmult = np.float32(bunny_dmult)
+            vals[idx] *= scale
+            if arr_name != "shape_material_ke":
+                vals[idx] *= dmult
+        arr.assign(vals)
+
+
+def _assign_shape_material_triplet(
+    model: Any, ke: np.ndarray, kd: np.ndarray, kf: np.ndarray
+) -> None:
+    model.shape_material_ke.assign(np.asarray(ke, dtype=np.float32))
+    model.shape_material_kd.assign(np.asarray(kd, dtype=np.float32))
+    model.shape_material_kf.assign(np.asarray(kf, dtype=np.float32))
 
 
 def load_bunny_mesh(asset_name: str, prim_path: str):
@@ -266,9 +522,16 @@ def _copy_object_only_ir(ir: dict[str, np.ndarray], args: argparse.Namespace) ->
         v0[:, 2] *= -1.0
     v0[:] = 0.0
 
+    mass = _effective_object_mass_array(ir_demo, args, n_obj)
+    original_mass = np.asarray(ir_demo["mass"], dtype=np.float32).copy()[:n_obj]
+    weight_scale = _mass_ratio_scale(original_mass, mass)
+
     ir_demo["x0"] = x0
     ir_demo["v0"] = v0
-    ir_demo["mass"] = np.full(n_obj, float(args.object_mass), dtype=np.float32)
+    ir_demo["mass"] = mass
+    ir_demo["weight_scale"] = float(weight_scale)
+    ir_demo["original_total_object_mass"] = float(original_mass.sum())
+    ir_demo["current_total_object_mass"] = float(mass.sum())
     ir_demo["collision_radius"] = np.asarray(ir_demo["collision_radius"], dtype=np.float32).copy()[:n_obj]
     ir_demo["num_object_points"] = np.asarray(n_obj, dtype=np.int32)
     ir_demo["reverse_z"] = np.asarray(False)
@@ -286,12 +549,13 @@ def _copy_object_only_ir(ir: dict[str, np.ndarray], args: argparse.Namespace) ->
 
 
 def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
+    spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
         output_prefix=args.prefix,
-        spring_ke_scale=float(args.spring_ke_scale),
-        spring_kd_scale=float(args.spring_kd_scale),
+        spring_ke_scale=float(spring_ke_scale),
+        spring_kd_scale=float(spring_kd_scale),
         angular_damping=float(args.angular_damping),
         friction_smoothing=float(args.friction_smoothing),
         enable_tri_contact=True,
@@ -360,11 +624,23 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     )
 
     model = builder.finalize(device=device)
+    shape_material_ke_base = model.shape_material_ke.numpy().astype(np.float32, copy=False).copy()
+    shape_material_kd_base = model.shape_material_kd.numpy().astype(np.float32, copy=False).copy()
+    shape_material_kf_base = model.shape_material_kf.numpy().astype(np.float32, copy=False).copy()
     if not (particle_contacts and (not cfg.disable_particle_contact_kernel)):
         model.particle_grid = None
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     model.set_gravity(gravity_vec)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
+    _apply_particle_contact_scaling(
+        model, weight_scale=float(ir_obj.get("weight_scale", 1.0))
+    )
+    _apply_shape_contact_scaling(
+        model, args, weight_scale=float(ir_obj.get("weight_scale", 1.0))
+    )
+    shape_material_ke_scaled = model.shape_material_ke.numpy().astype(np.float32, copy=False).copy()
+    shape_material_kd_scaled = model.shape_material_kd.numpy().astype(np.float32, copy=False).copy()
+    shape_material_kf_scaled = model.shape_material_kf.numpy().astype(np.float32, copy=False).copy()
 
     n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
     edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
@@ -379,17 +655,31 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "bunny_top_z": float(bunny_top_z),
         "rope_shift": shift.astype(np.float32, copy=False),
         "render_edges": render_edges,
+        "shape_material_ke_base": shape_material_ke_base,
+        "shape_material_kd_base": shape_material_kd_base,
+        "shape_material_kf_base": shape_material_kf_base,
+        "shape_material_ke_scaled": shape_material_ke_scaled,
+        "shape_material_kd_scaled": shape_material_kd_scaled,
+        "shape_material_kf_scaled": shape_material_kf_scaled,
     }
     return model, meta, n_obj, shifted_q
 
 
-def simulate(model: newton.Model, ir_obj: dict[str, Any], args: argparse.Namespace, n_obj: int, device: str) -> dict[str, Any]:
+def simulate(
+    model: newton.Model,
+    ir_obj: dict[str, Any],
+    meta: dict[str, Any],
+    args: argparse.Namespace,
+    n_obj: int,
+    device: str,
+) -> dict[str, Any]:
+    spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
         output_prefix=args.prefix,
-        spring_ke_scale=float(args.spring_ke_scale),
-        spring_kd_scale=float(args.spring_kd_scale),
+        spring_ke_scale=float(spring_ke_scale),
+        spring_kd_scale=float(spring_kd_scale),
         angular_damping=float(args.angular_damping),
         friction_smoothing=float(args.friction_smoothing),
         enable_tri_contact=True,
@@ -438,6 +728,7 @@ def simulate(model: newton.Model, ir_obj: dict[str, Any], args: argparse.Namespa
     gravity_norm = float(np.linalg.norm(gravity_vec))
     if bool(args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
         gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
+    use_decoupled_shape_materials = not np.isclose(float(ir_obj.get("weight_scale", 1.0)), 1.0)
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -463,7 +754,52 @@ def simulate(model: newton.Model, ir_obj: dict[str, Any], args: argparse.Namespa
             if contacts is not None:
                 model.collide(state_in, contacts)
 
-            solver.step(state_in, state_out, control, contacts, sim_dt)
+            if not use_decoupled_shape_materials:
+                solver.step(state_in, state_out, control, contacts, sim_dt)
+            else:
+                particle_f = state_in.particle_f if state_in.particle_count else None
+                body_f = state_in.body_f if state_in.body_count else None
+                body_f_work = body_f
+                if body_f is not None and model.joint_count and control.joint_f is not None:
+                    body_f_work = wp.clone(body_f)
+
+                eval_spring_forces(model, state_in, particle_f)
+                eval_body_joint_forces(
+                    model, state_in, control, body_f_work, solver.joint_attach_ke, solver.joint_attach_kd
+                )
+                if solver.enable_tri_contact:
+                    eval_triangle_contact_forces(model, state_in, particle_f)
+                if particle_contact_kernel:
+                    eval_particle_contact_forces(model, state_in, particle_f)
+
+                _assign_shape_material_triplet(
+                    model,
+                    meta["shape_material_ke_base"],
+                    meta["shape_material_kd_base"],
+                    meta["shape_material_kf_base"],
+                )
+                eval_body_contact_forces(
+                    model, state_in, contacts, friction_smoothing=solver.friction_smoothing, body_f_out=body_f_work
+                )
+
+                _assign_shape_material_triplet(
+                    model,
+                    meta["shape_material_ke_scaled"],
+                    meta["shape_material_kd_scaled"],
+                    meta["shape_material_kf_scaled"],
+                )
+                eval_particle_body_contact_forces(
+                    model, state_in, contacts, particle_f, body_f_work, body_f_in_world_frame=False
+                )
+
+                solver.integrate_particles(model, state_in, state_out, sim_dt)
+                if body_f_work is body_f:
+                    solver.integrate_bodies(model, state_in, state_out, sim_dt, solver.angular_damping)
+                else:
+                    body_f_prev = state_in.body_f
+                    state_in.body_f = body_f_work
+                    solver.integrate_bodies(model, state_in, state_out, sim_dt, solver.angular_damping)
+                    state_in.body_f = body_f_prev
             state_in, state_out = state_out, state_in
 
             if drag > 0.0:
@@ -508,6 +844,7 @@ def simulate(model: newton.Model, ir_obj: dict[str, Any], args: argparse.Namespa
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
         "wall_time": float(wall_time),
+        "use_decoupled_shape_materials": bool(use_decoupled_shape_materials),
     }
 
 
@@ -696,23 +1033,41 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
     return scene_npz
 
 
-def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: dict[str, Any], meta: dict[str, Any], n_obj: int, out_mp4: Path) -> dict[str, Any]:
+def build_summary(
+    model: newton.Model,
+    args: argparse.Namespace,
+    ir_obj: dict[str, Any],
+    sim_data: dict[str, Any],
+    meta: dict[str, Any],
+    n_obj: int,
+    out_mp4: Path,
+) -> dict[str, Any]:
     body_speed = np.linalg.norm(sim_data["body_vel"][:, 0, :], axis=1)
     auto_cam_pos, auto_cam_pitch, auto_cam_yaw = _compute_camera_pose(sim_data, meta, args)
     sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
     sim_duration = max((sim_data["particle_q_all"].shape[0] - 1) * sim_frame_dt, 0.0)
     video_duration = sim_duration * float(args.slowdown)
     rendered_frame_count = max(1, int(round(video_duration * float(args.render_fps))))
+    object_mass = float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].mean())
+    total_object_mass = float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum())
+    spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     return {
         "experiment": "rope_bunny_drop_object_only",
         "ir_path": str(args.ir.resolve()),
         "object_only": True,
         "drop_height_m": float(args.drop_height),
-        "object_mass_per_particle": float(args.object_mass),
+        "object_mass_per_particle": object_mass,
+        "auto_set_weight_target_kg": (
+            None if args.auto_set_weight is None else float(args.auto_set_weight)
+        ),
+        "weight_scale": float(ir_obj.get("weight_scale", 1.0)),
+        "mass_spring_scale": (
+            None if args.mass_spring_scale is None else float(args.mass_spring_scale)
+        ),
         "n_object_particles": int(n_obj),
-        "total_object_mass": float(n_obj * args.object_mass),
+        "total_object_mass": total_object_mass,
         "rigid_mass": float(args.rigid_mass),
-        "mass_ratio": float(n_obj * args.object_mass / max(args.rigid_mass, 1.0e-8)),
+        "mass_ratio": float(total_object_mass / max(args.rigid_mass, 1.0e-8)),
         "bunny_scale": float(args.bunny_scale),
         "bunny_quat_xyzw": [float(v) for v in meta["bunny_quat_xyzw"]],
         "bunny_top_z": float(meta["bunny_top_z"]),
@@ -734,6 +1089,21 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "apply_drag": bool(args.apply_drag),
         "drag_damping_scale": float(args.drag_damping_scale),
         "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
+        "spring_ke_scale": float(spring_ke_scale),
+        "spring_kd_scale": float(spring_kd_scale),
+        "shape_contact_scale": (
+            None if args.shape_contact_scale is None else float(args.shape_contact_scale)
+        ),
+        "shape_contact_damping_multiplier": float(args.shape_contact_damping_multiplier),
+        "use_decoupled_shape_materials": bool(
+            sim_data.get("use_decoupled_shape_materials", False)
+        ),
+        "soft_contact_ke_final": float(model.soft_contact_ke),
+        "soft_contact_kd_final": float(model.soft_contact_kd),
+        "soft_contact_kf_final": float(model.soft_contact_kf),
+        "particle_contact_ke_final": float(model.particle_ke),
+        "particle_contact_kd_final": float(model.particle_kd),
+        "particle_contact_kf_final": float(model.particle_kf),
         "camera_pos": (
             [float(v) for v in args.camera_pos]
             if args.camera_pos is not None
@@ -756,19 +1126,21 @@ def save_summary_json(args: argparse.Namespace, summary: dict[str, Any]) -> Path
 
 def main() -> int:
     args = parse_args()
+    _validate_scaling_args(args)
     args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     wp.init()
     device = newton_import_ir.resolve_device(args.device)
     ir = load_ir(args.ir)
+    _maybe_autoset_mass_spring_scale(args, ir)
     ir_obj = _copy_object_only_ir(ir, args)
 
     print(f"Building object-only rope+bunny model from {args.ir.resolve()}", flush=True)
     model, meta, n_obj, _shifted_q = build_model(ir_obj, args, device)
 
     print("Running simulation...", flush=True)
-    sim_data = simulate(model, ir_obj, args, n_obj, device)
+    sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
 
     scene_npz = save_scene_npz(args, sim_data, meta, n_obj)
     print(f"  Scene NPZ: {scene_npz}", flush=True)
@@ -776,7 +1148,7 @@ def main() -> int:
     print("Rendering video...", flush=True)
     out_mp4 = render_video(model, sim_data, meta, args, device)
 
-    summary = build_summary(args, ir_obj, sim_data, meta, n_obj, out_mp4)
+    summary = build_summary(model, args, ir_obj, sim_data, meta, n_obj, out_mp4)
     summary_path = save_summary_json(args, summary)
     print(f"  Summary: {summary_path}", flush=True)
     print(json.dumps(summary, indent=2), flush=True)

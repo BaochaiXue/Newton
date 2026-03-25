@@ -41,6 +41,29 @@ def _mass_tag(value: float) -> str:
 
 
 def _validate_scaling_args(args: argparse.Namespace) -> None:
+    auto_set_weight = getattr(args, "auto_set_weight", None)
+    if auto_set_weight is not None and float(auto_set_weight) <= 0.0:
+        raise ValueError(f"--auto-set-weight must be > 0, got {auto_set_weight}")
+    if auto_set_weight is not None and args.object_mass is not None:
+        raise ValueError(
+            "--auto-set-weight cannot be used together with --object-mass. "
+            "Use only one source of deformable mass control."
+        )
+    if auto_set_weight is not None and args.mass_spring_scale is not None:
+        raise ValueError(
+            "--auto-set-weight cannot be used together with --mass-spring-scale. "
+            "Use only one source of deformable mass scaling."
+        )
+    if auto_set_weight is not None and not np.isclose(float(args.spring_ke_scale), 1.0):
+        raise ValueError(
+            "--auto-set-weight cannot be used together with --spring-ke-scale. "
+            "The auto-computed weight_scale already controls spring_ke."
+        )
+    if auto_set_weight is not None and not np.isclose(float(args.spring_kd_scale), 1.0):
+        raise ValueError(
+            "--auto-set-weight cannot be used together with --spring-kd-scale. "
+            "The auto-computed weight_scale already controls spring_kd."
+        )
     if args.mass_spring_scale is None:
         return
     scale = float(args.mass_spring_scale)
@@ -265,6 +288,9 @@ def _maybe_autoset_mass_spring_scale(
 ) -> None:
     """Auto-fills ``mass_spring_scale`` from a target total object mass."""
 
+    auto_set_weight = getattr(args, "auto_set_weight", None)
+    if auto_set_weight is not None:
+        target_total_mass = float(auto_set_weight)
     if args.mass_spring_scale is not None or args.object_mass is not None:
         return
     n_obj = int(np.asarray(raw_ir["num_object_points"]).ravel()[0])

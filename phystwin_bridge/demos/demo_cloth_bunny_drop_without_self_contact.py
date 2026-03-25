@@ -33,6 +33,7 @@ from demo_cloth_bunny_common import (
     _default_cloth_ir,
     _effective_spring_scales,
     _mass_tag,
+    _maybe_autoset_mass_spring_scale,
     _validate_scaling_args,
     load_ir,
 )
@@ -75,6 +76,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cloth-shift-x", type=float, default=0.0)
     p.add_argument("--cloth-shift-y", type=float, default=0.0)
     p.add_argument("--object-mass", type=float, default=None, help="Optional per-particle cloth object mass override.")
+    p.add_argument(
+        "--auto-set-weight",
+        type=float,
+        default=None,
+        help=(
+            "Target total deformable mass [kg]. If provided, auto-compute the needed "
+            "weight_scale so mass + spring + contact all follow the same ratio."
+        ),
+    )
     p.add_argument(
         "--mass-spring-scale",
         type=float,
@@ -926,6 +936,9 @@ def build_summary(
         "cloth_shift_x_m": float(args.cloth_shift_x),
         "cloth_shift_y_m": float(args.cloth_shift_y),
         "object_mass_per_particle": object_mass,
+        "auto_set_weight_target_kg": (
+            None if args.auto_set_weight is None else float(args.auto_set_weight)
+        ),
         "weight_scale": float(ir_obj.get("weight_scale", 1.0)),
         "mass_spring_scale": (
             None if args.mass_spring_scale is None else float(args.mass_spring_scale)
@@ -1075,6 +1088,12 @@ def main() -> int:
     wp.init()
     device = newton_import_ir.resolve_device(args.device)
     raw_ir = load_ir(args.ir)
+    if args.auto_set_weight is not None:
+        _maybe_autoset_mass_spring_scale(
+            args,
+            raw_ir,
+            target_total_mass=float(args.auto_set_weight),
+        )
 
     run_case(args, raw_ir, device)
     return 0
