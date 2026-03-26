@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Newton-only real-time interactive playground for cloth-rigid demos.
+"""Newton-only real-time viewer for cloth-rigid demos.
 
 This script converts the current two-stage offline workflow
 
@@ -15,14 +15,14 @@ PhysTwin trainer, or Gaussian-splatting renderer.
 Usage examples
 --------------
 
-Stable OFF playground (recommended):
-    python demo_cloth_bunny_realtime_playground.py --viewer gl
+Stable OFF viewer (recommended):
+    python demo_cloth_bunny_realtime_viewer.py --viewer gl
 
 Quick validation without opening a window:
-    python demo_cloth_bunny_realtime_playground.py --viewer null --num-frames 5
+    python demo_cloth_bunny_realtime_viewer.py --viewer null --num-frames 5
 
-Experimental ON playground:
-    python demo_cloth_bunny_realtime_playground.py --mode on --viewer gl
+Experimental ON viewer:
+    python demo_cloth_bunny_realtime_viewer.py --mode on --viewer gl
 """
 
 from __future__ import annotations
@@ -65,11 +65,13 @@ import demo_cloth_box_drop_with_self_contact as on_case
 DEFAULT_IR = WORKSPACE_ROOT / "Newton/phystwin_bridge/ir/blue_cloth_double_lift_around/phystwin_ir_v2_bf_strict.npz"
 DEFAULT_TARGET_TOTAL_MASS = 0.1
 DEFAULT_VBD_ITERATIONS = 15
+DEFAULT_STEPS_PER_RENDER = 1
+REQUIRED_RUNTIME_DEVICE = "cuda:0"
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = newton.examples.create_parser()
-    parser.description = "Real-time Newton-only cloth-rigid interactive playground."
+    parser.description = "Real-time Newton-only cloth-rigid viewer."
 
     parser.add_argument("--mode", choices=["off", "on"], default="off", help="Playground mode.")
     parser.add_argument("--ir", type=Path, default=DEFAULT_IR, help="Path to PhysTwin strict IR.")
@@ -80,7 +82,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="Kept for compatibility with the existing build_model helpers.",
     )
     parser.add_argument("--prefix", default="cloth_bunny_playground")
-    parser.add_argument("--runtime-device", default=None, help="Override Newton runtime device.")
+    parser.add_argument(
+        "--runtime-device",
+        default=REQUIRED_RUNTIME_DEVICE,
+        help=(
+            "Newton runtime device. This realtime viewer is pinned to the RTX 4090 "
+            f"workstation path and must run on {REQUIRED_RUNTIME_DEVICE}."
+        ),
+    )
 
     parser.add_argument("--frames", type=int, default=300)
     parser.add_argument("--sim-dt", type=float, default=5.0e-5)
@@ -88,8 +97,13 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--steps-per-render",
         type=int,
-        default=None,
-        help="Simulation substeps executed before each rendered frame. Defaults to --substeps.",
+        default=DEFAULT_STEPS_PER_RENDER,
+        help=(
+            "Simulation steps executed before each viewer frame. Keep this small "
+            "(for example 1-8) to preserve the validated per-step dt while making "
+            "the viewer responsive. Increasing it speeds up simulated time but also "
+            "reintroduces the offline-style long stall before each draw."
+        ),
     )
     parser.add_argument("--gravity-mag", type=float, default=9.8)
     parser.add_argument("--drop-height", type=float, default=0.5)
@@ -218,7 +232,21 @@ def _prepare_ir_for_runtime(module, args: argparse.Namespace) -> dict[str, Any]:
     return ir_obj
 
 
-class NewtonClothBunnyPlayground:
+def _require_runtime_device(module, args: argparse.Namespace) -> str:
+    requested = str(
+        args.runtime_device or args.device or module.path_defaults.default_device()
+    )
+    resolved = module.newton_import_ir.resolve_device(requested)
+    if resolved != REQUIRED_RUNTIME_DEVICE:
+        raise RuntimeError(
+            "This realtime viewer is pinned to the local RTX 4090 path and must run "
+            f"on {REQUIRED_RUNTIME_DEVICE}. Requested device resolved to {resolved!r} "
+            f"from {requested!r}. Re-run with --runtime-device {REQUIRED_RUNTIME_DEVICE}."
+        )
+    return resolved
+
+
+class NewtonClothBunnyViewer:
     def __init__(self, viewer, args: argparse.Namespace):
         self.viewer = viewer
         self.args = args
@@ -236,8 +264,6 @@ class NewtonClothBunnyPlayground:
                 self.args.sim_dt = 1.0 / 600.0
             if int(self.args.substeps) == 667:
                 self.args.substeps = 10
-            if self.args.steps_per_render is None:
-                self.args.steps_per_render = self.args.substeps
             if float(self.args.rigid_mass) == 0.5:
                 self.args.rigid_mass = 4000.0
             if float(self.args.body_ke) == 5.0e4:
@@ -246,9 +272,7 @@ class NewtonClothBunnyPlayground:
                 self.args.body_kd = 1.0e-2
 
         self.module._validate_scaling_args(self.args)
-        self.device = self.module.newton_import_ir.resolve_device(
-            self.args.runtime_device or self.args.device or self.module.path_defaults.default_device()
-        )
+        self.device = _require_runtime_device(self.module, self.args)
         self.ir_obj = _prepare_ir_for_runtime(self.module, self.args)
         self.model, self.meta, self.n_obj = self.module.build_model(self.ir_obj, self.args, self.device)
 
@@ -284,7 +308,7 @@ class NewtonClothBunnyPlayground:
         )
         self.collision_pipeline = None
 
-        self.steps_per_render = max(1, int(self.args.steps_per_render or self.args.substeps))
+        self.steps_per_render = max(1, int(self.args.steps_per_render))
         self.sim_dt = float(self.args.sim_dt)
         self.drag = 0.0
         if self.args.apply_drag and "drag_damping" in self.ir_obj:
@@ -324,7 +348,7 @@ class NewtonClothBunnyPlayground:
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self.render_ui, position="side")
 
-        print("Newton-only interactive playground controls:")
+        print("Newton-only realtime viewer controls:")
         print("- Space: pause / resume (built into ViewerGL)")
         print("- H: show / hide UI")
         print("- F: frame camera on model")
@@ -470,6 +494,7 @@ class NewtonClothBunnyPlayground:
         if self.pending_reset:
             self._reset_runtime()
 
+        wp.synchronize_device(self.device)
         t0 = time.perf_counter()
         self.model.particle_radius.assign(self._physical_particle_radius)
         state_in = self.state_in
@@ -477,17 +502,20 @@ class NewtonClothBunnyPlayground:
         for _ in range(self.steps_per_render):
             state_in, state_out = self._step_substep(state_in, state_out)
         self.state_in, self.state_out = state_in, state_out
+        wp.synchronize_device(self.device)
         self.last_step_wall_ms = 1000.0 * (time.perf_counter() - t0)
         self.sim_time += self.sim_dt * self.steps_per_render
         self.frame_index += 1
 
     def render(self) -> None:
+        wp.synchronize_device(self.device)
         t0 = time.perf_counter()
         self.model.particle_radius.assign(self._visual_particle_radius)
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_in)
         self.viewer.end_frame()
         self.model.particle_radius.assign(self._physical_particle_radius)
+        wp.synchronize_device(self.device)
         self.last_render_wall_ms = 1000.0 * (time.perf_counter() - t0)
 
     def render_ui(self, imgui) -> None:
@@ -496,7 +524,7 @@ class NewtonClothBunnyPlayground:
 
         flags = imgui.WindowFlags_.no_resize.value
         imgui.set_next_window_size(imgui.ImVec2(390, 320), imgui.Cond_.first_use_ever)
-        if imgui.begin("Newton Playground", flags=flags):
+        if imgui.begin("Newton Viewer", flags=flags):
             imgui.text(f"Backend: Newton only")
             imgui.text(f"Mode: {self.args.mode.upper()}")
             imgui.text(f"IR: {Path(self.args.ir).name}")
@@ -505,8 +533,10 @@ class NewtonClothBunnyPlayground:
             imgui.text(f"mass-spring-scale: {float(self.args.mass_spring_scale):.6e}")
             imgui.text(f"shape-contact-scale: {float(self.args.shape_contact_scale):.6e}")
             imgui.text(f"sim_dt: {float(self.sim_dt):.2e}")
+            imgui.text(f"steps_per_render: {self.steps_per_render}")
+            imgui.text(f"sim time / viewer frame: {self.sim_dt * self.steps_per_render:.3e} s")
             if self.args.mode == "on":
-                imgui.text("Solver: VBD")
+                imgui.text("Solver: SemiImplicit")
                 imgui.text(f"self_contact_radius_scale: {float(self.args.self_contact_radius_scale):.3f}")
                 imgui.text(f"self_contact_margin_scale: {float(self.args.self_contact_margin_scale):.3f}")
             imgui.separator()
@@ -531,7 +561,7 @@ def main() -> int:
     parser = create_parser()
     viewer, args = newton.examples.init(parser)
     wp.init()
-    example = NewtonClothBunnyPlayground(viewer, args)
+    example = NewtonClothBunnyViewer(viewer, args)
     newton.examples.run(example, args)
     return 0
 
