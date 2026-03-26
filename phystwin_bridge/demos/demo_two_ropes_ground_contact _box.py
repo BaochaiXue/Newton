@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Two crossed object-only ropes drop onto a stack of boxes with real rope-rope contact.
+"""Two crossed object-only ropes drop onto a rigid box with real rope-rope contact.
 
 This demo targets a simpler multi-rope interaction setup:
 
 - duplicate one object-only rope IR into two ropes in one Newton particle system
-- place two crossed ropes above the box stack at different heights
-- drop both ropes onto the same three-box tower
+- place two crossed ropes above the rigid box at different heights
+- drop both ropes onto the same rigid box
 - keep Newton particle-particle contact enabled only for cross-rope pairs
 - use a fixed close camera for a deterministic offline MP4
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ import warp as wp
 
 from demo_rope_bunny_drop import (
     _apply_drag_correction_ignore_axis,
+    _assign_shape_material_triplet,
     _copy_object_only_ir,
     load_ir,
     newton,
@@ -31,7 +33,15 @@ from demo_rope_bunny_drop import (
     overlay_text_lines_rgb,
     path_defaults,
 )
+from demo_cloth_bunny_common import _apply_shape_contact_scaling
 from demo_shared import _pair_penalty_contact_force, compute_visual_particle_radii
+from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
+from newton._src.solvers.semi_implicit.kernels_contact import (
+    eval_body_contact_forces,
+    eval_particle_body_contact_forces,
+    eval_triangle_contact_forces,
+)
+from newton._src.solvers.semi_implicit.kernels_particle import eval_spring_forces
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 
@@ -49,18 +59,24 @@ ROPE_SPECS = (
     },
 )
 
-STACK_BOX_SIZE_M = 0.1
-STACK_BOX_HALF_EXTENTS = np.array(
-    [STACK_BOX_SIZE_M * 0.5, STACK_BOX_SIZE_M * 0.5, STACK_BOX_SIZE_M * 0.5],
-    dtype=np.float32,
-)
+DEFAULT_BOX_HALF_EXTENTS = np.array([0.05, 0.05, 0.05], dtype=np.float32)
 STACK_BOX_COUNT = 3
 STACK_BOX_MASS_KG = 0.1
 
 
-def _stack_box_centers() -> np.ndarray:
+def _make_box_shape_contact_args(args: argparse.Namespace) -> argparse.Namespace:
+    adapted = copy.copy(args)
+    adapted.bunny_shape_contact_scale = getattr(args, "box_shape_contact_scale", None)
+    adapted.bunny_shape_contact_damping_multiplier = getattr(
+        args, "box_shape_contact_damping_multiplier", None
+    )
+    adapted.add_bunny = True
+    return adapted
+
+
+def _stack_box_centers(box_half_extents: np.ndarray) -> np.ndarray:
     centers = []
-    hz = float(STACK_BOX_HALF_EXTENTS[2])
+    hz = float(box_half_extents[2])
     for box_idx in range(STACK_BOX_COUNT):
         centers.append([0.0, 0.0, hz + float(box_idx) * (2.0 * hz)])
     return np.asarray(centers, dtype=np.float32)
@@ -74,6 +90,30 @@ def _box_inertia_diag(mass: float, hx: float, hy: float, hz: float) -> tuple[flo
     iyy = float(mass) * (sx * sx + sz * sz) / 12.0
     izz = float(mass) * (sx * sx + sy * sy) / 12.0
     return ixx, iyy, izz
+
+
+def _apply_uniform_shape_contact_scaling(
+    model: Any, *, weight_scale: float, damping_mult: float = 1.0
+) -> None:
+    alpha = float(weight_scale)
+    if np.isclose(alpha, 1.0):
+        return
+    if alpha <= 0.0:
+        raise ValueError(f"shape-contact weight_scale must be > 0, got {alpha}")
+    if damping_mult <= 0.0:
+        raise ValueError(f"shape-contact damping multiplier must be > 0, got {damping_mult}")
+
+    model.soft_contact_ke = float(model.soft_contact_ke * alpha)
+    model.soft_contact_kd = float(model.soft_contact_kd * alpha * damping_mult)
+    model.soft_contact_kf = float(model.soft_contact_kf * alpha * damping_mult)
+
+    for arr_name in ("shape_material_ke", "shape_material_kd", "shape_material_kf"):
+        arr = getattr(model, arr_name)
+        vals = arr.numpy().astype(np.float32, copy=False).copy()
+        vals *= np.float32(alpha)
+        if arr_name != "shape_material_ke":
+            vals *= np.float32(damping_mult)
+        arr.assign(vals)
 
 
 def _rotate_points_z(points: np.ndarray, yaw_deg: float, center_xy: np.ndarray) -> np.ndarray:
@@ -262,15 +302,15 @@ def _default_rope_ir() -> Path:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Two crossed ropes drop onto a three-box stack with real cross-rope particle contact.")
+    p = argparse.ArgumentParser(description="Two crossed ropes drop onto a rigid box with real cross-rope particle contact.")
     p.add_argument("--ir", type=Path, default=_default_rope_ir(), help="Path to rope PhysTwin IR .npz")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--prefix", default="rope_box_stack_drop")
     p.add_argument("--device", default=path_defaults.default_device())
 
-    p.add_argument("--frames", type=int, default=3000)
-    p.add_argument("--sim-dt", type=float, default=1.0e-4)
-    p.add_argument("--substeps", type=int, default=4)
+    p.add_argument("--frames", type=int, default=300)
+    p.add_argument("--sim-dt", type=float, default=5.0e-5)
+    p.add_argument("--substeps", type=int, default=667)
     p.add_argument("--gravity-mag", type=float, default=9.8)
 
     p.add_argument(
@@ -340,7 +380,79 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--spring-ke-scale", type=float, default=1.0)
     p.add_argument("--spring-kd-scale", type=float, default=1.0)
+    p.add_argument(
+        "--shape-contact-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale factor applied to the actual particle-shape contact stiffness chain used by "
+            "SemiImplicit: soft_contact_ke and shape_material_ke. "
+            "If omitted, particle-shape contact stays at baseline values."
+        ),
+    )
+    p.add_argument(
+        "--shape-contact-damping-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Extra multiplier applied on top of shape-contact-scale for kd/kf terms in the "
+            "actual particle-shape contact chain. This is useful when minimizing rollout RMSE "
+            "requires more damping than pure alpha-scaling."
+        ),
+    )
+    p.add_argument(
+        "--ground-shape-contact-scale",
+        type=float,
+        default=None,
+        help="Optional override for ground shape_material_ke scaling.",
+    )
+    p.add_argument(
+        "--ground-shape-contact-damping-multiplier",
+        type=float,
+        default=None,
+        help="Optional override for ground shape_material_kd/kf scaling multiplier.",
+    )
+    p.add_argument(
+        "--box-shape-contact-scale",
+        type=float,
+        default=None,
+        help="Optional override for box shape_material_ke scaling.",
+    )
+    p.add_argument(
+        "--box-shape-contact-damping-multiplier",
+        type=float,
+        default=None,
+        help="Optional override for box shape_material_kd/kf scaling multiplier.",
+    )
     p.add_argument("--disable-particle-contact-kernel", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--contact-dist-scale",
+        "--particle-radius-scale",
+        dest="contact_dist_scale",
+        type=float,
+        default=1.0,
+        help="Global scale factor applied to contact_collision_dist before Newton radius mapping.",
+    )
+    p.add_argument(
+        "--add-ground-plane",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include the z=0 ground plane in the scene.",
+    )
+    p.add_argument(
+        "--shape-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable particle-vs-shape contacts for the rigid box.",
+    )
+
+    p.add_argument("--rigid-mass", type=float, default=STACK_BOX_MASS_KG)
+    p.add_argument("--body-mu", type=float, default=0.5)
+    p.add_argument("--body-ke", type=float, default=2.5e3)
+    p.add_argument("--body-kd", type=float, default=1.0e2)
+    p.add_argument("--box-hx", type=float, default=float(DEFAULT_BOX_HALF_EXTENTS[0]))
+    p.add_argument("--box-hy", type=float, default=float(DEFAULT_BOX_HALF_EXTENTS[1]))
+    p.add_argument("--box-hz", type=float, default=float(DEFAULT_BOX_HALF_EXTENTS[2]))
 
     p.add_argument("--angular-damping", type=float, default=0.05)
     p.add_argument("--friction-smoothing", type=float, default=1.0)
@@ -354,7 +466,7 @@ def parse_args() -> argparse.Namespace:
         "--camera-pos",
         type=float,
         nargs=3,
-        default=(-1.55, 1.35, 1.18),
+        default=(-0.95, 0.85, 0.78),
         metavar=("X", "Y", "Z"),
     )
     p.add_argument("--camera-pitch", type=float, default=-10.0)
@@ -363,19 +475,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--post-contact-video-seconds",
         type=float,
-        default=0.0,
+        default=1.0,
         help=(
             "End the rendered video this many output-video seconds after the first "
             "cross-rope contact. Use <= 0 to disable trimming."
         ),
     )
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
-    p.add_argument("--particle-radius-vis-min", type=float, default=0.0004)
+    p.add_argument("--particle-radius-vis-min", type=float, default=0.005)
+    p.add_argument(
+        "--render-springs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Render spring line segments. Disabled by default in the box demo to avoid line-through-box visual artifacts.",
+    )
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--label-font-size", type=int, default=28)
     p.add_argument("--rope-line-width", type=float, default=0.01)
-    p.add_argument("--spring-stride", type=int, default=4)
+    p.add_argument("--spring-stride", type=int, default=8)
     p.add_argument("--skip-render", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--decouple-shape-materials",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use baseline shape_material_ke/kd/kf for rigid-rigid contacts, but scaled "
+            "shape_material_ke/kd/kf for rope-box particle-shape contacts."
+        ),
+    )
     return p.parse_args()
 
 
@@ -406,6 +533,33 @@ def _validate_weight_args(args: argparse.Namespace) -> None:
             "Per-rope auto-set-weight cannot be used together with --spring-kd-scale. "
             "The rope-specific weight scales already control spring_kd."
         )
+    if float(args.rigid_mass) <= 0.0:
+        raise ValueError(f"--rigid-mass must be > 0, got {args.rigid_mass}")
+    if float(args.shape_contact_damping_multiplier) <= 0.0:
+        raise ValueError(
+            f"--shape-contact-damping-multiplier must be > 0, got {args.shape_contact_damping_multiplier}"
+        )
+    for name in (
+        "ground_shape_contact_damping_multiplier",
+        "box_shape_contact_damping_multiplier",
+    ):
+        value = getattr(args, name)
+        if value is not None and float(value) <= 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be > 0, got {value}")
+    if args.shape_contact_scale is not None and float(args.shape_contact_scale) <= 0.0:
+        raise ValueError(f"--shape-contact-scale must be > 0, got {args.shape_contact_scale}")
+    for name in ("ground_shape_contact_scale", "box_shape_contact_scale"):
+        value = getattr(args, name)
+        if value is not None and float(value) <= 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be > 0, got {value}")
+    if float(args.contact_dist_scale) <= 0.0:
+        raise ValueError(
+            f"--contact-dist-scale must be > 0, got {args.contact_dist_scale}"
+        )
+    for name in ("box_hx", "box_hy", "box_hz"):
+        value = getattr(args, name)
+        if float(value) <= 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be > 0, got {value}")
     for flag in ("lower_rope_auto_set_weight", "upper_rope_auto_set_weight"):
         value = getattr(args, flag)
         if value is not None and float(value) <= 0.0:
@@ -488,7 +642,10 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
     base_x = np.asarray(ir_obj["x0"], dtype=np.float32).copy()[:n_obj]
     base_v = np.asarray(ir_obj["v0"], dtype=np.float32).copy()[:n_obj]
     base_mass = np.asarray(ir_obj["mass"], dtype=np.float32).copy()[:n_obj]
-    base_radius = np.asarray(ir_obj["collision_radius"], dtype=np.float32).copy()[:n_obj]
+    base_radius = (
+        np.asarray(ir_obj["collision_radius"], dtype=np.float32).copy()[:n_obj]
+        * np.float32(args.contact_dist_scale)
+    )
     rope_mass_scales, base_total_mass = _resolve_rope_mass_scales(ir_obj, args, n_obj)
     base_bbox_min = base_x.min(axis=0)
     base_bbox_max = base_x.max(axis=0)
@@ -548,6 +705,9 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
     ir_multi["v0"] = np.concatenate(vs, axis=0).astype(np.float32, copy=False)
     ir_multi["mass"] = np.concatenate(masses, axis=0).astype(np.float32, copy=False)
     ir_multi["collision_radius"] = np.concatenate(radii, axis=0).astype(np.float32, copy=False)
+    if "contact_collision_dist" in ir_multi:
+        scaled_dist = float(np.asarray(ir_multi["contact_collision_dist"]).ravel()[0]) * float(args.contact_dist_scale)
+        ir_multi["contact_collision_dist"] = np.asarray(scaled_dist, dtype=np.float32)
     ir_multi["spring_edges"] = np.concatenate(edges, axis=0).astype(np.int32, copy=False)
     for key, arr in spring_data.items():
         if key in ("spring_ke", "spring_kd"):
@@ -574,11 +734,13 @@ def _build_multi_rope_ir(ir_obj: dict[str, np.ndarray], args: argparse.Namespace
         "rope_object_mass_per_particle": np.asarray([float(m.mean()) for m in masses], dtype=np.float32),
         "base_rope_total_mass": float(base_total_mass),
         "rope_yaws_deg": rope_yaws.astype(np.float32, copy=False),
+        "contact_dist_scale": float(args.contact_dist_scale),
     }
     return ir_multi, meta
 
 
 def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
+    shape_contacts_enabled = bool(args.shape_contacts)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
@@ -589,8 +751,8 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         friction_smoothing=float(args.friction_smoothing),
         enable_tri_contact=True,
         disable_particle_contact_kernel=True,
-        shape_contacts=True,
-        add_ground_plane=True,
+        shape_contacts=shape_contacts_enabled,
+        add_ground_plane=bool(args.add_ground_plane),
         strict_physics_checks=False,
         apply_drag=bool(args.apply_drag),
         drag_damping_scale=float(args.drag_damping_scale),
@@ -607,20 +769,28 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
     _radius, _, _ = newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts)
     newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
-    newton_import_ir._add_ground_plane(builder, ir_obj, cfg, checks)
+    if bool(args.add_ground_plane):
+        newton_import_ir._add_ground_plane(builder, ir_obj, cfg, checks)
 
-    box_centers = _stack_box_centers()
+    box_half_extents = np.array(
+        [float(args.box_hx), float(args.box_hy), float(args.box_hz)],
+        dtype=np.float32,
+    )
+    box_centers = _stack_box_centers(box_half_extents)
     box_cfg = builder.default_shape_cfg.copy()
+    box_cfg.mu = float(args.body_mu)
+    box_cfg.ke = float(args.body_ke)
+    box_cfg.kd = float(args.body_kd)
     box_ixx, box_iyy, box_izz = _box_inertia_diag(
-        STACK_BOX_MASS_KG,
-        float(STACK_BOX_HALF_EXTENTS[0]),
-        float(STACK_BOX_HALF_EXTENTS[1]),
-        float(STACK_BOX_HALF_EXTENTS[2]),
+        float(args.rigid_mass),
+        float(box_half_extents[0]),
+        float(box_half_extents[1]),
+        float(box_half_extents[2]),
     )
     for box_idx, box_center in enumerate(box_centers):
         box_body = builder.add_body(
             xform=wp.transform(wp.vec3(*box_center.tolist()), wp.quat_identity()),
-            mass=float(STACK_BOX_MASS_KG),
+            mass=float(args.rigid_mass),
             inertia=wp.mat33(
                 box_ixx, 0.0, 0.0,
                 0.0, box_iyy, 0.0,
@@ -631,9 +801,9 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         )
         builder.add_shape_box(
             body=box_body,
-            hx=float(STACK_BOX_HALF_EXTENTS[0]),
-            hy=float(STACK_BOX_HALF_EXTENTS[1]),
-            hz=float(STACK_BOX_HALF_EXTENTS[2]),
+            hx=float(box_half_extents[0]),
+            hy=float(box_half_extents[1]),
+            hz=float(box_half_extents[2]),
             cfg=box_cfg,
         )
 
@@ -678,6 +848,30 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         key: float(0.5 * (rope_contact_params[0][key] + rope_contact_params[1][key]))
         for key in ("ke", "kd", "kf", "mu")
     }
+    shape_material_base = {
+        "ke": model.shape_material_ke.numpy().astype(np.float32, copy=False).copy(),
+        "kd": model.shape_material_kd.numpy().astype(np.float32, copy=False).copy(),
+        "kf": model.shape_material_kf.numpy().astype(np.float32, copy=False).copy(),
+    }
+    effective_shape_contact_scale = (
+        float(args.shape_contact_scale) if args.shape_contact_scale is not None else 1.0
+    )
+    shape_contact_weight_scale = float(np.mean(rope_mass_scales)) * effective_shape_contact_scale
+    _apply_shape_contact_scaling(
+        model,
+        _make_box_shape_contact_args(args),
+        weight_scale=float(np.mean(rope_mass_scales)),
+    )
+    soft_contact_final = {
+        "ke": float(model.soft_contact_ke),
+        "kd": float(model.soft_contact_kd),
+        "kf": float(model.soft_contact_kf),
+    }
+    shape_material_final = {
+        "ke": model.shape_material_ke.numpy().astype(np.float32, copy=False).tolist(),
+        "kd": model.shape_material_kd.numpy().astype(np.float32, copy=False).tolist(),
+        "kf": model.shape_material_kf.numpy().astype(np.float32, copy=False).tolist(),
+    }
 
     meta = {
         "rope_shift": shift.astype(np.float32, copy=False),
@@ -694,15 +888,20 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "rope_object_mass_per_particle": np.asarray(ir_obj["_rope_object_mass_per_particle"], dtype=np.float32),
         "base_rope_total_mass": float(np.asarray(ir_obj["_base_rope_total_mass"]).ravel()[0]),
         "rope_yaws_deg": np.asarray(ir_obj["_rope_yaws_deg"], dtype=np.float32),
+        "contact_dist_scale": float(np.asarray(ir_obj["_contact_dist_scale"]).ravel()[0]),
         "rope_contact_params": rope_contact_params,
         "rope_ground_params": rope_ground_params,
         "cross_rope_contact_params": cross_rope_contact,
         "cross_rope_contact_enabled": True,
+        "shape_contact_weight_scale": float(shape_contact_weight_scale),
+        "soft_contact_final": soft_contact_final,
+        "shape_material_base": shape_material_base,
+        "shape_material_final": shape_material_final,
         "box_centers": box_centers.astype(np.float32, copy=False),
-        "box_half_extents": STACK_BOX_HALF_EXTENTS.astype(np.float32, copy=False),
+        "box_half_extents": box_half_extents.astype(np.float32, copy=False),
         "box_count": int(STACK_BOX_COUNT),
-        "box_stack_top_z": float(np.max(box_centers[:, 2] + STACK_BOX_HALF_EXTENTS[2])),
-        "box_mass_each_kg": float(STACK_BOX_MASS_KG),
+        "box_stack_top_z": float(np.max(box_centers[:, 2] + box_half_extents[2])),
+        "box_mass_each_kg": float(args.rigid_mass),
     }
     n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
     return model, meta, n_obj, cross_rope_contact_grid
@@ -717,6 +916,7 @@ def simulate(
     device: str,
     cross_rope_contact_grid: wp.HashGrid | None,
 ) -> dict[str, Any]:
+    shape_contacts_enabled = bool(args.shape_contacts)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
@@ -727,8 +927,8 @@ def simulate(
         friction_smoothing=float(args.friction_smoothing),
         enable_tri_contact=True,
         disable_particle_contact_kernel=True,
-        shape_contacts=True,
-        add_ground_plane=True,
+        shape_contacts=shape_contacts_enabled,
+        add_ground_plane=bool(args.add_ground_plane),
         strict_physics_checks=False,
         apply_drag=bool(args.apply_drag),
         drag_damping_scale=float(args.drag_damping_scale),
@@ -777,6 +977,9 @@ def simulate(
     gravity_norm = float(np.linalg.norm(gravity_vec))
     if bool(args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
         gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
+    use_decoupled_shape_materials = bool(args.decouple_shape_materials) or (
+        not np.isclose(float(meta["shape_contact_weight_scale"]), 1.0)
+    )
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -828,7 +1031,71 @@ def simulate(
             if contacts is not None:
                 model.collide(state_in, contacts)
 
-            solver.step(state_in, state_out, control, contacts, sim_dt)
+            if not use_decoupled_shape_materials:
+                solver.step(state_in, state_out, control, contacts, sim_dt)
+            else:
+                particle_f = state_in.particle_f if state_in.particle_count else None
+                body_f = state_in.body_f if state_in.body_count else None
+                body_f_work = body_f
+                if body_f is not None and model.joint_count and control.joint_f is not None:
+                    body_f_work = wp.clone(body_f)
+
+                eval_spring_forces(model, state_in, particle_f)
+                if body_f_work is not None:
+                    eval_body_joint_forces(
+                        model,
+                        state_in,
+                        control,
+                        body_f_work,
+                        solver.joint_attach_ke,
+                        solver.joint_attach_kd,
+                    )
+                if solver.enable_tri_contact:
+                    eval_triangle_contact_forces(model, state_in, particle_f)
+
+                _assign_shape_material_triplet(
+                    model,
+                    meta["shape_material_base"]["ke"],
+                    meta["shape_material_base"]["kd"],
+                    meta["shape_material_base"]["kf"],
+                )
+                if body_f_work is not None:
+                    eval_body_contact_forces(
+                        model,
+                        state_in,
+                        contacts,
+                        friction_smoothing=solver.friction_smoothing,
+                        body_f_out=body_f_work,
+                    )
+
+                _assign_shape_material_triplet(
+                    model,
+                    meta["shape_material_final"]["ke"],
+                    meta["shape_material_final"]["kd"],
+                    meta["shape_material_final"]["kf"],
+                )
+                if body_f_work is not None:
+                    eval_particle_body_contact_forces(
+                        model,
+                        state_in,
+                        contacts,
+                        particle_f,
+                        body_f_work,
+                        body_f_in_world_frame=False,
+                    )
+
+                solver.integrate_particles(model, state_in, state_out, sim_dt)
+                if body_f_work is body_f:
+                    solver.integrate_bodies(
+                        model, state_in, state_out, sim_dt, solver.angular_damping
+                    )
+                else:
+                    body_f_prev = state_in.body_f
+                    state_in.body_f = body_f_work
+                    solver.integrate_bodies(
+                        model, state_in, state_out, sim_dt, solver.angular_damping
+                    )
+                    state_in.body_f = body_f_prev
             state_in, state_out = state_out, state_in
 
             if drag > 0.0:
@@ -1069,17 +1336,18 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
                     hidden=False,
                 )
 
-                rope_edges = np.asarray(meta["render_edges"][rope_idx], dtype=np.int32)
-                rope_line_starts_wp[rope_idx].assign(q_obj[rope_edges[:, 0]])
-                rope_line_ends_wp[rope_idx].assign(q_obj[rope_edges[:, 1]])
-                viewer.log_lines(
-                    f"/demo/{spec['name']}_springs",
-                    rope_line_starts_wp[rope_idx],
-                    rope_line_ends_wp[rope_idx],
-                    spec["line_color"],
-                    width=float(args.rope_line_width),
-                    hidden=False,
-                )
+                if bool(args.render_springs):
+                    rope_edges = np.asarray(meta["render_edges"][rope_idx], dtype=np.int32)
+                    rope_line_starts_wp[rope_idx].assign(q_obj[rope_edges[:, 0]])
+                    rope_line_ends_wp[rope_idx].assign(q_obj[rope_edges[:, 1]])
+                    viewer.log_lines(
+                        f"/demo/{spec['name']}_springs",
+                        rope_line_starts_wp[rope_idx],
+                        rope_line_ends_wp[rope_idx],
+                        spec["line_color"],
+                        width=float(args.rope_line_width),
+                        hidden=False,
+                    )
 
             viewer.end_frame()
             frame = viewer.get_frame(render_ui=False).numpy()
@@ -1154,6 +1422,32 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
     else:
         body_displacement_final = np.zeros((0,), dtype=np.float32)
         body_displacement_max = np.zeros((0,), dtype=np.float32)
+
+    max_box_center_intrusion = 0.0
+    max_box_sphere_penetration = 0.0
+    if sim_data["body_q"].shape[1] > 0 and sim_data["particle_q_object"].size > 0:
+        q_obj_all = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
+        body_pos_all = np.asarray(sim_data["body_q"][:, :, :3], dtype=np.float32)
+        hx, hy, hz = [float(v) for v in np.asarray(meta["box_half_extents"], dtype=np.float32).ravel()]
+        particle_radius = (
+            np.asarray(ir_obj["collision_radius"], dtype=np.float32)[:n_obj]
+            * np.float32(meta["contact_dist_scale"])
+        )
+
+        def _box_sdf(local_pts: np.ndarray) -> np.ndarray:
+            q = np.abs(local_pts) - np.array([hx, hy, hz], dtype=np.float32)
+            outside = np.linalg.norm(np.maximum(q, 0.0), axis=1)
+            inside = np.minimum(np.maximum(q[:, 0], np.maximum(q[:, 1], q[:, 2])), 0.0)
+            return outside + inside
+
+        for frame_idx in range(q_obj_all.shape[0]):
+            local = q_obj_all[frame_idx] - body_pos_all[frame_idx, 0][None, :]
+            sdf = _box_sdf(local)
+            max_box_center_intrusion = max(max_box_center_intrusion, float(np.max(np.maximum(-sdf, 0.0))))
+            max_box_sphere_penetration = max(
+                max_box_sphere_penetration,
+                float(np.max(np.maximum(particle_radius - sdf, 0.0))),
+            )
     sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
     sim_duration = max((sim_data["particle_q_all"].shape[0] - 1) * sim_frame_dt, 0.0)
     video_duration = sim_duration * float(args.slowdown)
@@ -1175,6 +1469,7 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "rope_total_masses": np.asarray(meta["rope_total_masses"], dtype=np.float32).tolist(),
         "rope_object_mass_per_particle": np.asarray(meta["rope_object_mass_per_particle"], dtype=np.float32).tolist(),
         "rope_yaws_deg": np.asarray(meta["rope_yaws_deg"], dtype=np.float32).tolist(),
+        "contact_dist_scale": float(meta["contact_dist_scale"]),
         "cross_rope_contact_params": {k: float(v) for k, v in meta["cross_rope_contact_params"].items()},
         "rope_ground_contact_params": [
             {k: float(v) for k, v in rope_params.items()} for rope_params in meta["rope_ground_params"]
@@ -1182,6 +1477,33 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "rope_particle_contact_params": [
             {k: float(v) for k, v in rope_params.items()} for rope_params in meta["rope_contact_params"]
         ],
+        "shape_contact_weight_scale": float(meta["shape_contact_weight_scale"]),
+        "shape_contact_scale": (
+            None if args.shape_contact_scale is None else float(args.shape_contact_scale)
+        ),
+        "ground_shape_contact_scale": (
+            None
+            if args.ground_shape_contact_scale is None
+            else float(args.ground_shape_contact_scale)
+        ),
+        "box_shape_contact_scale": (
+            None
+            if args.box_shape_contact_scale is None
+            else float(args.box_shape_contact_scale)
+        ),
+        "decouple_shape_materials_arg": bool(args.decouple_shape_materials),
+        "render_springs": bool(args.render_springs),
+        "use_decoupled_shape_materials": bool(
+            bool(args.decouple_shape_materials)
+            or not np.isclose(float(meta["shape_contact_weight_scale"]), 1.0)
+        ),
+        "soft_contact_final": {k: float(v) for k, v in meta["soft_contact_final"].items()},
+        "shape_material_base": {
+            k: [float(vv) for vv in vals] for k, vals in meta["shape_material_base"].items()
+        },
+        "shape_material_final": {
+            k: [float(vv) for vv in vals] for k, vals in meta["shape_material_final"].items()
+        },
         "drop_height_m": float(args.drop_height),
         "lower_rope_bottom_z": float(meta["lower_rope_bottom_z"]),
         "upper_rope_bottom_z": float(meta["upper_rope_bottom_z"]),
@@ -1222,6 +1544,8 @@ def build_summary(args: argparse.Namespace, ir_obj: dict[str, Any], sim_data: di
         "body_speed_max_all": float(body_speed_max_all),
         "box_displacement_final_m": body_displacement_final.tolist(),
         "box_displacement_max_m": body_displacement_max.tolist(),
+        "max_box_center_intrusion_m": float(max_box_center_intrusion),
+        "max_box_sphere_penetration_m": float(max_box_sphere_penetration),
         "apply_drag": bool(args.apply_drag),
         "drag_damping_scale": float(args.drag_damping_scale),
         "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
@@ -1263,6 +1587,7 @@ def main() -> int:
     ir_multi["_rope_object_mass_per_particle"] = np.asarray(ir_multi_meta["rope_object_mass_per_particle"], dtype=np.float32)
     ir_multi["_base_rope_total_mass"] = np.asarray(ir_multi_meta["base_rope_total_mass"], dtype=np.float32)
     ir_multi["_rope_yaws_deg"] = np.asarray(ir_multi_meta["rope_yaws_deg"], dtype=np.float32)
+    ir_multi["_contact_dist_scale"] = np.asarray(ir_multi_meta["contact_dist_scale"], dtype=np.float32)
 
     print(f"Building dual-rope ground-drop model from {args.ir.resolve()}", flush=True)
     model, meta, n_obj, cross_rope_contact_grid = build_model(ir_multi, args, device)
