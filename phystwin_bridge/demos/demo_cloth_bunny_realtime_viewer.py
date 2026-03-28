@@ -64,6 +64,46 @@ DEFAULT_TARGET_TOTAL_MASS = 0.1
 DEFAULT_VBD_ITERATIONS = 15
 DEFAULT_STEPS_PER_RENDER = 1
 REQUIRED_RUNTIME_DEVICE = "cuda:0"
+PROFILE_OP_NAMES = (
+    "particle_grid_build",
+    "model_collide",
+    "eval_spring_forces",
+    "eval_triangle_forces",
+    "eval_bending_forces",
+    "eval_tetrahedra_forces",
+    "eval_body_joint_forces",
+    "eval_particle_contact_forces",
+    "eval_triangle_contact_forces",
+    "eval_body_contact_forces",
+    "eval_particle_body_contact_forces",
+    "integrate_particles",
+    "integrate_bodies",
+    "drag_correction",
+    "solver_step",
+    "total_substep",
+    "total_step",
+)
+PROFILE_GROUPS = {
+    "internal_force": (
+        "eval_spring_forces",
+        "eval_triangle_forces",
+        "eval_bending_forces",
+        "eval_tetrahedra_forces",
+        "eval_body_joint_forces",
+    ),
+    "collision_contact": (
+        "particle_grid_build",
+        "model_collide",
+        "eval_particle_contact_forces",
+        "eval_triangle_contact_forces",
+        "eval_body_contact_forces",
+        "eval_particle_body_contact_forces",
+    ),
+    "integration": (
+        "integrate_particles",
+        "integrate_bodies",
+    ),
+}
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -193,6 +233,24 @@ def create_parser() -> argparse.ArgumentParser:
         help="Disable rendering and run repeated step-only profiling episodes.",
     )
     parser.add_argument(
+        "--profile-mode",
+        choices=["throughput", "attribution"],
+        default="attribution",
+        help=(
+            "throughput: keep the normal solver path and only measure end-to-end no-render wall time. "
+            "attribution: enable synchronized per-op instrumentation for bottleneck attribution."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-profile-config",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When profiling mode=on, keep the caller-provided dt/substeps/rigid parameters "
+            "instead of applying the interactive ON-mode auto-retune."
+        ),
+    )
+    parser.add_argument(
         "--profile-runs",
         type=int,
         default=5,
@@ -287,16 +345,18 @@ class NewtonClothBunnyViewer:
             self.args.add_box = bool(getattr(self.args, "add_bunny", True))
             if self.args.prefix == "cloth_bunny_playground":
                 self.args.prefix = "cloth_box_playground"
-            if float(self.args.sim_dt) == 5.0e-5:
-                self.args.sim_dt = 1.0 / 600.0
-            if int(self.args.substeps) == 667:
-                self.args.substeps = 10
-            if float(self.args.rigid_mass) == 0.5:
-                self.args.rigid_mass = 4000.0
-            if float(self.args.body_ke) == 5.0e4:
-                self.args.body_ke = 1.0e4
-            if float(self.args.body_kd) == 5.0e2:
-                self.args.body_kd = 1.0e-2
+            freeze_profile_cfg = bool(self.args.profile_only) and bool(self.args.freeze_profile_config)
+            if not freeze_profile_cfg:
+                if float(self.args.sim_dt) == 5.0e-5:
+                    self.args.sim_dt = 1.0 / 600.0
+                if int(self.args.substeps) == 667:
+                    self.args.substeps = 10
+                if float(self.args.rigid_mass) == 0.5:
+                    self.args.rigid_mass = 4000.0
+                if float(self.args.body_ke) == 5.0e4:
+                    self.args.body_ke = 1.0e4
+                if float(self.args.body_kd) == 5.0e2:
+                    self.args.body_kd = 1.0e-2
 
         self.module._validate_scaling_args(self.args)
         self.device = _require_runtime_device(self.module, self.args)
@@ -370,6 +430,7 @@ class NewtonClothBunnyViewer:
         self.last_step_wall_ms = 0.0
         self.last_render_wall_ms = 0.0
         self.profile_enabled = False
+        self.profile_mode = str(self.args.profile_mode)
         self._profile_run_samples: dict[str, list[float]] = {}
 
         self._reset_runtime()
@@ -694,6 +755,19 @@ class NewtonClothBunnyViewer:
         self.sim_time += self.sim_dt * self.steps_per_render
         self.frame_index += 1
 
+    def step_no_sync(self) -> None:
+        if self.pending_reset:
+            self._reset_runtime()
+
+        self.model.particle_radius.assign(self._physical_particle_radius)
+        state_in = self.state_in
+        state_out = self.state_out
+        for _ in range(self.steps_per_render):
+            state_in, state_out = self._step_substep(state_in, state_out)
+        self.state_in, self.state_out = state_in, state_out
+        self.sim_time += self.sim_dt * self.steps_per_render
+        self.frame_index += 1
+
     def render(self) -> None:
         wp.synchronize_device(self.device)
         t0 = time.perf_counter()
@@ -750,7 +824,7 @@ class NewtonClothBunnyViewer:
         return max(1, int(self.args.frames))
 
     def _summarize_profile_runs(self, runs: list[dict[str, Any]]) -> dict[str, Any]:
-        op_names = sorted({name for run in runs for name in run["samples"].keys()})
+        op_names = list(PROFILE_OP_NAMES)
         summary: dict[str, Any] = {}
         for name in op_names:
             run_means = []
@@ -772,6 +846,34 @@ class NewtonClothBunnyViewer:
                 "std_over_all_calls_ms": float(np.std(all_calls)) if len(all_calls) > 1 else 0.0,
             }
         return summary
+
+    def _rank_profile_ops(self, aggregate: dict[str, Any]) -> list[dict[str, Any]]:
+        excluded = {"solver_step", "total_substep", "total_step"}
+        ranking = []
+        for name, stats in aggregate.items():
+            if name in excluded:
+                continue
+            ranking.append(
+                {
+                    "op_name": str(name),
+                    "mean_of_run_means_ms": float(stats["mean_of_run_means_ms"]),
+                    "call_count_total": int(stats["call_count_total"]),
+                }
+            )
+        ranking.sort(key=lambda item: item["mean_of_run_means_ms"], reverse=True)
+        return ranking
+
+    def _profile_group_shares(self, aggregate: dict[str, Any]) -> dict[str, float]:
+        total = float(aggregate.get("total_substep", {}).get("mean_of_run_means_ms", 0.0))
+        if total <= 1.0e-12:
+            return {name: 0.0 for name in PROFILE_GROUPS}
+        shares = {}
+        for group_name, op_names in PROFILE_GROUPS.items():
+            subtotal = 0.0
+            for op_name in op_names:
+                subtotal += float(aggregate.get(op_name, {}).get("mean_of_run_means_ms", 0.0))
+            shares[group_name] = subtotal / total
+        return shares
 
     def _write_profile_outputs(self, payload: dict[str, Any]) -> tuple[Path, Path]:
         json_path = (
@@ -820,11 +922,16 @@ class NewtonClothBunnyViewer:
 
         def run_episode(record: bool) -> dict[str, Any]:
             self._reset_runtime()
-            self.profile_enabled = record
+            attribution_mode = record and self.profile_mode == "attribution"
+            self.profile_enabled = attribution_mode
             self._profile_run_samples = {}
+            wp.synchronize_device(self.device)
             t0 = time.perf_counter()
             for _ in range(num_frames):
-                self.step()
+                if attribution_mode:
+                    self.step()
+                else:
+                    self.step_no_sync()
             wp.synchronize_device(self.device)
             wall_ms = 1000.0 * (time.perf_counter() - t0)
             samples = {k: [float(v) for v in vals] for k, vals in self._profile_run_samples.items()}
@@ -840,25 +947,36 @@ class NewtonClothBunnyViewer:
             run_episode(record=False)
 
         runs = [run_episode(record=True) for _ in range(prof_runs)]
+        aggregate = self._summarize_profile_runs(runs) if self.profile_mode == "attribution" else {}
         payload = {
             "mode": str(self.args.mode),
             "viewer": str(getattr(self.args, "viewer", "unknown")),
+            "profile_mode": str(self.profile_mode),
+            "freeze_profile_config": bool(self.args.freeze_profile_config),
             "num_frames": int(num_frames),
             "steps_per_render": int(self.steps_per_render),
             "sim_dt": float(self.sim_dt),
+            "substeps": int(self.args.substeps),
+            "rigid_mass": float(self.args.rigid_mass),
+            "body_ke": float(self.args.body_ke),
+            "body_kd": float(self.args.body_kd),
             "warmup_runs": int(warmup_runs),
             "profile_runs": int(prof_runs),
             "runs": runs,
-            "aggregate": self._summarize_profile_runs(runs),
+            "aggregate": aggregate,
+            "bottleneck_ranking": self._rank_profile_ops(aggregate) if aggregate else [],
+            "group_shares": self._profile_group_shares(aggregate) if aggregate else {},
         }
         json_path, csv_path = self._write_profile_outputs(payload)
         print(f"Profile JSON: {json_path}", flush=True)
         print(f"Profile CSV: {csv_path}", flush=True)
-        for name, stats in sorted(payload["aggregate"].items()):
-            print(
-                f"{name}: mean={stats['mean_of_run_means_ms']:.3f} ms, std={stats['std_of_run_means_ms']:.3f} ms, calls={stats['call_count_total']}",
-                flush=True,
-            )
+        if aggregate:
+            for rank in payload["bottleneck_ranking"][:5]:
+                print(
+                    f"top op: {rank['op_name']} mean={rank['mean_of_run_means_ms']:.3f} ms calls={rank['call_count_total']}",
+                    flush=True,
+                )
+            print(f"group shares: {payload['group_shares']}", flush=True)
         return payload
 
 

@@ -66,6 +66,27 @@ PROFILE_OP_NAMES = (
     "total_substep",
     "total_step",
 )
+PROFILE_GROUPS = {
+    "internal_force": (
+        "spring_forces",
+        "triangle_forces",
+        "bending_forces",
+        "tetra_forces",
+        "body_joint_forces",
+    ),
+    "collision_contact": (
+        "particle_grid_build",
+        "model_collide",
+        "particle_contact_forces",
+        "triangle_contact_forces",
+        "body_contact_forces",
+        "particle_body_contact_forces",
+    ),
+    "integration": (
+        "integrate_particles",
+        "integrate_bodies",
+    ),
+}
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -151,6 +172,15 @@ def create_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Disable rendering and profile a no-render rollout.",
+    )
+    parser.add_argument(
+        "--profile-mode",
+        choices=["throughput", "attribution"],
+        default="attribution",
+        help=(
+            "throughput: keep the normal solver path and only measure end-to-end no-render wall time. "
+            "attribution: enable synchronized per-op instrumentation for bottleneck attribution."
+        ),
     )
     parser.add_argument("--profile-runs", type=int, default=3)
     parser.add_argument("--profile-warmup-runs", type=int, default=1)
@@ -330,6 +360,7 @@ class NewtonRopeControlViewer:
         self.last_step_wall_ms = 0.0
         self.last_render_wall_ms = 0.0
         self.profile_enabled = False
+        self.profile_mode = str(self.args.profile_mode)
         self._profile_run_samples: dict[str, list[float]] = {}
 
         self._configure_viewer()
@@ -588,6 +619,16 @@ class NewtonRopeControlViewer:
             self._profile_run_samples.setdefault("total_step", []).append(self.last_step_wall_ms)
         self.frame_index += 1
 
+    def step_no_sync(self) -> None:
+        if self.pending_reset:
+            self._reset_runtime()
+        self.model.particle_radius.assign(self._physical_particle_radius)
+        for _ in range(self.steps_per_render):
+            if self.finished:
+                break
+            self._advance_one_substep()
+        self.frame_index += 1
+
     def render(self) -> None:
         wp.synchronize_device(self.device)
         t0 = time.perf_counter()
@@ -692,6 +733,18 @@ class NewtonRopeControlViewer:
         ranking.sort(key=lambda item: item["mean_of_run_means_ms"], reverse=True)
         return ranking
 
+    def _profile_group_shares(self, aggregate: dict[str, Any]) -> dict[str, float]:
+        total = float(aggregate.get("total_substep", {}).get("mean_of_run_means_ms", 0.0))
+        if total <= 1.0e-12:
+            return {name: 0.0 for name in PROFILE_GROUPS}
+        shares = {}
+        for group_name, op_names in PROFILE_GROUPS.items():
+            subtotal = 0.0
+            for op_name in op_names:
+                subtotal += float(aggregate.get(op_name, {}).get("mean_of_run_means_ms", 0.0))
+            shares[group_name] = subtotal / total
+        return shares
+
     def _write_profile_outputs(self, payload: dict[str, Any]) -> tuple[Path, Path]:
         json_path = (
             self.args.profile_json.resolve()
@@ -737,11 +790,16 @@ class NewtonRopeControlViewer:
 
         def run_episode(record: bool) -> dict[str, Any]:
             self._reset_runtime()
-            self.profile_enabled = record
+            attribution_mode = record and self.profile_mode == "attribution"
+            self.profile_enabled = attribution_mode
             self._profile_run_samples = {}
+            wp.synchronize_device(self.device)
             t0 = time.perf_counter()
             while not self.finished:
-                self.step()
+                if attribution_mode:
+                    self.step()
+                else:
+                    self.step_no_sync()
             wp.synchronize_device(self.device)
             wall_ms = 1000.0 * (time.perf_counter() - t0)
             samples = {k: [float(v) for v in vals] for k, vals in self._profile_run_samples.items()}
@@ -759,7 +817,7 @@ class NewtonRopeControlViewer:
             run_episode(record=False)
 
         runs = [run_episode(record=True) for _ in range(prof_runs)]
-        aggregate = self._summarize_profile_runs(runs)
+        aggregate = self._summarize_profile_runs(runs) if self.profile_mode == "attribution" else {}
         payload = {
             "ir": str(self.args.ir),
             "runtime_device": self.device,
@@ -768,21 +826,24 @@ class NewtonRopeControlViewer:
             "steps_per_render": int(self.steps_per_render),
             "trajectory_frames": int(self.n_traj_frames),
             "total_substeps": int(self.total_substeps),
-            "granular_solver_profile": True,
+            "profile_mode": str(self.profile_mode),
+            "granular_solver_profile": bool(self.profile_mode == "attribution"),
             "profile_runs": int(prof_runs),
             "warmup_runs": int(warmup_runs),
             "runs": runs,
             "aggregate": aggregate,
-            "bottleneck_ranked_ops": self._rank_profile_ops(aggregate),
+            "bottleneck_ranked_ops": self._rank_profile_ops(aggregate) if aggregate else [],
+            "group_shares": self._profile_group_shares(aggregate) if aggregate else {},
         }
         json_path, csv_path = self._write_profile_outputs(payload)
         print(f"Profile JSON: {json_path}", flush=True)
         print(f"Profile CSV: {csv_path}", flush=True)
-        for name, stats in sorted(payload["aggregate"].items()):
-            print(
-                f"{name}: mean={stats['mean_of_run_means_ms']:.3f} ms, std={stats['std_of_run_means_ms']:.3f} ms, calls={stats['call_count_total']}",
-                flush=True,
-            )
+        if aggregate:
+            for name, stats in sorted(payload["aggregate"].items()):
+                print(
+                    f"{name}: mean={stats['mean_of_run_means_ms']:.3f} ms, std={stats['std_of_run_means_ms']:.3f} ms, calls={stats['call_count_total']}",
+                    flush=True,
+                )
         if payload["bottleneck_ranked_ops"]:
             top = payload["bottleneck_ranked_ops"][:5]
             print("Top bottlenecks:", flush=True)
@@ -791,6 +852,7 @@ class NewtonRopeControlViewer:
                     f"  {item['op_name']}: mean={item['mean_of_run_means_ms']:.3f} ms, calls={item['call_count_total']}",
                     flush=True,
                 )
+            print(f"group shares: {payload['group_shares']}", flush=True)
         return payload
 
 

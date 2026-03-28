@@ -18,6 +18,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import warp as wp
+
 from bridge_shared import BRIDGE_ROOT, CORE_DIR, load_core_module
 
 WORKSPACE_ROOT = BRIDGE_ROOT.parents[1]
@@ -34,6 +36,38 @@ def ensure_bridge_runtime_paths() -> None:
 
 
 ensure_bridge_runtime_paths()
+
+if not hasattr(wp, "quat_twist"):
+    @wp.func
+    def _quat_twist_compat(axis: wp.vec3, q: wp.quat) -> wp.quat:
+        ax = wp.normalize(axis)
+        imag = wp.vec3(q[0], q[1], q[2])
+        proj = ax * wp.dot(imag, ax)
+        return wp.normalize(wp.quat(proj[0], proj[1], proj[2], q[3]))
+
+    wp.quat_twist = _quat_twist_compat
+
+if not hasattr(wp, "quat_to_euler"):
+    @wp.func
+    def _quat_to_euler_compat(q: wp.quat, i: int, j: int, k: int) -> wp.vec3:
+        x = q[0]
+        y = q[1]
+        z = q[2]
+        w = q[3]
+
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = wp.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (w * y - z * x)
+        pitch = wp.asin(wp.clamp(sinp, -1.0, 1.0))
+
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = wp.atan2(siny_cosp, cosy_cosp)
+        return wp.vec3(roll, pitch, yaw)
+
+    wp.quat_to_euler = _quat_to_euler_compat
 
 path_defaults = load_core_module(
     "phystwin_bridge_path_defaults",
