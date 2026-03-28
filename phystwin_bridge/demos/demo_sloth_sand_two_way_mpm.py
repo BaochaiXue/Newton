@@ -10,6 +10,7 @@ This demo follows the official Newton two-way coupling pattern:
 5. patch body wrench is mapped back to sloth particles as external forces
 
 The Newton core is not modified. All coupling glue lives in this script.
+This is a coupling adapter, not a native deformable-MPM contact implementation.
 """
 from __future__ import annotations
 
@@ -96,6 +97,8 @@ class ShadowSystem:
     patch_friction: float
     ground_thickness: float
     ground_friction: float
+    patch_mesh_mode_requested: str
+    patch_mesh_box_fallback_count: int
 
 
 @dataclass
@@ -158,7 +161,15 @@ def parse_args() -> argparse.Namespace:
     scene_group.add_argument("--sand-height", type=float, default=0.36)
 
     soft_group = p.add_argument_group("softbody")
-    soft_group.add_argument("--particle-mass", type=float, default=0.001)
+    soft_group.add_argument(
+        "--particle-mass",
+        type=float,
+        default=None,
+        help=(
+            "Optional constant per-particle mass override for the sloth object. "
+            "If omitted, preserve the PhysTwin IR mass distribution."
+        ),
+    )
     soft_group.add_argument("--drag-damping-scale", type=float, default=1.0)
     soft_group.add_argument("--spring-ke-scale", type=float, default=1.0)
     soft_group.add_argument("--spring-kd-scale", type=float, default=1.0)
@@ -177,12 +188,34 @@ def parse_args() -> argparse.Namespace:
     patch_group = p.add_argument_group("patches")
     patch_group.add_argument("--patch-count", type=int, default=48)
     patch_group.add_argument("--min-patch-particles", type=int, default=4)
-    patch_group.add_argument("--patch-force-scale", type=float, default=1.0)
-    patch_group.add_argument("--max-particle-dv-per-frame", type=float, default=1.0)
+    patch_group.add_argument(
+        "--patch-force-scale",
+        type=float,
+        default=1.0,
+        help="Multiplier on the patch->particle force transfer. 1.0 keeps the unscaled mapping.",
+    )
+    patch_group.add_argument(
+        "--max-particle-dv-per-frame",
+        type=float,
+        default=None,
+        help=(
+            "Optional per-frame dv clamp for patch->particle feedback. "
+            "If omitted, no clamp is applied."
+        ),
+    )
     patch_group.add_argument("--patch-inertia-floor", type=float, default=1.0e-5)
     patch_group.add_argument("--patch-friction", type=float, default=None)
     patch_group.add_argument("--patch-thickness", type=float, default=None)
     patch_group.add_argument("--ground-friction", type=float, default=0.5)
+    patch_group.add_argument(
+        "--patch-mesh-mode",
+        choices=["convex-hull", "box"],
+        default="convex-hull",
+        help=(
+            "Geometry used for each shadow patch collider. "
+            "convex-hull better matches the local surface; box is the older coarse proxy."
+        ),
+    )
 
     sand_group = p.add_argument_group("sand")
     sand_group.add_argument("--voxel-size", type=float, default=0.03)
@@ -370,7 +403,10 @@ def _prepare_object_only_ir(
 
     ir_demo["x0"] = x0
     ir_demo["v0"] = v0
-    ir_demo["mass"] = np.full(n_obj, float(args.particle_mass), dtype=np.float32)
+    mass_obj = np.asarray(ir_demo["mass"], dtype=np.float32).copy()[:n_obj]
+    if args.particle_mass is not None:
+        mass_obj = np.full(n_obj, float(args.particle_mass), dtype=np.float32)
+    ir_demo["mass"] = mass_obj
     ir_demo["collision_radius"] = np.asarray(ir_demo["collision_radius"], dtype=np.float32).copy()[:n_obj]
     ir_demo["num_object_points"] = np.asarray(n_obj, dtype=np.int32)
     ir_demo["reverse_z"] = np.asarray(False)
@@ -597,9 +633,47 @@ def _box_mesh_from_points(points_world: np.ndarray, origin_world: np.ndarray) ->
     return verts, faces
 
 
-def _build_patch_mesh(points_world: np.ndarray, origin_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _convex_hull_mesh_from_points(
+    points_world: np.ndarray,
+    origin_world: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    from scipy.spatial import ConvexHull
+
     pts = np.asarray(points_world, dtype=np.float32)
-    return _box_mesh_from_points(pts, origin_world)
+    pts_rounded = np.round(pts, decimals=6)
+    _, unique_indices = np.unique(pts_rounded, axis=0, return_index=True)
+    pts_unique = pts[np.sort(unique_indices)]
+    if pts_unique.shape[0] < 4:
+        raise ValueError("Need at least 4 unique points for a 3D convex hull.")
+    hull = ConvexHull(pts_unique.astype(np.float64))
+    center = np.mean(pts_unique, axis=0)
+    faces = np.asarray(hull.simplices, dtype=np.int32).copy()
+    for i in range(faces.shape[0]):
+        face = faces[i]
+        tri = pts_unique[face]
+        normal = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+        face_center = np.mean(tri, axis=0)
+        if float(np.dot(normal, face_center - center)) < 0.0:
+            faces[i] = np.asarray([face[0], face[2], face[1]], dtype=np.int32)
+    verts = (pts_unique - origin_world[None, :]).astype(np.float32, copy=False)
+    return verts, faces
+
+
+def _build_patch_mesh(
+    points_world: np.ndarray,
+    origin_world: np.ndarray,
+    mode: str,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    pts = np.asarray(points_world, dtype=np.float32)
+    if mode == "box":
+        verts, faces = _box_mesh_from_points(pts, origin_world)
+        return verts, faces, "box"
+    try:
+        verts, faces = _convex_hull_mesh_from_points(pts, origin_world)
+        return verts, faces, "convex-hull"
+    except Exception:
+        verts, faces = _box_mesh_from_points(pts, origin_world)
+        return verts, faces, "box"
 
 
 def _mat33_from_numpy(mat: np.ndarray) -> wp.mat33:
@@ -743,6 +817,7 @@ def _build_shadow_system(
     builder.add_ground_plane(cfg=ground_cfg)
 
     patches: list[PatchSegment] = []
+    patch_mesh_box_fallback_count = 0
     patch_mu = float(args.patch_friction) if args.patch_friction is not None else float(spec.collider_mu)
     patch_thickness = (
         float(args.patch_thickness)
@@ -763,7 +838,13 @@ def _build_shadow_system(
             inertia=_mat33_from_numpy(inertia),
             label=f"patch_{len(patches):03d}",
         )
-        mesh_vertices_local, mesh_faces = _build_patch_mesh(q0[surface_patch_ids], com)
+        mesh_vertices_local, mesh_faces, mesh_mode_used = _build_patch_mesh(
+            q0[surface_patch_ids],
+            com,
+            str(args.patch_mesh_mode),
+        )
+        if mesh_mode_used == "box" and str(args.patch_mesh_mode) != "box":
+            patch_mesh_box_fallback_count += 1
         patch_mesh = newton.Mesh(mesh_vertices_local.astype(np.float32), mesh_faces.reshape(-1).astype(np.int32), compute_inertia=False)
         patch_cfg = builder.default_shape_cfg.copy()
         patch_cfg.mu = patch_mu
@@ -798,6 +879,8 @@ def _build_shadow_system(
         patch_friction=float(patch_mu),
         ground_thickness=max(2.0 * float(args.voxel_size), 0.02),
         ground_friction=float(args.ground_friction),
+        patch_mesh_mode_requested=str(args.patch_mesh_mode),
+        patch_mesh_box_fallback_count=int(patch_mesh_box_fallback_count),
     )
 
 
@@ -950,15 +1033,17 @@ def _body_forces_to_particle_forces(
     pre_clamp_z = float(external[:, 2].sum())
     pre_clamp_norm = float(np.linalg.norm(external, axis=1).sum())
 
-    masses_all = model.particle_mass.numpy().astype(np.float32)
-    max_force = masses_all * (float(args.max_particle_dv_per_frame) / max(frame_dt, 1.0e-8))
     norms = np.linalg.norm(external, axis=1)
     n_with_force = int(np.count_nonzero(norms > 1.0e-12))
-    scale = np.ones_like(norms, dtype=np.float32)
-    over = norms > np.maximum(max_force, 1.0e-8)
-    n_clamped = int(np.count_nonzero(over))
-    scale[over] = max_force[over] / np.maximum(norms[over], 1.0e-8)
-    external *= scale[:, None]
+    n_clamped = 0
+    if args.max_particle_dv_per_frame is not None and float(args.max_particle_dv_per_frame) > 0.0:
+        masses_all = model.particle_mass.numpy().astype(np.float32)
+        max_force = masses_all * (float(args.max_particle_dv_per_frame) / max(frame_dt, 1.0e-8))
+        scale = np.ones_like(norms, dtype=np.float32)
+        over = norms > np.maximum(max_force, 1.0e-8)
+        n_clamped = int(np.count_nonzero(over))
+        scale[over] = max_force[over] / np.maximum(norms[over], 1.0e-8)
+        external *= scale[:, None]
     return external, pre_clamp_z, pre_clamp_norm, n_clamped, n_with_force
 
 
@@ -1250,6 +1335,9 @@ def simulate(
         "frame_dt": frame_dt,
         "wall_time_sec": float(time.perf_counter() - t0),
         "patch_count": int(len(shadow.patches)),
+        "patch_mesh_mode_requested": str(shadow.patch_mesh_mode_requested),
+        "patch_mesh_box_fallback_count": int(shadow.patch_mesh_box_fallback_count),
+        "total_soft_mass": float(total_soft_mass),
     }
 
 
@@ -1417,9 +1505,20 @@ def _write_outputs(args: argparse.Namespace, ir: dict[str, Any], sim_data: dict[
         "wall_time_sec": float(sim_data["wall_time_sec"]),
         "gravity_mag": float(args.gravity_mag),
         "drop_height": float(args.drop_height),
+        "soft_mass_mode": "constant_override" if args.particle_mass is not None else "preserve_ir",
+        "soft_particle_mass_override": float(args.particle_mass) if args.particle_mass is not None else None,
+        "total_soft_mass_kg": float(sim_data["total_soft_mass"]),
+        "coupling_adapter_mode": "dynamic_patch_proxy",
         "patch_count_actual": int(sim_data["patch_count"]),
+        "patch_mesh_mode_requested": str(sim_data["patch_mesh_mode_requested"]),
+        "patch_mesh_box_fallback_count": int(sim_data["patch_mesh_box_fallback_count"]),
         "patch_force_scale": float(args.patch_force_scale),
-        "max_particle_dv_per_frame": float(args.max_particle_dv_per_frame),
+        "particle_dv_clamp_enabled": bool(args.max_particle_dv_per_frame is not None and float(args.max_particle_dv_per_frame) > 0.0),
+        "max_particle_dv_per_frame": (
+            float(args.max_particle_dv_per_frame)
+            if args.max_particle_dv_per_frame is not None
+            else None
+        ),
         "voxel_size": float(args.voxel_size),
         "particles_per_cell": int(args.particles_per_cell),
         "grid_type": str(args.grid_type),

@@ -39,6 +39,7 @@ from demo_robot_rope import (
     _quat_conjugate,
     _quat_multiply,
     _rope_endpoints,
+    _resolve_particle_contact_settings,
     _validate_scaling_args,
     _maybe_autoset_mass_spring_scale,
     _effective_spring_scales,
@@ -114,6 +115,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drag-damping-scale", type=float, default=1.0)
     p.add_argument(
+        "--particle-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable rope particle self-contact. If omitted, follow the IR self_collision flag.",
+    )
+    p.add_argument(
+        "--particle-contact-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the Newton particle contact kernel when particle contacts are active.",
+    )
+    p.add_argument(
         "--drag-ignore-gravity-axis",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -122,6 +135,15 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--anchor-height", type=float, default=0.72)
     p.add_argument("--anchor-count-per-end", type=int, default=1)
+    p.add_argument(
+        "--anchor-mass-mode",
+        choices=["preserve", "zero"],
+        default="preserve",
+        help=(
+            "How to treat rope endpoint particle masses after marking them inactive. "
+            "preserve keeps the original IR mass field; zero reproduces the older hard-anchor rewrite."
+        ),
+    )
 
     p.add_argument(
         "--robot-base-offset",
@@ -230,7 +252,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     x0 = np.asarray(ir_obj["x0"], dtype=np.float32).copy()
     edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
 
-    endpoint_indices = _rope_endpoints(edges, n_obj)
+    endpoint_indices = _rope_endpoints(edges, n_obj, x0)
     endpoint_mid = 0.5 * (x0[int(endpoint_indices[0])] + x0[int(endpoint_indices[1])])
     shift = np.array(
         [
@@ -247,6 +269,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
 
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
+    particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
@@ -256,7 +279,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         angular_damping=0.05,
         friction_smoothing=1.0,
         enable_tri_contact=False,
-        disable_particle_contact_kernel=True,
+        disable_particle_contact_kernel=not bool(particle_contact_kernel),
         shape_contacts=True,
         add_ground_plane=False,
         strict_physics_checks=False,
@@ -265,18 +288,19 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         gravity=-float(args.gravity_mag),
         gravity_from_reverse_z=False,
         up_axis="Z",
-        particle_contacts=False,
+        particle_contacts=bool(particle_contacts),
         device=device,
     )
 
     checks = newton_import_ir.validate_ir_physics(ir_obj, cfg)
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
-    _, _, _ = newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts=False)
+    _, _, _ = newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts=bool(particle_contacts))
     newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
     builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
     for idx in anchor_indices.tolist():
         builder.particle_flags[idx] = int(builder.particle_flags[idx]) & ~int(newton.ParticleFlags.ACTIVE)
-        builder.particle_mass[idx] = 0.0
+        if str(args.anchor_mass_mode) == "zero":
+            builder.particle_mass[idx] = 0.0
 
     robot_base_pos = rope_center + np.asarray(args.robot_base_offset, dtype=np.float32)
     franka_asset = newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf"
@@ -315,7 +339,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
 
     model = builder.finalize(device=device)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
-    model.particle_grid = None
+    if not bool(particle_contact_kernel):
+        model.particle_grid = None
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     model.set_gravity(gravity_vec)
 
@@ -336,6 +361,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "anchor_positions": shifted_q[anchor_indices].astype(np.float32),
         "rope_center": rope_center.astype(np.float32),
         "render_edges": render_edges,
+        "particle_contacts": bool(particle_contacts),
+        "particle_contact_kernel": bool(particle_contact_kernel),
         "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
     }
     return model, ir_obj, meta, n_obj
@@ -350,6 +377,7 @@ def simulate(
     device: str,
 ) -> dict[str, Any]:
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
+    particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
@@ -359,7 +387,7 @@ def simulate(
         angular_damping=0.05,
         friction_smoothing=1.0,
         enable_tri_contact=False,
-        disable_particle_contact_kernel=True,
+        disable_particle_contact_kernel=not bool(particle_contact_kernel),
         shape_contacts=True,
         add_ground_plane=False,
         strict_physics_checks=False,
@@ -368,7 +396,7 @@ def simulate(
         gravity=-float(args.gravity_mag),
         gravity_from_reverse_z=False,
         up_axis="Z",
-        particle_contacts=False,
+        particle_contacts=bool(particle_contacts),
         device=device,
     )
 
@@ -422,21 +450,24 @@ def simulate(
     )
 
     n_frames = max(2, int(args.frames))
-    particle_q_all: list[np.ndarray] = []
-    particle_q_object: list[np.ndarray] = []
-    body_q: list[np.ndarray] = []
-    body_vel: list[np.ndarray] = []
-    ee_target_pos: list[np.ndarray] = []
+    particle_q0 = state_in.particle_q.numpy().astype(np.float32)
+    body_q0 = state_in.body_q.numpy().astype(np.float32)
+    body_qd0 = state_in.body_qd.numpy().astype(np.float32)
+    particle_q_all = np.empty((n_frames, particle_q0.shape[0], 3), dtype=np.float32)
+    particle_q_object = np.empty((n_frames, n_obj, 3), dtype=np.float32)
+    body_q = np.empty((n_frames, body_q0.shape[0], body_q0.shape[1]), dtype=np.float32)
+    body_vel = np.empty((n_frames, body_qd0.shape[0], 3), dtype=np.float32)
+    ee_target_pos = np.empty((n_frames, 3), dtype=np.float32)
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
         q = state_in.particle_q.numpy().astype(np.float32)
-        particle_q_all.append(q.copy())
-        particle_q_object.append(q[:n_obj].copy())
-        body_q.append(state_in.body_q.numpy().astype(np.float32).copy())
-        body_vel.append(state_in.body_qd.numpy().astype(np.float32)[:, :3].copy())
+        particle_q_all[frame] = q
+        particle_q_object[frame] = q[:n_obj]
+        body_q[frame] = state_in.body_q.numpy().astype(np.float32)
+        body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
         target_pos_frame, _ = _robot_target_state(float(frame) * sim_dt * float(substeps), meta, args)
-        ee_target_pos.append(target_pos_frame.copy())
+        ee_target_pos[frame] = target_pos_frame
 
         for sub in range(substeps):
             sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
@@ -491,11 +522,11 @@ def simulate(
     wall_time = time.perf_counter() - t0
     print(f"  Simulation done: {n_frames} frames in {wall_time:.1f}s", flush=True)
     return {
-        "particle_q_all": np.stack(particle_q_all),
-        "particle_q_object": np.stack(particle_q_object),
-        "body_q": np.stack(body_q),
-        "body_vel": np.stack(body_vel),
-        "ee_target_pos": np.stack(ee_target_pos),
+        "particle_q_all": particle_q_all,
+        "particle_q_object": particle_q_object,
+        "body_q": body_q,
+        "body_vel": body_vel,
+        "ee_target_pos": ee_target_pos,
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
         "wall_time": float(wall_time),
@@ -751,6 +782,10 @@ def build_summary(
         "wall_time_sec": float(sim_data["wall_time"]),
         "rope_total_mass": float(meta["total_object_mass"]),
         "anchor_count": int(meta["anchor_indices"].shape[0]),
+        "anchor_constraint_mode": "inactive_fixed_particles",
+        "anchor_mass_mode": str(args.anchor_mass_mode),
+        "particle_contacts": bool(meta["particle_contacts"]),
+        "particle_contact_kernel": bool(meta["particle_contact_kernel"]),
         "robot_geometry": "native_franka",
         "ee_body_index": int(meta["ee_body_index"]),
         "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),

@@ -677,7 +677,9 @@ def _apply_controller_targets(
     device: str,
     *,
     interpolate: bool,
+    sim_dt: float,
 ) -> None:
+    frame_dt = float(sim_dt) * float(substeps)
     last_frame = int(controller.traj_np.shape[0]) - 1
     if frame >= last_frame:
         target = controller.traj_np[last_frame]
@@ -692,7 +694,11 @@ def _apply_controller_targets(
             interpolate,
         )
         controller.target_wp.assign(target.astype(np.float32, copy=False))
-        controller.vel_wp.assign(controller.zero_vel_np)
+        vel = (
+            controller.traj_np[frame].astype(np.float32, copy=False)
+            - controller.traj_np[frame - 1].astype(np.float32, copy=False)
+        ) / max(frame_dt, 1.0e-8)
+        controller.vel_wp.assign(vel.astype(np.float32, copy=False))
     wp.launch(
         newton_import_ir._write_kinematic_state,
         dim=controller.indices_np.size,
@@ -799,6 +805,7 @@ def simulate(
                 int(args.substeps),
                 device,
                 interpolate=bool(args.interpolate_controls),
+                sim_dt=float(args.sim_dt),
             )
 
             if particle_grid is not None:
@@ -1111,6 +1118,8 @@ def _write_outputs(
         "sand_base_radius_y": float(args.sand_base_radius_y),
         "sand_height": float(args.sand_height),
         "controller_count": int(np.asarray(ir["controller_idx"]).size),
+        "controller_velocity_mode": "trajectory_finite_difference",
+        "interpolate_controls": bool(args.interpolate_controls),
         "render_video": str(out_mp4) if out_mp4 is not None else None,
     }
     (args.out_dir / f"{args.prefix}_summary.json").write_text(
