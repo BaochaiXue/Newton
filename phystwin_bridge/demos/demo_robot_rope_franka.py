@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Native Newton Franka Panda pushes a PhysTwin rope.
 
-This demo keeps the deformable side on the PhysTwin -> Newton bridge, but
-replaces the proxy pusher with a native Newton robotics asset:
+This demo keeps the deformable side on the PhysTwin -> Newton bridge and uses
+a native Newton robotics asset:
 
 - load one rope from PhysTwin IR
 - keep it object-only and pin the rope endpoints
