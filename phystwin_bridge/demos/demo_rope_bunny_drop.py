@@ -41,6 +41,7 @@ from newton._src.solvers.semi_implicit.kernels_particle import eval_spring_force
 
 from demo_shared import (
     CORE_DIR,
+    apply_viewer_shape_colors,
     compute_visual_particle_radii,
     load_core_module,
     overlay_text_lines_rgb,
@@ -921,15 +922,11 @@ def render_video(model: newton.Model, sim_data: dict[str, Any], meta: dict[str, 
         )
 
         try:
-            shape_colors = {}
-            for idx, label in enumerate(list(model.shape_label)):
-                name = str(label).lower()
-                if "bunny" in name:
-                    shape_colors[idx] = (0.88, 0.35, 0.28)
-                elif "ground" in name or "plane" in name:
-                    shape_colors[idx] = (0.23, 0.26, 0.31)
-            if shape_colors:
-                viewer.update_shape_colors(shape_colors)
+            apply_viewer_shape_colors(
+                viewer,
+                model,
+                extra_rules=[(lambda name: "bunny" in name, (0.88, 0.35, 0.28))],
+            )
         except Exception:
             pass
 

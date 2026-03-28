@@ -49,7 +49,7 @@ from demo_rope_bunny_drop import (
     overlay_text_lines_rgb,
     path_defaults,
 )
-from demo_shared import compute_visual_particle_radii, temporary_particle_radius_override
+from demo_shared import apply_viewer_shape_colors, compute_visual_particle_radii, temporary_particle_radius_override
 from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
 from newton._src.solvers.semi_implicit.kernels_contact import (
     eval_body_contact_forces,
@@ -694,15 +694,11 @@ def render_video(
         )
 
         try:
-            shape_colors = {}
-            for idx, label in enumerate(list(model.shape_label)):
-                name = str(label).lower()
-                if "box" in name:
-                    shape_colors[idx] = (0.88, 0.35, 0.28)
-                elif "ground" in name or "plane" in name:
-                    shape_colors[idx] = (0.23, 0.26, 0.31)
-            if shape_colors:
-                viewer.update_shape_colors(shape_colors)
+            apply_viewer_shape_colors(
+                viewer,
+                model,
+                extra_rules=[(lambda name: "box" in name, (0.88, 0.35, 0.28))],
+            )
         except Exception:
             pass
 

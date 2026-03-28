@@ -28,6 +28,8 @@ Experimental ON viewer:
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import sys
 import time
 from pathlib import Path
@@ -60,6 +62,7 @@ if str(THIS_DIR) not in sys.path:
 
 import demo_cloth_bunny_drop_without_self_contact as off_case
 import demo_cloth_box_drop_with_self_contact as on_case
+from demo_shared import apply_viewer_shape_colors
 
 
 DEFAULT_IR = WORKSPACE_ROOT / "Newton/phystwin_bridge/ir/blue_cloth_double_lift_around/phystwin_ir_v2_bf_strict.npz"
@@ -189,6 +192,36 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spring-stride", type=int, default=8)
     parser.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
     parser.add_argument("--particle-radius-vis-min", type=float, default=0.005)
+    parser.add_argument(
+        "--profile-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Disable rendering and run repeated step-only profiling episodes.",
+    )
+    parser.add_argument(
+        "--profile-runs",
+        type=int,
+        default=5,
+        help="Number of measured no-render profiling episodes.",
+    )
+    parser.add_argument(
+        "--profile-warmup-runs",
+        type=int,
+        default=1,
+        help="Number of warmup episodes excluded from the final statistics.",
+    )
+    parser.add_argument(
+        "--profile-json",
+        type=Path,
+        default=None,
+        help="Optional path for JSON profiling summary. Defaults to <out-dir>/<prefix>_profile.json.",
+    )
+    parser.add_argument(
+        "--profile-csv",
+        type=Path,
+        default=None,
+        help="Optional path for CSV profiling summary. Defaults to <out-dir>/<prefix>_profile.csv.",
+    )
 
     return parser
 
@@ -342,6 +375,8 @@ class NewtonClothBunnyViewer:
         self.frame_index = 0
         self.last_step_wall_ms = 0.0
         self.last_render_wall_ms = 0.0
+        self.profile_enabled = False
+        self._profile_run_samples: dict[str, list[float]] = {}
 
         self._reset_runtime()
         self._configure_viewer()
@@ -353,6 +388,14 @@ class NewtonClothBunnyViewer:
         print("- H: show / hide UI")
         print("- F: frame camera on model")
         print("- ESC: exit")
+
+    def _profile_call(self, name: str, fn, *args, **kwargs):
+        wp.synchronize_device(self.device)
+        t0 = time.perf_counter()
+        result = fn(*args, **kwargs)
+        wp.synchronize_device(self.device)
+        self._profile_run_samples.setdefault(name, []).append(1000.0 * (time.perf_counter() - t0))
+        return result
 
     def _configure_viewer(self) -> None:
         self.viewer.set_model(self.model)
@@ -379,6 +422,10 @@ class NewtonClothBunnyViewer:
             )
         except Exception:
             pass
+        try:
+            apply_viewer_shape_colors(self.viewer, self.model)
+        except Exception:
+            pass
 
     def _reset_runtime(self) -> None:
         self.state_in = self.model.state()
@@ -396,17 +443,43 @@ class NewtonClothBunnyViewer:
         self.pending_reset = False
 
     def _step_substep(self, state_in, state_out):
+        if self.profile_enabled:
+            wp.synchronize_device(self.device)
+            t_sub = time.perf_counter()
+
         state_in.clear_forces()
 
         if self.particle_grid is not None:
             with wp.ScopedDevice(self.model.device):
-                self.particle_grid.build(state_in.particle_q, radius=self.search_radius)
+                if self.profile_enabled:
+                    self._profile_call(
+                        "particle_grid_build",
+                        self.particle_grid.build,
+                        state_in.particle_q,
+                        radius=self.search_radius,
+                    )
+                else:
+                    self.particle_grid.build(state_in.particle_q, radius=self.search_radius)
 
         if self.contacts is not None:
-            self.model.collide(state_in, self.contacts)
+            if self.profile_enabled:
+                self._profile_call("model_collide", self.model.collide, state_in, self.contacts)
+            else:
+                self.model.collide(state_in, self.contacts)
 
         if not bool(self.args.decouple_shape_materials):
-            self.solver.step(state_in, state_out, self.control, self.contacts, self.sim_dt)
+            if self.profile_enabled:
+                self._profile_call(
+                    "solver_step",
+                    self.solver.step,
+                    state_in,
+                    state_out,
+                    self.control,
+                    self.contacts,
+                    self.sim_dt,
+                )
+            else:
+                self.solver.step(state_in, state_out, self.control, self.contacts, self.sim_dt)
         else:
             particle_f = state_in.particle_f if state_in.particle_count else None
             body_f = state_in.body_f if state_in.body_count else None
@@ -414,79 +487,197 @@ class NewtonClothBunnyViewer:
             if body_f is not None and self.model.joint_count and self.control.joint_f is not None:
                 body_f_work = wp.clone(body_f)
 
-            eval_spring_forces(self.model, state_in, particle_f)
-            eval_triangle_forces(self.model, state_in, self.control, particle_f)
-            eval_bending_forces(self.model, state_in, particle_f)
-            eval_tetrahedra_forces(self.model, state_in, self.control, particle_f)
-            eval_body_joint_forces(
-                self.model, state_in, self.control, body_f_work, self.solver.joint_attach_ke, self.solver.joint_attach_kd
-            )
-            if self.args.mode == "on":
-                eval_particle_contact_forces(self.model, state_in, particle_f)
-            if self.solver.enable_tri_contact:
-                eval_triangle_contact_forces(self.model, state_in, particle_f)
-
-            self.module._assign_shape_material_triplet(
-                self.model,
-                self.meta["shape_material_ke_base"],
-                self.meta["shape_material_kd_base"],
-                self.meta["shape_material_kf_base"],
-            )
-            eval_body_contact_forces(
-                self.model,
-                state_in,
-                self.contacts,
-                friction_smoothing=self.solver.friction_smoothing,
-                body_f_out=body_f_work,
-            )
-
-            self.module._assign_shape_material_triplet(
-                self.model,
-                self.meta["shape_material_ke_scaled"],
-                self.meta["shape_material_kd_scaled"],
-                self.meta["shape_material_kf_scaled"],
-            )
-            eval_particle_body_contact_forces(
-                self.model, state_in, self.contacts, particle_f, body_f_work, body_f_in_world_frame=False
-            )
-
-            self.solver.integrate_particles(self.model, state_in, state_out, self.sim_dt)
-            if body_f_work is body_f:
-                self.solver.integrate_bodies(
-                    self.model, state_in, state_out, self.sim_dt, self.solver.angular_damping
+            if self.profile_enabled:
+                self._profile_call("eval_spring_forces", eval_spring_forces, self.model, state_in, particle_f)
+                self._profile_call("eval_triangle_forces", eval_triangle_forces, self.model, state_in, self.control, particle_f)
+                self._profile_call("eval_bending_forces", eval_bending_forces, self.model, state_in, particle_f)
+                self._profile_call("eval_tetrahedra_forces", eval_tetrahedra_forces, self.model, state_in, self.control, particle_f)
+                self._profile_call(
+                    "eval_body_joint_forces",
+                    eval_body_joint_forces,
+                    self.model,
+                    state_in,
+                    self.control,
+                    body_f_work,
+                    self.solver.joint_attach_ke,
+                    self.solver.joint_attach_kd,
                 )
+                if self.args.mode == "on":
+                    self._profile_call("eval_particle_contact_forces", eval_particle_contact_forces, self.model, state_in, particle_f)
+                if self.solver.enable_tri_contact:
+                    self._profile_call("eval_triangle_contact_forces", eval_triangle_contact_forces, self.model, state_in, particle_f)
+
+                self.module._assign_shape_material_triplet(
+                    self.model,
+                    self.meta["shape_material_ke_base"],
+                    self.meta["shape_material_kd_base"],
+                    self.meta["shape_material_kf_base"],
+                )
+                self._profile_call(
+                    "eval_body_contact_forces",
+                    eval_body_contact_forces,
+                    self.model,
+                    state_in,
+                    self.contacts,
+                    friction_smoothing=self.solver.friction_smoothing,
+                    body_f_out=body_f_work,
+                )
+
+                self.module._assign_shape_material_triplet(
+                    self.model,
+                    self.meta["shape_material_ke_scaled"],
+                    self.meta["shape_material_kd_scaled"],
+                    self.meta["shape_material_kf_scaled"],
+                )
+                self._profile_call(
+                    "eval_particle_body_contact_forces",
+                    eval_particle_body_contact_forces,
+                    self.model,
+                    state_in,
+                    self.contacts,
+                    particle_f,
+                    body_f_work,
+                    body_f_in_world_frame=False,
+                )
+
+                self._profile_call(
+                    "integrate_particles",
+                    self.solver.integrate_particles,
+                    self.model,
+                    state_in,
+                    state_out,
+                    self.sim_dt,
+                )
+                if body_f_work is body_f:
+                    self._profile_call(
+                        "integrate_bodies",
+                        self.solver.integrate_bodies,
+                        self.model,
+                        state_in,
+                        state_out,
+                        self.sim_dt,
+                        self.solver.angular_damping,
+                    )
+                else:
+                    body_f_prev = state_in.body_f
+                    state_in.body_f = body_f_work
+                    self._profile_call(
+                        "integrate_bodies",
+                        self.solver.integrate_bodies,
+                        self.model,
+                        state_in,
+                        state_out,
+                        self.sim_dt,
+                        self.solver.angular_damping,
+                    )
+                    state_in.body_f = body_f_prev
             else:
-                body_f_prev = state_in.body_f
-                state_in.body_f = body_f_work
-                self.solver.integrate_bodies(
-                    self.model, state_in, state_out, self.sim_dt, self.solver.angular_damping
+                eval_spring_forces(self.model, state_in, particle_f)
+                eval_triangle_forces(self.model, state_in, self.control, particle_f)
+                eval_bending_forces(self.model, state_in, particle_f)
+                eval_tetrahedra_forces(self.model, state_in, self.control, particle_f)
+                eval_body_joint_forces(
+                    self.model, state_in, self.control, body_f_work, self.solver.joint_attach_ke, self.solver.joint_attach_kd
                 )
-                state_in.body_f = body_f_prev
+                if self.args.mode == "on":
+                    eval_particle_contact_forces(self.model, state_in, particle_f)
+                if self.solver.enable_tri_contact:
+                    eval_triangle_contact_forces(self.model, state_in, particle_f)
+
+                self.module._assign_shape_material_triplet(
+                    self.model,
+                    self.meta["shape_material_ke_base"],
+                    self.meta["shape_material_kd_base"],
+                    self.meta["shape_material_kf_base"],
+                )
+                eval_body_contact_forces(
+                    self.model,
+                    state_in,
+                    self.contacts,
+                    friction_smoothing=self.solver.friction_smoothing,
+                    body_f_out=body_f_work,
+                )
+
+                self.module._assign_shape_material_triplet(
+                    self.model,
+                    self.meta["shape_material_ke_scaled"],
+                    self.meta["shape_material_kd_scaled"],
+                    self.meta["shape_material_kf_scaled"],
+                )
+                eval_particle_body_contact_forces(
+                    self.model, state_in, self.contacts, particle_f, body_f_work, body_f_in_world_frame=False
+                )
+
+                self.solver.integrate_particles(self.model, state_in, state_out, self.sim_dt)
+                if body_f_work is body_f:
+                    self.solver.integrate_bodies(
+                        self.model, state_in, state_out, self.sim_dt, self.solver.angular_damping
+                    )
+                else:
+                    body_f_prev = state_in.body_f
+                    state_in.body_f = body_f_work
+                    self.solver.integrate_bodies(
+                        self.model, state_in, state_out, self.sim_dt, self.solver.angular_damping
+                    )
+                    state_in.body_f = body_f_prev
 
         state_in, state_out = state_out, state_in
 
         if self.drag > 0.0:
             if self.gravity_axis is not None:
-                wp.launch(
-                    self.module._apply_drag_correction_ignore_axis,
-                    dim=self.n_obj,
-                    inputs=[
-                        state_in.particle_q,
-                        state_in.particle_qd,
-                        self.n_obj,
-                        self.sim_dt,
-                        self.drag,
-                        wp.vec3(*self.gravity_axis.tolist()),
-                    ],
-                    device=self.device,
-                )
+                if self.profile_enabled:
+                    self._profile_call(
+                        "drag_correction",
+                        wp.launch,
+                        self.module._apply_drag_correction_ignore_axis,
+                        dim=self.n_obj,
+                        inputs=[
+                            state_in.particle_q,
+                            state_in.particle_qd,
+                            self.n_obj,
+                            self.sim_dt,
+                            self.drag,
+                            wp.vec3(*self.gravity_axis.tolist()),
+                        ],
+                        device=self.device,
+                    )
+                else:
+                    wp.launch(
+                        self.module._apply_drag_correction_ignore_axis,
+                        dim=self.n_obj,
+                        inputs=[
+                            state_in.particle_q,
+                            state_in.particle_qd,
+                            self.n_obj,
+                            self.sim_dt,
+                            self.drag,
+                            wp.vec3(*self.gravity_axis.tolist()),
+                        ],
+                        device=self.device,
+                    )
             else:
-                wp.launch(
-                    self.module.newton_import_ir._apply_drag_correction,
-                    dim=self.n_obj,
-                    inputs=[state_in.particle_q, state_in.particle_qd, self.n_obj, self.sim_dt, self.drag],
-                    device=self.device,
-                )
+                if self.profile_enabled:
+                    self._profile_call(
+                        "drag_correction",
+                        wp.launch,
+                        self.module.newton_import_ir._apply_drag_correction,
+                        dim=self.n_obj,
+                        inputs=[state_in.particle_q, state_in.particle_qd, self.n_obj, self.sim_dt, self.drag],
+                        device=self.device,
+                    )
+                else:
+                    wp.launch(
+                        self.module.newton_import_ir._apply_drag_correction,
+                        dim=self.n_obj,
+                        inputs=[state_in.particle_q, state_in.particle_qd, self.n_obj, self.sim_dt, self.drag],
+                        device=self.device,
+                    )
+
+        if self.profile_enabled:
+            wp.synchronize_device(self.device)
+            self._profile_run_samples.setdefault("total_substep", []).append(
+                1000.0 * (time.perf_counter() - t_sub)
+            )
 
         return state_in, state_out
 
@@ -504,6 +695,8 @@ class NewtonClothBunnyViewer:
         self.state_in, self.state_out = state_in, state_out
         wp.synchronize_device(self.device)
         self.last_step_wall_ms = 1000.0 * (time.perf_counter() - t0)
+        if self.profile_enabled:
+            self._profile_run_samples.setdefault("total_step", []).append(self.last_step_wall_ms)
         self.sim_time += self.sim_dt * self.steps_per_render
         self.frame_index += 1
 
@@ -556,12 +749,135 @@ class NewtonClothBunnyViewer:
     def test_final(self):
         pass
 
+    def _profile_num_frames(self) -> int:
+        num_frames = int(getattr(self.args, "num_frames", 0) or 0)
+        if num_frames > 0:
+            return num_frames
+        return max(1, int(self.args.frames))
+
+    def _summarize_profile_runs(self, runs: list[dict[str, Any]]) -> dict[str, Any]:
+        op_names = sorted({name for run in runs for name in run["samples"].keys()})
+        summary: dict[str, Any] = {}
+        for name in op_names:
+            run_means = []
+            all_calls = []
+            counts = []
+            for run in runs:
+                samples = run["samples"].get(name, [])
+                counts.append(len(samples))
+                if samples:
+                    run_means.append(float(np.mean(samples)))
+                    all_calls.extend(samples)
+            summary[name] = {
+                "call_count_total": int(len(all_calls)),
+                "call_count_per_run": counts,
+                "run_mean_ms": run_means,
+                "mean_of_run_means_ms": float(np.mean(run_means)) if run_means else 0.0,
+                "std_of_run_means_ms": float(np.std(run_means)) if len(run_means) > 1 else 0.0,
+                "mean_over_all_calls_ms": float(np.mean(all_calls)) if all_calls else 0.0,
+                "std_over_all_calls_ms": float(np.std(all_calls)) if len(all_calls) > 1 else 0.0,
+            }
+        return summary
+
+    def _write_profile_outputs(self, payload: dict[str, Any]) -> tuple[Path, Path]:
+        json_path = (
+            self.args.profile_json.resolve()
+            if self.args.profile_json is not None
+            else (self.args.out_dir / f"{self.args.prefix}_profile.json").resolve()
+        )
+        csv_path = (
+            self.args.profile_csv.resolve()
+            if self.args.profile_csv is not None
+            else (self.args.out_dir / f"{self.args.prefix}_profile.csv").resolve()
+        )
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(
+                [
+                    "op_name",
+                    "call_count_total",
+                    "mean_of_run_means_ms",
+                    "std_of_run_means_ms",
+                    "mean_over_all_calls_ms",
+                    "std_over_all_calls_ms",
+                ]
+            )
+            for name, stats in payload["aggregate"].items():
+                writer.writerow(
+                    [
+                        name,
+                        stats["call_count_total"],
+                        stats["mean_of_run_means_ms"],
+                        stats["std_of_run_means_ms"],
+                        stats["mean_over_all_calls_ms"],
+                        stats["std_over_all_calls_ms"],
+                    ]
+                )
+        return json_path, csv_path
+
+    def profile_only(self) -> dict[str, Any]:
+        num_frames = self._profile_num_frames()
+        warmup_runs = max(0, int(self.args.profile_warmup_runs))
+        prof_runs = max(1, int(self.args.profile_runs))
+
+        def run_episode(record: bool) -> dict[str, Any]:
+            self._reset_runtime()
+            self.profile_enabled = record
+            self._profile_run_samples = {}
+            t0 = time.perf_counter()
+            for _ in range(num_frames):
+                self.step()
+            wp.synchronize_device(self.device)
+            wall_ms = 1000.0 * (time.perf_counter() - t0)
+            samples = {k: [float(v) for v in vals] for k, vals in self._profile_run_samples.items()}
+            self.profile_enabled = False
+            return {
+                "wall_ms": float(wall_ms),
+                "sim_time_sec": float(self.sim_time),
+                "frame_index": int(self.frame_index),
+                "samples": samples,
+            }
+
+        for _ in range(warmup_runs):
+            run_episode(record=False)
+
+        runs = [run_episode(record=True) for _ in range(prof_runs)]
+        payload = {
+            "mode": str(self.args.mode),
+            "viewer": str(getattr(self.args, "viewer", "unknown")),
+            "num_frames": int(num_frames),
+            "steps_per_render": int(self.steps_per_render),
+            "sim_dt": float(self.sim_dt),
+            "warmup_runs": int(warmup_runs),
+            "profile_runs": int(prof_runs),
+            "runs": runs,
+            "aggregate": self._summarize_profile_runs(runs),
+        }
+        json_path, csv_path = self._write_profile_outputs(payload)
+        print(f"Profile JSON: {json_path}", flush=True)
+        print(f"Profile CSV: {csv_path}", flush=True)
+        for name, stats in sorted(payload["aggregate"].items()):
+            print(
+                f"{name}: mean={stats['mean_of_run_means_ms']:.3f} ms, std={stats['std_of_run_means_ms']:.3f} ms, calls={stats['call_count_total']}",
+                flush=True,
+            )
+        return payload
+
 
 def main() -> int:
     parser = create_parser()
     viewer, args = newton.examples.init(parser)
     wp.init()
     example = NewtonClothBunnyViewer(viewer, args)
+    if bool(args.profile_only):
+        example.profile_only()
+        if hasattr(viewer, "close"):
+            viewer.close()
+        return 0
     newton.examples.run(example, args)
     return 0
 

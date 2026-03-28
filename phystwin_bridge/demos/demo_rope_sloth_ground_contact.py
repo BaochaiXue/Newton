@@ -21,7 +21,7 @@ from demo_rope_bunny_drop import (
     overlay_text_lines_rgb,
     path_defaults,
 )
-from demo_shared import _pair_penalty_contact_force, compute_visual_particle_radii
+from demo_shared import _pair_penalty_contact_force, apply_viewer_shape_colors, compute_visual_particle_radii
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
@@ -752,13 +752,7 @@ def render_video(
         )
 
         try:
-            shape_colors = {}
-            for idx, label in enumerate(list(model.shape_label)):
-                name = str(label).lower()
-                if "ground" in name or "plane" in name:
-                    shape_colors[idx] = (0.23, 0.26, 0.31)
-            if shape_colors:
-                viewer.update_shape_colors(shape_colors)
+            apply_viewer_shape_colors(viewer, model)
         except Exception:
             pass
 

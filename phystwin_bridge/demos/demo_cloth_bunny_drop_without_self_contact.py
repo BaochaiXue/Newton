@@ -46,7 +46,7 @@ from demo_rope_bunny_drop import (
     path_defaults,
     quat_to_rotmat,
 )
-from demo_shared import compute_visual_particle_radii, temporary_particle_radius_override
+from demo_shared import apply_viewer_shape_colors, compute_visual_particle_radii, temporary_particle_radius_override
 from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
 from newton._src.solvers.semi_implicit.kernels_contact import (
     eval_body_contact_forces,
@@ -246,6 +246,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-font-size", type=int, default=28)
     p.add_argument("--skip-render", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
+        "--force-diagnostic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Capture the exact collision-triggering substep, split internal vs external cloth forces, "
+            "and dump diagnostic artifacts."
+        ),
+    )
+    p.add_argument(
+        "--force-dump-dir",
+        type=Path,
+        default=None,
+        help="Optional output directory for force diagnostic artifacts. Defaults to <out-dir>/force_diagnostic.",
+    )
+    p.add_argument(
+        "--force-topk",
+        type=int,
+        default=32,
+        help="Number of highest external-force cloth nodes retained in the diagnostic summary and snapshot.",
+    )
+    p.add_argument(
+        "--force-arrow-scale",
+        type=float,
+        default=0.05,
+        help=(
+            "Maximum rendered arrow length [m] for each diagnostic vector family in the trigger snapshot. "
+            "Forces and accelerations are normalized per family before display."
+        ),
+    )
+    p.add_argument(
+        "--force-snapshot-frame",
+        choices=["trigger", "trigger_plus_1"],
+        default="trigger",
+        help="Choose whether the rendered diagnostic snapshot uses the trigger substep or the immediately following substep.",
+    )
+    p.add_argument(
+        "--stop-after-diagnostic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop the rollout immediately after the requested diagnostic snapshot has been captured.",
+    )
+    p.add_argument(
         "--decouple-shape-materials",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -416,6 +458,468 @@ def _assign_shape_material_triplet(model, ke: np.ndarray, kd: np.ndarray, kf: np
     model.shape_material_kf.assign(np.asarray(kf, dtype=np.float32))
 
 
+def _resolve_force_dump_dir(args: argparse.Namespace) -> Path:
+    if args.force_dump_dir is not None:
+        return args.force_dump_dir.expanduser().resolve()
+    return (args.out_dir / "force_diagnostic").resolve()
+
+
+def _select_force_topk(external_norm: np.ndarray, *, topk: int, eps: float) -> np.ndarray:
+    active = np.flatnonzero(external_norm > eps)
+    candidates = active if active.size else np.arange(external_norm.shape[0], dtype=np.int32)
+    if candidates.size == 0:
+        return np.zeros((0,), dtype=np.int32)
+    order = np.argsort(external_norm[candidates])[::-1]
+    limit = min(max(1, int(topk)), candidates.size)
+    return candidates[order[:limit]].astype(np.int32, copy=False)
+
+
+def _box_surface_info(
+    points_world: np.ndarray,
+    body_pos: np.ndarray,
+    quat_xyzw: np.ndarray,
+    half_extents: np.ndarray,
+    radius: np.ndarray,
+) -> dict[str, np.ndarray]:
+    rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+    local = (points_world - body_pos[None, :]) @ rot
+    hx, hy, hz = [float(v) for v in half_extents.ravel()]
+    closest_local = np.clip(local, [-hx, -hy, -hz], [hx, hy, hz]).astype(np.float32, copy=False)
+    outside_delta = local - closest_local
+    outside_dist = np.linalg.norm(outside_delta, axis=1)
+    sdf = _box_signed_distance(local.astype(np.float32, copy=False), hx, hy, hz).astype(np.float32, copy=False)
+
+    normals_local = np.zeros_like(local, dtype=np.float32)
+    outside_mask = outside_dist > 1.0e-8
+    if np.any(outside_mask):
+        normals_local[outside_mask] = (
+            outside_delta[outside_mask] / outside_dist[outside_mask, None]
+        ).astype(np.float32, copy=False)
+
+    inside_mask = ~outside_mask
+    if np.any(inside_mask):
+        local_inside = local[inside_mask]
+        dist_to_face = np.stack(
+            [
+                hx - local_inside[:, 0],
+                local_inside[:, 0] + hx,
+                hy - local_inside[:, 1],
+                local_inside[:, 1] + hy,
+                hz - local_inside[:, 2],
+                local_inside[:, 2] + hz,
+            ],
+            axis=1,
+        )
+        face_ids = np.argmin(dist_to_face, axis=1)
+        face_normals = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, -1.0],
+            ],
+            dtype=np.float32,
+        )
+        normals_local[inside_mask] = face_normals[face_ids]
+
+        inside_indices = np.flatnonzero(inside_mask)
+        for local_idx, point_idx in enumerate(inside_indices):
+            face_id = int(face_ids[local_idx])
+            if face_id == 0:
+                closest_local[point_idx, 0] = hx
+            elif face_id == 1:
+                closest_local[point_idx, 0] = -hx
+            elif face_id == 2:
+                closest_local[point_idx, 1] = hy
+            elif face_id == 3:
+                closest_local[point_idx, 1] = -hy
+            elif face_id == 4:
+                closest_local[point_idx, 2] = hz
+            else:
+                closest_local[point_idx, 2] = -hz
+
+    closest_world = closest_local @ rot.T + body_pos[None, :]
+    face_normal_world = normals_local @ rot.T
+    outward_normal = face_normal_world.copy()
+    flip_mask = np.sum((points_world - closest_world) * outward_normal, axis=1) < 0.0
+    outward_normal[flip_mask] *= -1.0
+    penetration = np.maximum(radius - sdf, 0.0).astype(np.float32, copy=False)
+    triangle_id = np.full((points_world.shape[0],), -1, dtype=np.int32)
+    return {
+        "closest_point_world": closest_world.astype(np.float32, copy=False),
+        "face_normal_world": face_normal_world.astype(np.float32, copy=False),
+        "outward_normal_world": outward_normal.astype(np.float32, copy=False),
+        "penetration_depth": penetration,
+        "triangle_id": triangle_id,
+        "distance_to_surface": np.abs(sdf).astype(np.float32, copy=False),
+    }
+
+
+def _mesh_surface_info(
+    points_world: np.ndarray,
+    body_pos: np.ndarray,
+    quat_xyzw: np.ndarray,
+    meta: dict[str, Any],
+    radius: np.ndarray,
+) -> dict[str, np.ndarray]:
+    faces = np.asarray(meta.get("mesh_tri_indices", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
+    verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+    if not faces.size or not verts_local.size:
+        raise ValueError("Mesh surface info requested, but no bunny mesh data is available in meta.")
+
+    scale = float(meta["mesh_scale"])
+    rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+    verts = (verts_local * scale) @ rot.T + body_pos[None, :]
+    tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    closest_point, dist, triangle_id = trimesh.proximity.closest_point(tri, points_world.astype(np.float64))
+    triangle_id = np.asarray(triangle_id, dtype=np.int32)
+    face_normal_world = tri.face_normals[triangle_id].astype(np.float32, copy=False)
+    closest_world = np.asarray(closest_point, dtype=np.float32)
+    outward_normal = face_normal_world.copy()
+    flip_mask = np.sum((points_world - closest_world) * outward_normal, axis=1) < 0.0
+    outward_normal[flip_mask] *= -1.0
+    dist = np.asarray(dist, dtype=np.float32)
+    penetration = np.maximum(radius - dist, 0.0).astype(np.float32, copy=False)
+    return {
+        "closest_point_world": closest_world,
+        "face_normal_world": face_normal_world,
+        "outward_normal_world": outward_normal.astype(np.float32, copy=False),
+        "penetration_depth": penetration,
+        "triangle_id": triangle_id,
+        "distance_to_surface": dist,
+    }
+
+
+def _capture_force_snapshot(
+    *,
+    frame_index: int,
+    substep_index_in_frame: int,
+    global_substep_index: int,
+    sim_time: float,
+    sim_dt: float,
+    particle_q: np.ndarray,
+    particle_qd: np.ndarray,
+    body_q: np.ndarray,
+    body_qd: np.ndarray,
+    particle_radius: np.ndarray,
+    mass: np.ndarray,
+    gravity_vec: np.ndarray,
+    f_spring: np.ndarray,
+    f_internal_total: np.ndarray,
+    f_external_total: np.ndarray,
+    meta: dict[str, Any],
+    force_topk: int,
+    force_eps: float,
+) -> dict[str, Any]:
+    if body_q.shape[0] == 0:
+        raise ValueError("Force diagnostics require a rigid body pose, but no body state is present.")
+
+    rigid_kind = str(meta.get("rigid_shape", "bunny"))
+    body_pos = body_q[0, :3].astype(np.float32, copy=False)
+    quat_xyzw = body_q[0, 3:7].astype(np.float32, copy=False)
+    if rigid_kind == "box":
+        surface = _box_surface_info(
+            particle_q,
+            body_pos,
+            quat_xyzw,
+            np.asarray(meta["box_half_extents"], dtype=np.float32),
+            particle_radius,
+        )
+    else:
+        surface = _mesh_surface_info(particle_q, body_pos, quat_xyzw, meta, particle_radius)
+
+    acceleration_total = (
+        (f_internal_total + f_external_total) / np.maximum(mass[:, None], 1.0e-12)
+        + gravity_vec.reshape(1, 3)
+    ).astype(np.float32, copy=False)
+    external_norm = np.linalg.norm(f_external_total, axis=1).astype(np.float32, copy=False)
+    internal_norm = np.linalg.norm(f_internal_total, axis=1).astype(np.float32, copy=False)
+    spring_norm = np.linalg.norm(f_spring, axis=1).astype(np.float32, copy=False)
+    accel_norm = np.linalg.norm(acceleration_total, axis=1).astype(np.float32, copy=False)
+
+    outward_normal = surface["outward_normal_world"]
+    face_normal = surface["face_normal_world"]
+    closest_world = surface["closest_point_world"]
+    penetration = surface["penetration_depth"]
+    triangle_id = surface["triangle_id"]
+    v_n = np.sum(particle_qd * outward_normal, axis=1).astype(np.float32, copy=False)
+    f_ext_n = np.sum(f_external_total * outward_normal, axis=1).astype(np.float32, copy=False)
+    f_int_n = np.sum(f_internal_total * outward_normal, axis=1).astype(np.float32, copy=False)
+    a_total_n = np.sum(acceleration_total * outward_normal, axis=1).astype(np.float32, copy=False)
+    f_stop_n = (mass * np.maximum(-v_n, 0.0) / max(float(sim_dt), 1.0e-12)).astype(np.float32)
+    topk_indices = _select_force_topk(external_norm, topk=force_topk, eps=force_eps)
+
+    return {
+        "frame_index": int(frame_index),
+        "substep_index_in_frame": int(substep_index_in_frame),
+        "global_substep_index": int(global_substep_index),
+        "sim_time": float(sim_time),
+        "particle_q": particle_q.astype(np.float32, copy=False),
+        "particle_qd": particle_qd.astype(np.float32, copy=False),
+        "body_q": body_q.astype(np.float32, copy=False),
+        "body_qd": body_qd.astype(np.float32, copy=False),
+        "particle_radius": particle_radius.astype(np.float32, copy=False),
+        "particle_mass": mass.astype(np.float32, copy=False),
+        "gravity_vec": gravity_vec.astype(np.float32, copy=False),
+        "f_spring": f_spring.astype(np.float32, copy=False),
+        "f_internal_total": f_internal_total.astype(np.float32, copy=False),
+        "f_external_total": f_external_total.astype(np.float32, copy=False),
+        "a_total": acceleration_total,
+        "closest_point_world": closest_world.astype(np.float32, copy=False),
+        "face_normal_world": face_normal.astype(np.float32, copy=False),
+        "outward_normal_world": outward_normal.astype(np.float32, copy=False),
+        "penetration_depth": penetration.astype(np.float32, copy=False),
+        "triangle_id": triangle_id.astype(np.int32, copy=False),
+        "external_force_norm": external_norm,
+        "internal_force_norm": internal_norm,
+        "spring_force_norm": spring_norm,
+        "acceleration_norm": accel_norm,
+        "external_force_normal": f_ext_n,
+        "internal_force_normal": f_int_n,
+        "acceleration_normal": a_total_n,
+        "normal_velocity": v_n,
+        "stop_force_required_normal": f_stop_n,
+        "topk_indices": topk_indices.astype(np.int32, copy=False),
+        "rigid_shape": rigid_kind,
+    }
+
+
+def _force_summary_payload(snapshot: dict[str, Any], *, eps: float) -> dict[str, Any]:
+    ext_norm = np.asarray(snapshot["external_force_norm"], dtype=np.float32)
+    contact_mask = ext_norm > eps
+    f_ext_n = np.asarray(snapshot["external_force_normal"], dtype=np.float32)
+    f_int_n = np.asarray(snapshot["internal_force_normal"], dtype=np.float32)
+    a_total_n = np.asarray(snapshot["acceleration_normal"], dtype=np.float32)
+    f_stop_n = np.asarray(snapshot["stop_force_required_normal"], dtype=np.float32)
+    topk = np.asarray(snapshot["topk_indices"], dtype=np.int32)
+
+    if np.any(contact_mask & (f_ext_n < 0.0)):
+        dominant_issue_guess = "direction_or_geometry"
+    elif np.any(contact_mask & (a_total_n < 0.0)):
+        dominant_issue_guess = "insufficient_contact_magnitude"
+    elif np.any(contact_mask & (f_ext_n < f_stop_n)):
+        dominant_issue_guess = "insufficient_contact_magnitude"
+    else:
+        dominant_issue_guess = "undetermined"
+
+    topk_records = []
+    for idx in topk.tolist():
+        topk_records.append(
+            {
+                "particle_index": int(idx),
+                "external_force_norm": float(ext_norm[idx]),
+                "internal_force_norm": float(snapshot["internal_force_norm"][idx]),
+                "spring_force_norm": float(snapshot["spring_force_norm"][idx]),
+                "acceleration_norm": float(snapshot["acceleration_norm"][idx]),
+                "penetration_depth_m": float(snapshot["penetration_depth"][idx]),
+                "triangle_id": int(snapshot["triangle_id"][idx]),
+                "external_force_normal": float(f_ext_n[idx]),
+                "internal_force_normal": float(f_int_n[idx]),
+                "acceleration_normal": float(a_total_n[idx]),
+                "normal_velocity": float(snapshot["normal_velocity"][idx]),
+                "stop_force_required_normal": float(f_stop_n[idx]),
+                "particle_position_world": [
+                    float(v) for v in np.asarray(snapshot["particle_q"][idx], dtype=np.float32)
+                ],
+                "closest_point_world": [
+                    float(v) for v in np.asarray(snapshot["closest_point_world"][idx], dtype=np.float32)
+                ],
+                "face_normal_world": [
+                    float(v) for v in np.asarray(snapshot["face_normal_world"][idx], dtype=np.float32)
+                ],
+                "outward_normal_world": [
+                    float(v) for v in np.asarray(snapshot["outward_normal_world"][idx], dtype=np.float32)
+                ],
+            }
+        )
+
+    return {
+        "trigger_substep_global": int(snapshot["global_substep_index"]),
+        "trigger_frame_index": int(snapshot["frame_index"]),
+        "trigger_substep_index_in_frame": int(snapshot["substep_index_in_frame"]),
+        "trigger_sim_time_sec": float(snapshot["sim_time"]),
+        "rigid_shape": str(snapshot["rigid_shape"]),
+        "contact_node_count": int(np.count_nonzero(contact_mask)),
+        "contact_nodes_with_wrong_direction": int(np.count_nonzero(contact_mask & (f_ext_n < 0.0))),
+        "contact_nodes_with_inward_acceleration": int(np.count_nonzero(contact_mask & (a_total_n < 0.0))),
+        "contact_nodes_force_below_stop": int(np.count_nonzero(contact_mask & (f_ext_n < f_stop_n))),
+        "contact_nodes_internal_dominates": int(
+            np.count_nonzero(contact_mask & (np.abs(f_int_n) > np.abs(f_ext_n)))
+        ),
+        "dominant_issue_guess": dominant_issue_guess,
+        "topk_particle_records": topk_records,
+    }
+
+
+def _write_force_diagnostic_outputs(
+    args: argparse.Namespace,
+    trigger_snapshot: dict[str, Any],
+    summary_payload: dict[str, Any],
+) -> tuple[Path, Path]:
+    dump_dir = _resolve_force_dump_dir(args)
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = dump_dir / "force_diag_trigger_substep.npz"
+    json_path = dump_dir / "force_diag_trigger_summary.json"
+
+    np.savez_compressed(
+        npz_path,
+        frame_index=np.int32(trigger_snapshot["frame_index"]),
+        substep_index_in_frame=np.int32(trigger_snapshot["substep_index_in_frame"]),
+        global_substep_index=np.int32(trigger_snapshot["global_substep_index"]),
+        sim_time=np.float32(trigger_snapshot["sim_time"]),
+        particle_q=trigger_snapshot["particle_q"],
+        particle_qd=trigger_snapshot["particle_qd"],
+        body_q=trigger_snapshot["body_q"],
+        body_qd=trigger_snapshot["body_qd"],
+        particle_radius=trigger_snapshot["particle_radius"],
+        particle_mass=trigger_snapshot["particle_mass"],
+        gravity_vec=trigger_snapshot["gravity_vec"],
+        f_spring=trigger_snapshot["f_spring"],
+        f_internal_total=trigger_snapshot["f_internal_total"],
+        f_external_total=trigger_snapshot["f_external_total"],
+        a_total=trigger_snapshot["a_total"],
+        closest_point_world=trigger_snapshot["closest_point_world"],
+        face_normal_world=trigger_snapshot["face_normal_world"],
+        outward_normal_world=trigger_snapshot["outward_normal_world"],
+        penetration_depth=trigger_snapshot["penetration_depth"],
+        triangle_id=trigger_snapshot["triangle_id"],
+        external_force_norm=trigger_snapshot["external_force_norm"],
+        internal_force_norm=trigger_snapshot["internal_force_norm"],
+        spring_force_norm=trigger_snapshot["spring_force_norm"],
+        acceleration_norm=trigger_snapshot["acceleration_norm"],
+        external_force_normal=trigger_snapshot["external_force_normal"],
+        internal_force_normal=trigger_snapshot["internal_force_normal"],
+        acceleration_normal=trigger_snapshot["acceleration_normal"],
+        normal_velocity=trigger_snapshot["normal_velocity"],
+        stop_force_required_normal=trigger_snapshot["stop_force_required_normal"],
+        topk_indices=trigger_snapshot["topk_indices"],
+        rigid_shape=np.asarray(str(trigger_snapshot["rigid_shape"])),
+    )
+    json_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    return npz_path, json_path
+
+
+def _render_force_diagnostic_snapshot(
+    model: newton.Model,
+    meta: dict[str, Any],
+    args: argparse.Namespace,
+    device: str,
+    snapshot: dict[str, Any],
+    out_path: Path,
+) -> Path:
+    import newton.viewer  # noqa: PLC0415
+    from PIL import Image  # noqa: PLC0415
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    width = int(args.screen_width)
+    height = int(args.screen_height)
+    viewer = newton.viewer.ViewerGL(width=width, height=height, vsync=False, headless=True)
+    try:
+        viewer.set_model(model)
+        viewer.show_particles = True
+        viewer.show_triangles = True
+        viewer.show_visual = True
+        viewer.show_static = True
+        viewer.show_collision = True
+        viewer.show_contacts = False
+        viewer.show_ui = False
+        viewer.picking_enabled = False
+        try:
+            viewer.camera.fov = float(args.camera_fov)
+        except Exception:
+            pass
+        cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
+        viewer.set_camera(
+            wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])),
+            float(args.camera_pitch),
+            float(args.camera_yaw),
+        )
+
+        render_radii = compute_visual_particle_radii(
+            model.particle_radius.numpy(),
+            radius_scale=float(args.particle_radius_vis_scale),
+            radius_cap=float(args.particle_radius_vis_min),
+        )
+        state = model.state()
+        if state.particle_qd is not None:
+            state.particle_qd.zero_()
+        if state.body_qd is not None:
+            state.body_qd.zero_()
+
+        cloth_edges = np.asarray(meta["render_edges"], dtype=np.int32)
+        starts_wp = wp.empty(len(cloth_edges), dtype=wp.vec3, device=device) if cloth_edges.size else None
+        ends_wp = wp.empty(len(cloth_edges), dtype=wp.vec3, device=device) if cloth_edges.size else None
+
+        topk = np.asarray(snapshot["topk_indices"], dtype=np.int32)
+        topk_q = np.asarray(snapshot["particle_q"], dtype=np.float32)[topk]
+        arrow_specs = [
+            ("diag_normal", np.asarray(snapshot["outward_normal_world"], dtype=np.float32)[topk], (1.0, 1.0, 1.0)),
+            ("diag_external", np.asarray(snapshot["f_external_total"], dtype=np.float32)[topk], (0.95, 0.25, 0.25)),
+            ("diag_spring", np.asarray(snapshot["f_spring"], dtype=np.float32)[topk], (0.25, 0.45, 0.95)),
+            ("diag_accel", np.asarray(snapshot["a_total"], dtype=np.float32)[topk], (0.15, 0.85, 0.25)),
+        ]
+
+        with temporary_particle_radius_override(model, render_radii):
+            state.particle_q.assign(np.asarray(snapshot["particle_q"], dtype=np.float32))
+            if state.body_q is not None and np.asarray(snapshot["body_q"]).size:
+                state.body_q.assign(np.asarray(snapshot["body_q"], dtype=np.float32))
+
+            viewer.begin_frame(float(snapshot["sim_time"]))
+            viewer.log_state(state)
+
+            if args.render_springs and cloth_edges.size and starts_wp is not None and ends_wp is not None:
+                q_obj = np.asarray(snapshot["particle_q"], dtype=np.float32)
+                starts_wp.assign(q_obj[cloth_edges[:, 0]].astype(np.float32, copy=False))
+                ends_wp.assign(q_obj[cloth_edges[:, 1]].astype(np.float32, copy=False))
+                viewer.log_lines(
+                    "/demo/cloth_springs",
+                    starts_wp,
+                    ends_wp,
+                    (0.28, 0.54, 0.88),
+                    width=0.01,
+                    hidden=False,
+                )
+
+            max_len = max(float(args.force_arrow_scale), 1.0e-6)
+            for name, vectors, color in arrow_specs:
+                if topk_q.shape[0] == 0:
+                    continue
+                if name == "diag_normal":
+                    scaled = vectors * max_len
+                else:
+                    norms = np.linalg.norm(vectors, axis=1)
+                    peak = float(np.max(norms)) if norms.size else 0.0
+                    if peak <= 1.0e-12:
+                        scaled = np.zeros_like(vectors, dtype=np.float32)
+                    else:
+                        scaled = (vectors / peak * max_len).astype(np.float32, copy=False)
+                starts = wp.array(topk_q.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
+                ends = wp.array((topk_q + scaled).astype(np.float32, copy=False), dtype=wp.vec3, device=device)
+                viewer.log_lines(f"/demo/{name}", starts, ends, color, width=0.012, hidden=False)
+
+            viewer.end_frame()
+            frame = viewer.get_frame(render_ui=False).numpy()
+            frame = overlay_text_lines_rgb(
+                frame,
+                [
+                    "FORCE DIAGNOSTIC SNAPSHOT",
+                    f"snapshot = {args.force_snapshot_frame}",
+                    f"trigger substep = {int(snapshot['global_substep_index'])}",
+                    "white=normal red=external blue=spring green=acceleration",
+                ],
+                font_size=int(args.label_font_size),
+            )
+            Image.fromarray(frame, mode="RGB").save(out_path)
+    finally:
+        try:
+            viewer.close()
+        except Exception:
+            pass
+    return out_path
+
+
 def simulate(
     model: newton.Model,
     ir_obj: dict[str, Any],
@@ -480,6 +984,21 @@ def simulate(
     use_decoupled_shape_materials = bool(args.decouple_shape_materials) or (
         not np.isclose(float(ir_obj.get("weight_scale", 1.0)), 1.0)
     )
+    force_diagnostic_enabled = bool(args.force_diagnostic)
+    use_manual_force_path = bool(use_decoupled_shape_materials) or force_diagnostic_enabled
+    force_eps = 1.0e-8
+    trigger_snapshot: dict[str, Any] | None = None
+    render_snapshot: dict[str, Any] | None = None
+    pending_snapshot_after_step = False
+    previous_max_external_norm = 0.0
+    stop_requested = False
+    diagnostic_rollout_truncated = False
+    global_substep_index = 0
+    particle_mass_diag = np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].copy()
+    particle_radius_diag = model.particle_radius.numpy().astype(np.float32)[:n_obj].copy()
+    gravity_vec_diag = np.asarray(gravity_vec, dtype=np.float32).reshape(3)
+    if force_diagnostic_enabled:
+        _resolve_force_dump_dir(args).mkdir(parents=True, exist_ok=True)
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -501,7 +1020,7 @@ def simulate(
         else:
             body_vel.append(state_in.body_qd.numpy().astype(np.float32)[:, :3].copy())
 
-        for _ in range(substeps):
+        for substep_index_in_frame in range(substeps):
             state_in.clear_forces()
 
             if particle_grid is not None:
@@ -511,7 +1030,7 @@ def simulate(
             if contacts is not None:
                 model.collide(state_in, contacts)
 
-            if not use_decoupled_shape_materials:
+            if not use_manual_force_path:
                 solver.step(state_in, state_out, control, contacts, sim_dt)
             else:
                 particle_f = state_in.particle_f if state_in.particle_count else None
@@ -519,36 +1038,102 @@ def simulate(
                 body_f_work = body_f
                 if body_f is not None and model.joint_count and control.joint_f is not None:
                     body_f_work = wp.clone(body_f)
+                if particle_f is None:
+                    raise RuntimeError("Force diagnostics require particle forces, but particle_f is not allocated.")
 
                 eval_spring_forces(model, state_in, particle_f)
+                f_spring_np = None
+                f_internal_total_np = None
+                f_before_particle_body_np = None
+                if force_diagnostic_enabled:
+                    f_spring_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
                 eval_triangle_forces(model, state_in, control, particle_f)
                 eval_bending_forces(model, state_in, particle_f)
                 eval_tetrahedra_forces(model, state_in, control, particle_f)
+                if force_diagnostic_enabled:
+                    f_internal_total_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
                 eval_body_joint_forces(
                     model, state_in, control, body_f_work, solver.joint_attach_ke, solver.joint_attach_kd
                 )
                 if solver.enable_tri_contact:
                     eval_triangle_contact_forces(model, state_in, particle_f)
+                if force_diagnostic_enabled:
+                    f_before_particle_body_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
 
-                _assign_shape_material_triplet(
-                    model,
-                    meta["shape_material_ke_base"],
-                    meta["shape_material_kd_base"],
-                    meta["shape_material_kf_base"],
-                )
+                if use_decoupled_shape_materials:
+                    _assign_shape_material_triplet(
+                        model,
+                        meta["shape_material_ke_base"],
+                        meta["shape_material_kd_base"],
+                        meta["shape_material_kf_base"],
+                    )
                 eval_body_contact_forces(
                     model, state_in, contacts, friction_smoothing=solver.friction_smoothing, body_f_out=body_f_work
                 )
 
-                _assign_shape_material_triplet(
-                    model,
-                    meta["shape_material_ke_scaled"],
-                    meta["shape_material_kd_scaled"],
-                    meta["shape_material_kf_scaled"],
-                )
+                if use_decoupled_shape_materials:
+                    _assign_shape_material_triplet(
+                        model,
+                        meta["shape_material_ke_scaled"],
+                        meta["shape_material_kd_scaled"],
+                        meta["shape_material_kf_scaled"],
+                    )
                 eval_particle_body_contact_forces(
                     model, state_in, contacts, particle_f, body_f_work, body_f_in_world_frame=False
                 )
+                if force_diagnostic_enabled:
+                    f_after_particle_body_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                    if f_spring_np is None or f_internal_total_np is None or f_before_particle_body_np is None:
+                        raise RuntimeError("Force diagnostic bookkeeping is incomplete inside the manual force path.")
+                    f_external_total_np = (
+                        f_after_particle_body_np - f_before_particle_body_np
+                    ).astype(np.float32, copy=False)
+                    current_max_external_norm = float(
+                        np.max(np.linalg.norm(f_external_total_np, axis=1))
+                    ) if f_external_total_np.size else 0.0
+                    sim_time = (frame * substeps + substep_index_in_frame) * sim_dt
+                    if (
+                        trigger_snapshot is None
+                        and previous_max_external_norm <= force_eps
+                        and current_max_external_norm > force_eps
+                    ):
+                        particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        body_q_np = (
+                            state_in.body_q.numpy().astype(np.float32).copy()
+                            if state_in.body_q is not None
+                            else np.zeros((0, 7), dtype=np.float32)
+                        )
+                        body_qd_np = (
+                            state_in.body_qd.numpy().astype(np.float32).copy()
+                            if state_in.body_qd is not None
+                            else np.zeros((0, 6), dtype=np.float32)
+                        )
+                        trigger_snapshot = _capture_force_snapshot(
+                            frame_index=frame,
+                            substep_index_in_frame=substep_index_in_frame,
+                            global_substep_index=global_substep_index,
+                            sim_time=sim_time,
+                            sim_dt=sim_dt,
+                            particle_q=particle_q_np,
+                            particle_qd=particle_qd_np,
+                            body_q=body_q_np,
+                            body_qd=body_qd_np,
+                            particle_radius=particle_radius_diag,
+                            mass=particle_mass_diag,
+                            gravity_vec=gravity_vec_diag,
+                            f_spring=f_spring_np,
+                            f_internal_total=f_internal_total_np,
+                            f_external_total=f_external_total_np,
+                            meta=meta,
+                            force_topk=int(args.force_topk),
+                            force_eps=force_eps,
+                        )
+                        if str(args.force_snapshot_frame) == "trigger":
+                            render_snapshot = trigger_snapshot
+                        else:
+                            pending_snapshot_after_step = True
+                    previous_max_external_norm = current_max_external_norm
 
                 solver.integrate_particles(model, state_in, state_out, sim_dt)
                 if body_f_work is body_f:
@@ -582,12 +1167,89 @@ def simulate(
                         device=device,
                     )
 
+            global_substep_index += 1
+            if pending_snapshot_after_step and trigger_snapshot is not None and render_snapshot is None:
+                particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                body_q_np = (
+                    state_in.body_q.numpy().astype(np.float32).copy()
+                    if state_in.body_q is not None
+                    else np.zeros((0, 7), dtype=np.float32)
+                )
+                body_qd_np = (
+                    state_in.body_qd.numpy().astype(np.float32).copy()
+                    if state_in.body_qd is not None
+                    else np.zeros((0, 6), dtype=np.float32)
+                )
+                render_snapshot = _capture_force_snapshot(
+                    frame_index=frame,
+                    substep_index_in_frame=substep_index_in_frame + 1,
+                    global_substep_index=global_substep_index,
+                    sim_time=(frame * substeps + substep_index_in_frame + 1) * sim_dt,
+                    sim_dt=sim_dt,
+                    particle_q=particle_q_np,
+                    particle_qd=particle_qd_np,
+                    body_q=body_q_np,
+                    body_qd=body_qd_np,
+                    particle_radius=particle_radius_diag,
+                    mass=particle_mass_diag,
+                    gravity_vec=gravity_vec_diag,
+                    f_spring=trigger_snapshot["f_spring"],
+                    f_internal_total=trigger_snapshot["f_internal_total"],
+                    f_external_total=trigger_snapshot["f_external_total"],
+                    meta=meta,
+                    force_topk=int(args.force_topk),
+                    force_eps=force_eps,
+                )
+                pending_snapshot_after_step = False
+            if force_diagnostic_enabled and trigger_snapshot is not None and bool(args.stop_after_diagnostic):
+                if render_snapshot is not None:
+                    stop_requested = True
+                    diagnostic_rollout_truncated = True
+            if stop_requested:
+                break
+
+        if stop_requested:
+            break
         if frame == 49 or frame == 99 or frame == 199 or frame == n_frames - 1:
             print(f"  frame {frame + 1}/{n_frames}", flush=True)
 
     wall_time = time.perf_counter() - t0
-    print(f"  Simulation done: {n_frames} frames in {wall_time:.1f}s", flush=True)
-    return {
+    force_diagnostic: dict[str, Any] | None = None
+    if force_diagnostic_enabled:
+        if trigger_snapshot is None:
+            raise RuntimeError(
+                "Force diagnostic requested, but no trigger substep was found. "
+                "Try increasing --frames or using a case that reaches cloth-rigid contact."
+            )
+        summary_payload = _force_summary_payload(trigger_snapshot, eps=force_eps)
+        npz_path, json_path = _write_force_diagnostic_outputs(args, trigger_snapshot, summary_payload)
+        snapshot_png_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.png"
+        _render_force_diagnostic_snapshot(
+            model,
+            meta,
+            args,
+            device,
+            render_snapshot if render_snapshot is not None else trigger_snapshot,
+            snapshot_png_path,
+        )
+        force_diagnostic = {
+            "enabled": True,
+            "snapshot_frame_mode": str(args.force_snapshot_frame),
+            "trigger_substep_global": int(trigger_snapshot["global_substep_index"]),
+            "trigger_frame_index": int(trigger_snapshot["frame_index"]),
+            "trigger_substep_index_in_frame": int(trigger_snapshot["substep_index_in_frame"]),
+            "force_eps": float(force_eps),
+            "npz_path": str(npz_path),
+            "summary_json_path": str(json_path),
+            "snapshot_png_path": str(snapshot_png_path),
+            "contact_node_count": int(summary_payload["contact_node_count"]),
+            "dominant_issue_guess": str(summary_payload["dominant_issue_guess"]),
+            "topk_particle_count": int(len(summary_payload["topk_particle_records"])),
+            "rollout_truncated": bool(diagnostic_rollout_truncated),
+        }
+    print(f"  Simulation done: {len(particle_q_all)} recorded frames in {wall_time:.1f}s", flush=True)
+    result = {
         "particle_q_all": np.stack(particle_q_all, axis=0),
         "particle_q_object": np.stack(particle_q_object, axis=0),
         "body_q": np.stack(body_q, axis=0),
@@ -597,6 +1259,9 @@ def simulate(
         "wall_time": float(wall_time),
         "use_decoupled_shape_materials": bool(use_decoupled_shape_materials),
     }
+    if force_diagnostic is not None:
+        result["force_diagnostic"] = force_diagnostic
+    return result
 
 
 def render_video(
@@ -716,15 +1381,17 @@ def render_video(
         )
 
         try:
-            shape_colors = {}
-            for idx, label in enumerate(list(model.shape_label)):
-                name = str(label).lower()
-                if "bunny" in name or (meta.get("rigid_shape") == "box" and "shape_1" in name):
-                    shape_colors[idx] = (0.88, 0.35, 0.28)
-                elif "ground" in name or "plane" in name:
-                    shape_colors[idx] = (0.23, 0.26, 0.31)
-            if shape_colors:
-                viewer.update_shape_colors(shape_colors)
+            apply_viewer_shape_colors(
+                viewer,
+                model,
+                extra_rules=[
+                    (
+                        lambda name: "bunny" in name
+                        or (meta.get("rigid_shape") == "box" and "shape_1" in name),
+                        (0.88, 0.35, 0.28),
+                    )
+                ],
+            )
         except Exception:
             pass
 
@@ -927,7 +1594,7 @@ def build_summary(
             bunny_mesh_max_penetration = float(sampled_max)
             if final_penetration is not None:
                 bunny_mesh_final_p99_penetration = float(np.quantile(final_penetration, 0.99))
-    return {
+    summary = {
         "experiment": "cloth_bunny_drop_object_only",
         "self_collision_case": "off",
         "ir_path": str(args.ir.resolve()),
@@ -1018,6 +1685,36 @@ def build_summary(
         "camera_mode": "manual",
         "render_video": str(out_mp4) if out_mp4 is not None else None,
     }
+    force_diagnostic = sim_data.get("force_diagnostic")
+    if isinstance(force_diagnostic, dict):
+        summary.update(
+            {
+                "force_diagnostic_enabled": bool(force_diagnostic.get("enabled", False)),
+                "force_snapshot_frame_mode": str(force_diagnostic.get("snapshot_frame_mode", "trigger")),
+                "force_diagnostic_trigger_substep_global": int(
+                    force_diagnostic.get("trigger_substep_global", -1)
+                ),
+                "force_diagnostic_trigger_frame_index": int(
+                    force_diagnostic.get("trigger_frame_index", -1)
+                ),
+                "force_diagnostic_trigger_substep_index_in_frame": int(
+                    force_diagnostic.get("trigger_substep_index_in_frame", -1)
+                ),
+                "force_diagnostic_contact_node_count": int(force_diagnostic.get("contact_node_count", 0)),
+                "force_diagnostic_topk_particle_count": int(force_diagnostic.get("topk_particle_count", 0)),
+                "force_diagnostic_dominant_issue_guess": str(
+                    force_diagnostic.get("dominant_issue_guess", "undetermined")
+                ),
+                "force_diagnostic_force_eps": float(force_diagnostic.get("force_eps", 0.0)),
+                "force_diagnostic_npz": str(force_diagnostic.get("npz_path", "")),
+                "force_diagnostic_summary_json": str(force_diagnostic.get("summary_json_path", "")),
+                "force_diagnostic_snapshot_png": str(force_diagnostic.get("snapshot_png_path", "")),
+                "rollout_truncated_for_force_diagnostic": bool(
+                    force_diagnostic.get("rollout_truncated", False)
+                ),
+            }
+        )
+    return summary
 
 
 def save_summary_json(args: argparse.Namespace, summary: dict[str, Any]) -> Path:
@@ -1052,7 +1749,10 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
     print(f"  Scene NPZ: {scene_npz}", flush=True)
 
     out_mp4: Path | None = None
-    if not bool(args.skip_render):
+    skip_full_rollout_render = bool(args.force_diagnostic) and bool(args.stop_after_diagnostic)
+    if skip_full_rollout_render and not bool(args.skip_render):
+        print("Skipping full rollout video because --stop-after-diagnostic is active.", flush=True)
+    if not bool(args.skip_render) and not skip_full_rollout_render:
         print("Rendering video...", flush=True)
         out_mp4 = args.out_dir / f"{args.prefix}_{_mass_tag(args.rigid_mass)}.mp4"
         out_mp4.parent.mkdir(parents=True, exist_ok=True)

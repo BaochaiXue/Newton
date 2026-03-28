@@ -8,13 +8,14 @@ import math
 import pickle
 import sys
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import warp as wp
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 CORE_DIR = BRIDGE_ROOT / "tools" / "core"
+EARTH_GROUND_COLOR = (0.76, 0.66, 0.46)
 
 
 def load_core_module(name: str, path: Path):
@@ -236,6 +237,35 @@ def overlay_text_lines_rgb(
     return np.asarray(img, dtype=np.uint8)
 
 
+def apply_viewer_shape_colors(
+    viewer: Any,
+    model: Any,
+    *,
+    extra_rules: list[tuple[Callable[[str], bool], tuple[float, float, float]]] | None = None,
+    ground_color: tuple[float, float, float] = EARTH_GROUND_COLOR,
+) -> dict[int, tuple[float, float, float]]:
+    """Applies a consistent presentation palette to ViewerGL shapes.
+
+    We keep the logic at the bridge layer so every offline MP4 / GIF can share
+    the same readable earth-tone ground without touching Newton core rendering.
+    """
+
+    labels = list(getattr(model, "shape_label", []))
+    shape_colors: dict[int, tuple[float, float, float]] = {}
+    for idx, label in enumerate(labels):
+        name = str(label).lower()
+        if "ground" in name or "plane" in name:
+            shape_colors[idx] = tuple(float(c) for c in ground_color)
+        if extra_rules:
+            for predicate, color in extra_rules:
+                if predicate(name):
+                    shape_colors[idx] = tuple(float(c) for c in color)
+                    break
+    if shape_colors:
+        viewer.update_shape_colors(shape_colors)
+    return shape_colors
+
+
 def camera_position(target: np.ndarray, yaw_deg: float, pitch_deg: float, distance: float) -> np.ndarray:
     yaw = math.radians(float(yaw_deg))
     pitch = math.radians(float(pitch_deg))
@@ -357,7 +387,7 @@ def ground_grid(
     *,
     steps: int = 12,
     z: float = 0.0,
-    color: tuple[float, float, float] = (0.17, 0.24, 0.33),
+    color: tuple[float, float, float] = EARTH_GROUND_COLOR,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     vals = np.linspace(-size, size, 2 * int(steps) + 1, dtype=np.float32)
     starts: list[list[float]] = []
