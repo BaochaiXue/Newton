@@ -19,7 +19,6 @@ import argparse
 import json
 import shutil
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,29 +27,17 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_shared import (
-    CORE_DIR,
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_shared import (
     alpha_shape_surface_mesh,
     camera_position,
     ground_grid,
-    load_core_module,
     load_ir_checked,
     load_surface_points,
     model_particle_collider_body_ids,
     overlay_text_lines_rgb,
     spawn_mpm_particle_block,
 )
-
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
-NEWTON_PY_ROOT = CORE_DIR.parents[2] / "newton"
-if str(NEWTON_PY_ROOT) not in sys.path:
-    sys.path.insert(0, str(NEWTON_PY_ROOT))
-
-path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
-newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
-
-import newton  # noqa: E402
 
 
 @dataclass
@@ -454,7 +441,7 @@ def _build_sand_system(proxy: SoftProxy, args: argparse.Namespace, device: str) 
     if getattr(sand_model, "mpm", None) is not None and getattr(sand_model.mpm, "hardening", None) is not None:
         sand_model.mpm.hardening.fill_(0.0)
 
-    options = newton.solvers.SolverImplicitMPM.Options()
+    options = newton.solvers.SolverImplicitMPM.Config()
     options.voxel_size = float(args.voxel_size)
     options.tolerance = float(args.tolerance)
     options.transfer_scheme = "pic"
@@ -476,7 +463,7 @@ def _build_sand_system(proxy: SoftProxy, args: argparse.Namespace, device: str) 
     sand_solver.setup_collider(
         collider_meshes=collider_meshes,
         collider_body_ids=collider_body_ids,
-        collider_thicknesses=collider_thicknesses,
+        collider_margins=collider_thicknesses,
         collider_friction=collider_friction,
         model=sand_model,
     )

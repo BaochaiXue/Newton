@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -28,32 +27,19 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-import newton
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
 import newton.examples
-from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
-from newton._src.solvers.semi_implicit.kernels_contact import (
+from semiimplicit_bridge_kernels import (
     eval_body_contact_forces,
+    eval_body_joint_forces,
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
     eval_triangle_contact_forces,
-)
-from newton._src.solvers.semi_implicit.kernels_particle import (
     eval_bending_forces,
     eval_spring_forces,
     eval_tetrahedra_forces,
     eval_triangle_forces,
 )
-
-from demo_shared import CORE_DIR, load_core_module
-
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
-NEWTON_PY_ROOT = CORE_DIR.parents[2] / "newton"
-if str(NEWTON_PY_ROOT) not in sys.path:
-    sys.path.insert(0, str(NEWTON_PY_ROOT))
-
-path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
-newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
 
 
 THIS_DIR = Path(__file__).resolve().parent

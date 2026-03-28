@@ -30,7 +30,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_cloth_bunny_common import (
+from cloth_bunny_common import (
     _apply_particle_contact_scaling,
     _apply_shape_contact_scaling,
     _box_signed_distance,
@@ -42,22 +42,18 @@ from demo_cloth_bunny_common import (
     _validate_scaling_args,
     load_ir,
 )
-from demo_rope_bunny_drop import (
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_deformable_common import (
     _apply_drag_correction_ignore_axis,
-    newton,
-    newton_import_ir,
-    overlay_text_lines_rgb,
-    path_defaults,
 )
-from demo_shared import apply_viewer_shape_colors, compute_visual_particle_radii, temporary_particle_radius_override
-from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
-from newton._src.solvers.semi_implicit.kernels_contact import (
+from bridge_shared import apply_viewer_shape_colors, compute_visual_particle_radii, temporary_particle_radius_override
+from bridge_shared import overlay_text_lines_rgb
+from semiimplicit_bridge_kernels import (
     eval_body_contact_forces,
+    eval_body_joint_forces,
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
     eval_triangle_contact_forces,
-)
-from newton._src.solvers.semi_implicit.kernels_particle import (
     eval_bending_forces,
     eval_spring_forces,
     eval_tetrahedra_forces,

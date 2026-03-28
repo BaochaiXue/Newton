@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -38,16 +37,14 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-import newton
+from bridge_bootstrap import newton
 import newton.examples
-from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
-from newton._src.solvers.semi_implicit.kernels_contact import (
+from semiimplicit_bridge_kernels import (
     eval_body_contact_forces,
+    eval_body_joint_forces,
     eval_particle_body_contact_forces,
     eval_particle_contact_forces,
     eval_triangle_contact_forces,
-)
-from newton._src.solvers.semi_implicit.kernels_particle import (
     eval_bending_forces,
     eval_spring_forces,
     eval_tetrahedra_forces,
@@ -57,12 +54,9 @@ from newton._src.solvers.semi_implicit.kernels_particle import (
 
 THIS_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = THIS_DIR.parents[2]
-if str(THIS_DIR) not in sys.path:
-    sys.path.insert(0, str(THIS_DIR))
-
 import demo_cloth_bunny_drop_without_self_contact as off_case
 import demo_cloth_box_drop_with_self_contact as on_case
-from demo_shared import apply_viewer_shape_colors
+from bridge_shared import apply_viewer_shape_colors
 
 
 DEFAULT_IR = WORKSPACE_ROOT / "Newton/phystwin_bridge/ir/blue_cloth_double_lift_around/phystwin_ir_v2_bf_strict.npz"

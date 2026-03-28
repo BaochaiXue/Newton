@@ -20,7 +20,6 @@ import argparse
 import json
 import shutil
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,30 +28,17 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_shared import (
-    CORE_DIR,
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_shared import (
     alpha_shape_surface_mesh,
     camera_position,
     ground_grid,
-    load_core_module,
     load_ir_checked,
     load_surface_points,
     model_particle_collider_body_ids,
     overlay_text_lines_rgb,
 )
-
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
-NEWTON_PY_ROOT = CORE_DIR.parents[2] / "newton"
-if str(NEWTON_PY_ROOT) not in sys.path:
-    sys.path.insert(0, str(NEWTON_PY_ROOT))
-
-path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
-newton_import_ir = load_core_module(
-    "newton_import_ir", CORE_DIR / "newton_import_ir.py"
-)
-
-import newton  # noqa: E402
+from rollout_storage import RolloutStorage
 
 
 @dataclass
@@ -145,6 +131,12 @@ def parse_args() -> argparse.Namespace:
     sim_group.add_argument("--substeps", type=int, default=None)
     sim_group.add_argument("--gravity-mag", type=float, default=9.8)
     sim_group.add_argument("--soft-gravity-mag", type=float, default=0.0)
+    sim_group.add_argument(
+        "--history-storage",
+        choices=["memory", "memmap"],
+        default="memmap",
+        help="Storage backend for rollout histories.",
+    )
     sim_group.add_argument(
         "--interpolate-controls", action=argparse.BooleanOptionalAction, default=True
     )
@@ -625,7 +617,7 @@ def _build_sand_system(
     ):
         sand_model.mpm.hardening.fill_(0.0)
 
-    options = newton.solvers.SolverImplicitMPM.Options()
+    options = newton.solvers.SolverImplicitMPM.Config()
     options.voxel_size = float(args.voxel_size)
     options.tolerance = float(args.tolerance)
     options.transfer_scheme = "pic"
@@ -647,7 +639,7 @@ def _build_sand_system(
     sand_solver.setup_collider(
         collider_meshes=collider_meshes,
         collider_body_ids=collider_body_ids,
-        collider_thicknesses=collider_thicknesses,
+        collider_margins=collider_thicknesses,
         collider_friction=collider_friction,
         model=sand_model,
     )
@@ -790,11 +782,18 @@ def simulate(
     if max_frames < 2:
         raise ValueError(f"Need at least 2 frames, got {max_frames}")
 
-    soft_hist: list[np.ndarray] = [state_in.particle_q.numpy().astype(np.float32)]
-    sand_hist: list[np.ndarray] = [sand.state_0.particle_q.numpy().astype(np.float32)]
+    store = RolloutStorage(args.out_dir, args.prefix, mode=str(args.history_storage))
+    soft_q0 = state_in.particle_q.numpy().astype(np.float32)
+    sand_q0 = sand.state_0.particle_q.numpy().astype(np.float32)
+    soft_hist = store.allocate("soft_particle_q_all", (max_frames, soft_q0.shape[0], 3), np.float32)
+    sand_hist = store.allocate("sand_points_all", (max_frames, sand_q0.shape[0], 3), np.float32)
+    soft_hist[0] = soft_q0
+    sand_hist[0] = sand_q0
     t0 = time.perf_counter()
 
     for frame in range(1, max_frames):
+        total_sand_substeps = max(1, int(args.sand_frame_substeps))
+        sand_dt = frame_dt / float(total_sand_substeps)
         for sub in range(int(args.substeps)):
             state_in.clear_forces()
             _apply_controller_targets(
@@ -833,20 +832,20 @@ def simulate(
                     device=device,
                 )
 
-        _update_proxy_from_soft_state(state_in, sand.proxy, frame_dt)
-        sand_substeps = max(1, int(args.sand_frame_substeps))
-        sand_dt = frame_dt / float(sand_substeps)
-        for _ in range(sand_substeps):
-            sand.solver.step(sand.state_0, sand.state_1, None, None, sand_dt)
-            sand.solver.project_outside(sand.state_1, sand.state_1, sand_dt)
-            sand.state_0, sand.state_1 = sand.state_1, sand.state_0
+            _update_proxy_from_soft_state(state_in, sand.proxy, float(args.sim_dt))
+            sand_steps_before = (sub * total_sand_substeps) // int(args.substeps)
+            sand_steps_after = ((sub + 1) * total_sand_substeps) // int(args.substeps)
+            for _ in range(max(0, sand_steps_after - sand_steps_before)):
+                sand.solver.step(sand.state_0, sand.state_1, None, None, sand_dt)
+                sand.solver.project_outside(sand.state_1, sand.state_1, sand_dt)
+                sand.state_0, sand.state_1 = sand.state_1, sand.state_0
 
-        soft_hist.append(state_in.particle_q.numpy().astype(np.float32))
-        sand_hist.append(sand.state_0.particle_q.numpy().astype(np.float32))
+        soft_hist[frame] = state_in.particle_q.numpy().astype(np.float32)
+        sand_hist[frame] = sand.state_0.particle_q.numpy().astype(np.float32)
 
         if frame == 1 or frame % 10 == 0 or frame + 1 == max_frames:
-            sloth_np = soft_hist[-1][: spec.particle_count]
-            sand_np = sand_hist[-1]
+            sloth_np = soft_hist[frame][: spec.particle_count]
+            sand_np = sand_hist[frame]
             print(
                 f"  frame {frame + 1}/{max_frames}"
                 f"  sloth_z=[{sloth_np[:,2].min():.3f},{sloth_np[:,2].max():.3f}]"
@@ -855,14 +854,15 @@ def simulate(
             )
 
     return {
-        "soft_particle_q_all": np.stack(soft_hist),
-        "sand_points_all": np.stack(sand_hist),
+        "soft_particle_q_all": soft_hist,
+        "sand_points_all": sand_hist,
         "sand_point_radii": sand.render_radii.numpy().astype(np.float32),
         "sand_point_colors": sand.render_colors.numpy().astype(np.float32),
         "sim_dt": float(args.sim_dt),
         "substeps": int(args.substeps),
         "frame_dt": frame_dt,
         "wall_time_sec": float(time.perf_counter() - t0),
+        **store.summary_dict(),
     }
 
 
@@ -1120,6 +1120,9 @@ def _write_outputs(
         "controller_count": int(np.asarray(ir["controller_idx"]).size),
         "controller_velocity_mode": "trajectory_finite_difference",
         "interpolate_controls": bool(args.interpolate_controls),
+        "coupling_sync_mode": "distributed_substep_proxy_update",
+        "history_storage_mode": str(sim_data["history_storage_mode"]),
+        "history_storage_files": sim_data["history_storage_files"],
         "render_video": str(out_mp4) if out_mp4 is not None else None,
     }
     (args.out_dir / f"{args.prefix}_summary.json").write_text(

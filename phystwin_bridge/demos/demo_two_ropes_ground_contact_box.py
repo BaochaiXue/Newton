@@ -23,25 +23,22 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_rope_bunny_drop import (
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_deformable_common import (
     _apply_drag_correction_ignore_axis,
     _assign_shape_material_triplet,
     _copy_object_only_ir,
     load_ir,
-    newton,
-    newton_import_ir,
-    overlay_text_lines_rgb,
-    path_defaults,
 )
-from demo_cloth_bunny_common import _apply_shape_contact_scaling
-from demo_shared import _pair_penalty_contact_force, apply_viewer_shape_colors, compute_visual_particle_radii
-from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
-from newton._src.solvers.semi_implicit.kernels_contact import (
+from cloth_bunny_common import _apply_shape_contact_scaling
+from bridge_shared import _pair_penalty_contact_force, apply_viewer_shape_colors, compute_visual_particle_radii, overlay_text_lines_rgb
+from semiimplicit_bridge_kernels import (
     eval_body_contact_forces,
+    eval_body_joint_forces,
     eval_particle_body_contact_forces,
     eval_triangle_contact_forces,
+    eval_spring_forces,
 )
-from newton._src.solvers.semi_implicit.kernels_particle import eval_spring_forces
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 

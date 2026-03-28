@@ -19,7 +19,6 @@ import json
 import math
 import shutil
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,29 +27,18 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_shared import (
-    CORE_DIR,
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_shared import (
     add_dense_particle_forces,
     alpha_shape_surface_mesh,
     camera_position,
     compute_body_forces,
     ground_grid,
-    load_core_module,
     load_ir_checked,
     load_surface_points,
     overlay_text_lines_rgb,
 )
-
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
-NEWTON_PY_ROOT = CORE_DIR.parents[2] / "newton"
-if str(NEWTON_PY_ROOT) not in sys.path:
-    sys.path.insert(0, str(NEWTON_PY_ROOT))
-
-path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
-newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
-
-import newton  # noqa: E402
+from rollout_storage import RolloutStorage
 
 
 @dataclass
@@ -151,6 +139,12 @@ def parse_args() -> argparse.Namespace:
     sim_group.add_argument("--substeps", type=int, default=None)
     sim_group.add_argument("--gravity-mag", type=float, default=9.8)
     sim_group.add_argument("--sand-frame-substeps", type=int, default=1)
+    sim_group.add_argument(
+        "--history-storage",
+        choices=["memory", "memmap"],
+        default="memmap",
+        help="Storage backend for rollout histories.",
+    )
 
     scene_group = p.add_argument_group("scene")
     scene_group.add_argument("--sloth-target-xy", type=float, nargs=2, default=(0.0, 0.0))
@@ -945,7 +939,7 @@ def _build_sand_system(
     if getattr(sand_model, "mpm", None) is not None and getattr(sand_model.mpm, "hardening", None) is not None:
         sand_model.mpm.hardening.fill_(0.0)
 
-    options = newton.solvers.SolverImplicitMPM.Options()
+    options = newton.solvers.SolverImplicitMPM.Config()
     options.voxel_size = float(args.voxel_size)
     options.tolerance = float(args.tolerance)
     options.transfer_scheme = "pic"
@@ -965,7 +959,7 @@ def _build_sand_system(
     collider_friction = [shadow.ground_friction] + [shadow.patch_friction] * shadow.model.body_count
     sand_solver.setup_collider(
         model=shadow.model,
-        collider_thicknesses=collider_thicknesses,
+        collider_margins=collider_thicknesses,
         collider_friction=collider_friction,
         body_q=shadow.state.body_q,
     )
@@ -1183,8 +1177,13 @@ def simulate(
     external_forces_wp = wp.zeros(model.particle_count, dtype=wp.vec3, device=device)
     coupling_sample_hist: list[int] = [0]
     coupling_impulse_hist: list[float] = [0.0]
-    soft_hist: list[np.ndarray] = [state_in.particle_q.numpy().astype(np.float32)]
-    sand_hist: list[np.ndarray] = [sand.state_0.particle_q.numpy().astype(np.float32)]
+    store = RolloutStorage(args.out_dir, args.prefix, mode=str(args.history_storage))
+    soft_q0 = state_in.particle_q.numpy().astype(np.float32)
+    sand_q0 = sand.state_0.particle_q.numpy().astype(np.float32)
+    soft_hist = store.allocate("soft_particle_q_all", (max_frames, soft_q0.shape[0], 3), np.float32)
+    sand_hist = store.allocate("sand_points_all", (max_frames, sand_q0.shape[0], 3), np.float32)
+    soft_hist[0] = soft_q0
+    sand_hist[0] = sand_q0
     total_soft_mass = float(model.particle_mass.numpy().astype(np.float32)[: spec.particle_count].sum())
     total_gravity_force = float(args.gravity_mag) * total_soft_mass
 
@@ -1288,14 +1287,14 @@ def simulate(
             clamp_ratio=float(n_clamped) / max(n_with_force, 1),
         )
 
-        soft_hist.append(state_in.particle_q.numpy().astype(np.float32))
-        sand_hist.append(sand.state_0.particle_q.numpy().astype(np.float32))
+        soft_hist[frame] = state_in.particle_q.numpy().astype(np.float32)
+        sand_hist[frame] = sand.state_0.particle_q.numpy().astype(np.float32)
         coupling_sample_hist.append(int(sample_count))
         coupling_impulse_hist.append(float(impulse_norm_sum))
 
         if frame == 1 or frame % 10 == 0 or frame + 1 == max_frames:
-            sloth_np = soft_hist[-1][: spec.particle_count]
-            sand_np = sand_hist[-1]
+            sloth_np = soft_hist[frame][: spec.particle_count]
+            sand_np = sand_hist[frame]
             active_patches = int(np.count_nonzero(np.abs(body_f_z_per_patch) > 1.0e-6))
             print(
                 f"  frame {frame + 1}/{max_frames}"
@@ -1324,8 +1323,8 @@ def simulate(
             )
 
     return {
-        "soft_particle_q_all": np.stack(soft_hist),
-        "sand_points_all": np.stack(sand_hist),
+        "soft_particle_q_all": soft_hist,
+        "sand_points_all": sand_hist,
         "sand_point_radii": sand.render_radii.numpy().astype(np.float32),
         "sand_point_colors": sand.render_colors.numpy().astype(np.float32),
         "coupling_sample_count": np.asarray(coupling_sample_hist, dtype=np.int32),
@@ -1338,6 +1337,7 @@ def simulate(
         "patch_mesh_mode_requested": str(shadow.patch_mesh_mode_requested),
         "patch_mesh_box_fallback_count": int(shadow.patch_mesh_box_fallback_count),
         "total_soft_mass": float(total_soft_mass),
+        **store.summary_dict(),
     }
 
 
@@ -1509,6 +1509,8 @@ def _write_outputs(args: argparse.Namespace, ir: dict[str, Any], sim_data: dict[
         "soft_particle_mass_override": float(args.particle_mass) if args.particle_mass is not None else None,
         "total_soft_mass_kg": float(sim_data["total_soft_mass"]),
         "coupling_adapter_mode": "dynamic_patch_proxy",
+        "history_storage_mode": str(sim_data["history_storage_mode"]),
+        "history_storage_files": sim_data["history_storage_files"],
         "patch_count_actual": int(sim_data["patch_count"]),
         "patch_mesh_mode_requested": str(sim_data["patch_mesh_mode_requested"]),
         "patch_mesh_box_fallback_count": int(sim_data["patch_mesh_box_fallback_count"]),

@@ -24,31 +24,23 @@ import argparse
 import json
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import warp as wp
-
-NEWTON_PY_ROOT = Path(__file__).resolve().parents[2] / "newton"
-if str(NEWTON_PY_ROOT) not in sys.path:
-    sys.path.insert(0, str(NEWTON_PY_ROOT))
-
-from demo_rope_bunny_drop import (
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_deformable_common import (
     _apply_drag_correction_ignore_axis,
     _copy_object_only_ir,
     _effective_spring_scales,
     _maybe_autoset_mass_spring_scale,
     _validate_scaling_args,
     load_ir,
-    newton,
-    newton_import_ir,
-    overlay_text_lines_rgb,
-    path_defaults,
 )
-from demo_shared import compute_visual_particle_radii, temporary_particle_radius_override
+from bridge_shared import compute_visual_particle_radii, overlay_text_lines_rgb, temporary_particle_radius_override
+from rollout_storage import RolloutStorage
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +104,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--frames", type=int, default=1000)
     p.add_argument("--sim-dt", type=float, default=1.0e-4)
     p.add_argument("--substeps", type=int, default=4)
+    p.add_argument(
+        "--history-storage",
+        choices=["memory", "memmap"],
+        default="memmap",
+        help="Storage backend for rollout histories.",
+    )
     p.add_argument("--gravity-mag", type=float, default=9.8)
 
     p.add_argument("--object-mass", type=float, default=1.0, help="Fallback per-particle rope mass.")
@@ -573,15 +571,16 @@ def simulate(
         gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
 
     n_frames = max(2, int(args.frames))
+    store = RolloutStorage(args.out_dir, args.prefix, mode=str(args.history_storage))
     particle_q0 = state_in.particle_q.numpy().astype(np.float32)
     body_q0 = state_in.body_q.numpy().astype(np.float32)
     body_qd0 = state_in.body_qd.numpy().astype(np.float32)
-    particle_q_all = np.empty((n_frames, particle_q0.shape[0], 3), dtype=np.float32)
-    particle_q_object = np.empty((n_frames, n_obj, 3), dtype=np.float32)
-    body_q = np.empty((n_frames, body_q0.shape[0], body_q0.shape[1]), dtype=np.float32)
-    body_vel = np.empty((n_frames, body_qd0.shape[0], 3), dtype=np.float32)
-    robot_target_pos = np.empty((n_frames, 3), dtype=np.float32)
-    robot_target_vel = np.empty((n_frames, 3), dtype=np.float32)
+    particle_q_all = store.allocate("particle_q_all", (n_frames, particle_q0.shape[0], 3), np.float32)
+    particle_q_object = store.allocate("particle_q_object", (n_frames, n_obj, 3), np.float32)
+    body_q = store.allocate("body_q", (n_frames, body_q0.shape[0], body_q0.shape[1]), np.float32)
+    body_vel = store.allocate("body_vel", (n_frames, body_qd0.shape[0], 3), np.float32)
+    robot_target_pos = store.allocate("robot_target_pos", (n_frames, 3), np.float32)
+    robot_target_vel = store.allocate("robot_target_vel", (n_frames, 3), np.float32)
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
@@ -665,6 +664,7 @@ def simulate(
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
         "wall_time": float(wall_time),
+        **store.summary_dict(),
     }
 
 
@@ -939,6 +939,8 @@ def build_summary(
         "particle_contacts": bool(meta["particle_contacts"]),
         "particle_contact_kernel": bool(meta["particle_contact_kernel"]),
         "orientation_control_mode": "pd_torque",
+        "history_storage_mode": str(sim_data["history_storage_mode"]),
+        "history_storage_files": sim_data["history_storage_files"],
         "robot_geometry": str(meta["robot_geometry"]),
         "robot_mass": float(args.robot_mass),
         "robot_capsule_radius_m": float(robot_capsule_radius),

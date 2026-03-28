@@ -23,39 +23,27 @@ import json
 import math
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import warp as wp
-from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
-from newton._src.solvers.semi_implicit.kernels_contact import (
-    eval_body_contact_forces,
-    eval_particle_body_contact_forces,
-    eval_particle_contact_forces,
-    eval_triangle_contact_forces,
-)
-from newton._src.solvers.semi_implicit.kernels_particle import eval_spring_forces
-
-from demo_shared import (
-    CORE_DIR,
+from bridge_shared import (
     apply_viewer_shape_colors,
     compute_visual_particle_radii,
-    load_core_module,
     overlay_text_lines_rgb,
     temporary_particle_radius_override,
 )
-
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
-NEWTON_PY_ROOT = CORE_DIR.parents[2] / "newton"
-if str(NEWTON_PY_ROOT) not in sys.path:
-    sys.path.insert(0, str(NEWTON_PY_ROOT))
-
-path_defaults = load_core_module("path_defaults", CORE_DIR / "path_defaults.py")
-newton_import_ir = load_core_module("newton_import_ir", CORE_DIR / "newton_import_ir.py")
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from semiimplicit_bridge_kernels import (
+    eval_body_contact_forces,
+    eval_body_joint_forces,
+    eval_particle_body_contact_forces,
+    eval_particle_contact_forces,
+    eval_spring_forces,
+    eval_triangle_contact_forces,
+)
 
 if not hasattr(wp, "quat_twist"):
     @wp.func
@@ -89,9 +77,6 @@ if not hasattr(wp, "quat_to_euler"):
         return wp.vec3(roll, pitch, yaw)
 
     wp.quat_to_euler = _quat_to_euler_compat
-
-import newton  # noqa: E402
-
 
 @wp.kernel
 def _apply_drag_correction_ignore_axis(

@@ -22,16 +22,13 @@ from typing import Any
 import numpy as np
 import warp as wp
 
-from demo_rope_bunny_drop import (
+from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_deformable_common import (
     _apply_drag_correction_ignore_axis,
     _copy_object_only_ir,
     load_ir,
-    newton,
-    newton_import_ir,
-    overlay_text_lines_rgb,
-    path_defaults,
 )
-from demo_shared import _pair_penalty_contact_force, apply_viewer_shape_colors, compute_visual_particle_radii
+from bridge_shared import _pair_penalty_contact_force, apply_viewer_shape_colors, compute_visual_particle_radii, overlay_text_lines_rgb
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 
