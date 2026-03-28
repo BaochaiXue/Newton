@@ -243,6 +243,7 @@ def _copy_object_only_ir(
         x0[:, 2] *= -1.0
         v0[:, 2] *= -1.0
     v0[:] = 0.0
+    v0[:, 2] = float(getattr(args, "initial_velocity_z", 0.0))
 
     mass = _effective_object_mass_array(ir_demo, args, n_obj)
     original_mass = np.asarray(ir_demo["mass"], dtype=np.float32).copy()[:n_obj]
