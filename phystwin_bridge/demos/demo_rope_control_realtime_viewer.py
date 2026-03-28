@@ -30,6 +30,19 @@ import warp as wp
 
 import newton
 import newton.examples
+from newton._src.solvers.semi_implicit.kernels_body import eval_body_joint_forces
+from newton._src.solvers.semi_implicit.kernels_contact import (
+    eval_body_contact_forces,
+    eval_particle_body_contact_forces,
+    eval_particle_contact_forces,
+    eval_triangle_contact_forces,
+)
+from newton._src.solvers.semi_implicit.kernels_particle import (
+    eval_bending_forces,
+    eval_spring_forces,
+    eval_tetrahedra_forces,
+    eval_triangle_forces,
+)
 
 from demo_shared import CORE_DIR, load_core_module
 
@@ -51,6 +64,17 @@ PROFILE_OP_NAMES = (
     "write_kinematic_state",
     "particle_grid_build",
     "model_collide",
+    "spring_forces",
+    "triangle_forces",
+    "bending_forces",
+    "tetra_forces",
+    "body_joint_forces",
+    "particle_contact_forces",
+    "triangle_contact_forces",
+    "body_contact_forces",
+    "particle_body_contact_forces",
+    "integrate_particles",
+    "integrate_bodies",
     "solver_step",
     "drag_correction",
     "total_substep",
@@ -366,6 +390,88 @@ class NewtonRopeControlViewer:
         self._profile_run_samples.setdefault(name, []).append(1000.0 * (time.perf_counter() - t0))
         return result
 
+    def _record_profile_sample(self, name: str, duration_ms: float) -> None:
+        self._profile_run_samples.setdefault(name, []).append(float(duration_ms))
+
+    def _solver_step_granular(self) -> None:
+        wp.synchronize_device(self.device)
+        solver_t0 = time.perf_counter()
+
+        model = self.model
+        particle_f = self.state_in.particle_f if self.state_in.particle_count else None
+        body_f = self.state_in.body_f if self.state_in.body_count else None
+        control = self.control
+
+        body_f_work = body_f
+        if body_f is not None and model.joint_count and control.joint_f is not None:
+            body_f_work = wp.clone(body_f)
+
+        self._profile_call("spring_forces", eval_spring_forces, model, self.state_in, particle_f)
+        self._profile_call("triangle_forces", eval_triangle_forces, model, self.state_in, control, particle_f)
+        self._profile_call("bending_forces", eval_bending_forces, model, self.state_in, particle_f)
+        self._profile_call("tetra_forces", eval_tetrahedra_forces, model, self.state_in, control, particle_f)
+        self._profile_call(
+            "body_joint_forces",
+            eval_body_joint_forces,
+            model,
+            self.state_in,
+            control,
+            body_f_work,
+            self.solver.joint_attach_ke,
+            self.solver.joint_attach_kd,
+        )
+        self._profile_call("particle_contact_forces", eval_particle_contact_forces, model, self.state_in, particle_f)
+        if self.solver.enable_tri_contact:
+            self._profile_call("triangle_contact_forces", eval_triangle_contact_forces, model, self.state_in, particle_f)
+        self._profile_call(
+            "body_contact_forces",
+            eval_body_contact_forces,
+            model,
+            self.state_in,
+            self.contacts,
+            friction_smoothing=self.solver.friction_smoothing,
+            body_f_out=body_f_work,
+        )
+        self._profile_call(
+            "particle_body_contact_forces",
+            eval_particle_body_contact_forces,
+            model,
+            self.state_in,
+            self.contacts,
+            particle_f,
+            body_f_work,
+            body_f_in_world_frame=False,
+        )
+        self._profile_call("integrate_particles", self.solver.integrate_particles, model, self.state_in, self.state_out, self.sim_dt)
+        if body_f_work is body_f:
+            self._profile_call(
+                "integrate_bodies",
+                self.solver.integrate_bodies,
+                model,
+                self.state_in,
+                self.state_out,
+                self.sim_dt,
+                self.solver.angular_damping,
+            )
+        else:
+            body_f_prev = self.state_in.body_f
+            self.state_in.body_f = body_f_work
+            try:
+                self._profile_call(
+                    "integrate_bodies",
+                    self.solver.integrate_bodies,
+                    model,
+                    self.state_in,
+                    self.state_out,
+                    self.sim_dt,
+                    self.solver.angular_damping,
+                )
+            finally:
+                self.state_in.body_f = body_f_prev
+
+        wp.synchronize_device(self.device)
+        self._record_profile_sample("solver_step", 1000.0 * (time.perf_counter() - solver_t0))
+
     def _controller_target_for_substep(self, global_substep: int) -> np.ndarray:
         if self.n_traj_frames <= 1:
             return self.ctrl_traj[0]
@@ -445,15 +551,7 @@ class NewtonRopeControlViewer:
                 self.model.collide(self.state_in, self.contacts)
 
         if self.profile_enabled:
-            self._profile_call(
-                "solver_step",
-                self.solver.step,
-                self.state_in,
-                self.state_out,
-                self.control,
-                self.contacts,
-                self.sim_dt,
-            )
+            self._solver_step_granular()
         else:
             self.solver.step(self.state_in, self.state_out, self.control, self.contacts, self.sim_dt)
 
@@ -592,6 +690,22 @@ class NewtonRopeControlViewer:
             }
         return summary
 
+    def _rank_profile_ops(self, aggregate: dict[str, Any]) -> list[dict[str, Any]]:
+        excluded = {"solver_step", "total_substep", "total_step"}
+        ranking = []
+        for name, stats in aggregate.items():
+            if name in excluded:
+                continue
+            ranking.append(
+                {
+                    "op_name": str(name),
+                    "mean_of_run_means_ms": float(stats["mean_of_run_means_ms"]),
+                    "call_count_total": int(stats["call_count_total"]),
+                }
+            )
+        ranking.sort(key=lambda item: item["mean_of_run_means_ms"], reverse=True)
+        return ranking
+
     def _write_profile_outputs(self, payload: dict[str, Any]) -> tuple[Path, Path]:
         json_path = (
             self.args.profile_json.resolve()
@@ -659,6 +773,7 @@ class NewtonRopeControlViewer:
             run_episode(record=False)
 
         runs = [run_episode(record=True) for _ in range(prof_runs)]
+        aggregate = self._summarize_profile_runs(runs)
         payload = {
             "ir": str(self.args.ir),
             "runtime_device": self.device,
@@ -667,10 +782,12 @@ class NewtonRopeControlViewer:
             "steps_per_render": int(self.steps_per_render),
             "trajectory_frames": int(self.n_traj_frames),
             "total_substeps": int(self.total_substeps),
+            "granular_solver_profile": True,
             "profile_runs": int(prof_runs),
             "warmup_runs": int(warmup_runs),
             "runs": runs,
-            "aggregate": self._summarize_profile_runs(runs),
+            "aggregate": aggregate,
+            "bottleneck_ranked_ops": self._rank_profile_ops(aggregate),
         }
         json_path, csv_path = self._write_profile_outputs(payload)
         print(f"Profile JSON: {json_path}", flush=True)
@@ -680,6 +797,14 @@ class NewtonRopeControlViewer:
                 f"{name}: mean={stats['mean_of_run_means_ms']:.3f} ms, std={stats['std_of_run_means_ms']:.3f} ms, calls={stats['call_count_total']}",
                 flush=True,
             )
+        if payload["bottleneck_ranked_ops"]:
+            top = payload["bottleneck_ranked_ops"][:5]
+            print("Top bottlenecks:", flush=True)
+            for item in top:
+                print(
+                    f"  {item['op_name']}: mean={item['mean_of_run_means_ms']:.3f} ms, calls={item['call_count_total']}",
+                    flush=True,
+                )
         return payload
 
 

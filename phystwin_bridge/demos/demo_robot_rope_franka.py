@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Active rigid pusher demo: a robot proxy actively pushes a rope.
+"""Native Newton Franka Panda pushes a PhysTwin rope.
 
-This is a minimum active-control / two-way-coupling demo for the PhysTwin ->
-Newton bridge:
+This demo keeps the deformable side on the PhysTwin -> Newton bridge, but
+replaces the proxy pusher with a native Newton robotics asset:
 
 - load one rope from PhysTwin IR
-- drop controllers and keep one object-only rope
-- pin the two rope endpoints in space so the rope hangs freely
-- add one dynamic rigid capsule as a robot end-effector proxy
-- drive the capsule with a translational PD controller toward a target path
-- let native particle-shape contact produce the two-way coupling
+- keep it object-only and pin the rope endpoints
+- add the native Franka Panda URDF through ``ModelBuilder.add_urdf()``
+- drive the end-effector through a short Cartesian push using Newton IK
+- solve the combined robot + rope scene with ``SolverSemiImplicit``
 
-The intent is not to build a full robot tonight. The rigid capsule is the
-smallest controlled actuator that still demonstrates:
-
-1. active control input
-2. deformable response
-3. rigid-body reaction / tracking lag under contact load
+The goal is a native robot asset baseline that is easier to defend in a
+meeting than a free-floating box / capsule proxy.
 """
 from __future__ import annotations
 
@@ -36,12 +31,21 @@ NEWTON_PY_ROOT = Path(__file__).resolve().parents[2] / "newton"
 if str(NEWTON_PY_ROOT) not in sys.path:
     sys.path.insert(0, str(NEWTON_PY_ROOT))
 
+import newton.ik as ik
+import newton.utils
+
+from demo_robot_rope import (
+    _anchor_particle_indices,
+    _quat_conjugate,
+    _quat_multiply,
+    _rope_endpoints,
+    _validate_scaling_args,
+    _maybe_autoset_mass_spring_scale,
+    _effective_spring_scales,
+)
 from demo_rope_bunny_drop import (
     _apply_drag_correction_ignore_axis,
     _copy_object_only_ir,
-    _effective_spring_scales,
-    _maybe_autoset_mass_spring_scale,
-    _validate_scaling_args,
     load_ir,
     newton,
     newton_import_ir,
@@ -50,44 +54,22 @@ from demo_rope_bunny_drop import (
 )
 from demo_shared import compute_visual_particle_radii, temporary_particle_radius_override
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 
-
-@wp.kernel
-def _apply_body_pd_force_translation(
-    body_q: wp.array(dtype=wp.transform),
-    body_qd: wp.array(dtype=wp.spatial_vector),
-    body_f: wp.array(dtype=wp.spatial_vector),
-    body_index: int,
-    target_pos: wp.vec3,
-    target_vel: wp.vec3,
-    kp: float,
-    kd: float,
-    force_limit: float,
-):
-    pos = wp.transform_get_translation(body_q[body_index])
-    vel = wp.spatial_top(body_qd[body_index])
-
-    force = (target_pos - pos) * kp + (target_vel - vel) * kd
-    force_norm = wp.length(force)
-    if force_limit > 0.0 and force_norm > force_limit:
-        force = force * (force_limit / (force_norm + 1.0e-8))
-
-    body_f[body_index] = body_f[body_index] + wp.spatial_vector(force, wp.vec3(0.0))
-
-
-@wp.kernel
-def _enforce_body_orientation(
-    body_q: wp.array(dtype=wp.transform),
-    body_qd: wp.array(dtype=wp.spatial_vector),
-    body_index: int,
-    target_rot: wp.quat,
-):
-    pos = wp.transform_get_translation(body_q[body_index])
-    lin = wp.spatial_top(body_qd[body_index])
-    body_q[body_index] = wp.transform(pos, target_rot)
-    body_qd[body_index] = wp.spatial_vector(lin, wp.vec3(0.0, 0.0, 0.0))
+FRANKA_INIT_Q = np.asarray(
+    [
+        -3.6802115e-03,
+        2.3901723e-02,
+        3.6804110e-03,
+        -2.3683236e00,
+        -1.2918962e-04,
+        2.3922248e00,
+        7.8549200e-01,
+        0.04,
+        0.04,
+    ],
+    dtype=np.float32,
+)
 
 
 def _default_rope_ir() -> Path:
@@ -96,14 +78,14 @@ def _default_rope_ir() -> Path:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Active robot proxy pushes a hanging rope with real two-way deformable-rigid coupling."
+        description="Native Newton Franka Panda pushes a hanging PhysTwin rope."
     )
     p.add_argument("--ir", type=Path, default=_default_rope_ir(), help="Path to rope PhysTwin IR .npz")
     p.add_argument("--out-dir", type=Path, required=True)
-    p.add_argument("--prefix", default="robot_push_rope")
+    p.add_argument("--prefix", default="robot_push_rope_franka")
     p.add_argument("--device", default=path_defaults.default_device())
 
-    p.add_argument("--frames", type=int, default=1000)
+    p.add_argument("--frames", type=int, default=800)
     p.add_argument("--sim-dt", type=float, default=1.0e-4)
     p.add_argument("--substeps", type=int, default=4)
     p.add_argument("--gravity-mag", type=float, default=9.8)
@@ -138,21 +120,27 @@ def parse_args() -> argparse.Namespace:
         help="Apply drag only orthogonal to gravity so free-fall acceleration is preserved.",
     )
 
-    p.add_argument("--anchor-height", type=float, default=1.20)
+    p.add_argument("--anchor-height", type=float, default=0.72)
     p.add_argument("--anchor-count-per-end", type=int, default=1)
 
-    p.add_argument("--robot-mass", type=float, default=10.0)
-    p.add_argument("--robot-capsule-radius", type=float, default=0.035)
-    p.add_argument("--robot-capsule-half-height", type=float, default=0.05)
-    p.add_argument("--robot-contact-mu", type=float, default=0.4)
-    p.add_argument("--robot-contact-ke", type=float, default=8.0e4)
-    p.add_argument("--robot-contact-kd", type=float, default=8.0e2)
-    p.add_argument("--robot-start-offset", type=float, default=0.22)
-    p.add_argument("--robot-end-offset", type=float, default=-0.02)
-    p.add_argument("--robot-z-offset", type=float, default=0.0)
-    p.add_argument("--robot-kp", type=float, default=2500.0)
-    p.add_argument("--robot-kd", type=float, default=250.0)
-    p.add_argument("--robot-force-limit", type=float, default=1200.0)
+    p.add_argument(
+        "--robot-base-offset",
+        type=float,
+        nargs=3,
+        default=(-0.58, 0.0, -0.32),
+        metavar=("X", "Y", "Z"),
+        help="Franka base offset from the rope center [m].",
+    )
+    p.add_argument("--ee-start-x-offset", type=float, default=-0.18)
+    p.add_argument("--ee-end-x-offset", type=float, default=0.06)
+    p.add_argument("--ee-z-offset", type=float, default=-0.02)
+    p.add_argument("--ee-contact-radius", type=float, default=0.055)
+    p.add_argument("--ik-iters", type=int, default=24)
+    p.add_argument("--joint-target-ke", type=float, default=400.0)
+    p.add_argument("--joint-target-kd", type=float, default=40.0)
+    p.add_argument("--finger-target-ke", type=float, default=100.0)
+    p.add_argument("--finger-target-kd", type=float, default=10.0)
+    p.add_argument("--gripper-open", type=float, default=0.04)
     p.add_argument("--settle-seconds", type=float, default=0.02)
     p.add_argument("--push-seconds", type=float, default=0.08)
     p.add_argument("--hold-seconds", type=float, default=0.16)
@@ -170,169 +158,66 @@ def parse_args() -> argparse.Namespace:
         "--camera-pos",
         type=float,
         nargs=3,
-        default=(-0.45, 0.55, 1.15),
+        default=(-0.90, 0.55, 0.95),
         metavar=("X", "Y", "Z"),
     )
-    p.add_argument("--camera-pitch", type=float, default=-5.0)
-    p.add_argument("--camera-yaw", type=float, default=-50.0)
-    p.add_argument("--camera-fov", type=float, default=30.0)
+    p.add_argument("--camera-pitch", type=float, default=-8.0)
+    p.add_argument("--camera-yaw", type=float, default=-42.0)
+    p.add_argument("--camera-fov", type=float, default=34.0)
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
     p.add_argument("--particle-radius-vis-min", type=float, default=0.004)
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--label-font-size", type=int, default=24)
-    p.add_argument("--rope-line-width", type=float, default=0.025)
+    p.add_argument("--rope-line-width", type=float, default=0.02)
     p.add_argument("--spring-stride", type=int, default=20)
     return p.parse_args()
 
 
-def _rope_endpoints(edges: np.ndarray, n_obj: int) -> np.ndarray:
-    degree = np.zeros((n_obj,), dtype=np.int32)
-    for i, j in np.asarray(edges, dtype=np.int32):
-        if 0 <= i < n_obj and 0 <= j < n_obj:
-            degree[i] += 1
-            degree[j] += 1
-    endpoints = np.flatnonzero(degree == 1)
-    if endpoints.size >= 2:
-        if endpoints.size == 2:
-            return endpoints.astype(np.int32, copy=False)
-        pts = None
-        best_pair = (int(endpoints[0]), int(endpoints[1]))
-        best_dist = -1.0
-        for i_idx in range(endpoints.size):
-            for j_idx in range(i_idx + 1, endpoints.size):
-                i = int(endpoints[i_idx])
-                j = int(endpoints[j_idx])
-                if pts is not None:
-                    pass
-                best_pair = (i, j)
-                break
-            if best_dist >= 0.0:
-                break
-        return np.asarray(best_pair, dtype=np.int32)
-    return np.asarray([0, max(0, n_obj - 1)], dtype=np.int32)
-
-
-def _anchor_particle_indices(
-    shifted_q: np.ndarray, endpoint_indices: np.ndarray, count_per_end: int
-) -> np.ndarray:
-    count_per_end = max(1, int(count_per_end))
-    selected: list[int] = []
-    for endpoint in endpoint_indices.tolist():
-        endpoint_pos = shifted_q[int(endpoint)]
-        d = np.linalg.norm(shifted_q - endpoint_pos[None, :], axis=1)
-        nearest = np.argsort(d)[:count_per_end]
-        selected.extend(int(v) for v in nearest.tolist())
-    return np.asarray(sorted(set(selected)), dtype=np.int32)
-
-
-def _safe_normalize(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n <= 1.0e-8:
-        return np.asarray(fallback, dtype=np.float32).copy()
-    return (np.asarray(v, dtype=np.float32) / n).astype(np.float32, copy=False)
-
-
-def _quat_from_rotmat(rot: np.ndarray) -> np.ndarray:
-    m = np.asarray(rot, dtype=np.float64)
-    trace = float(m[0, 0] + m[1, 1] + m[2, 2])
-    if trace > 0.0:
-        s = 0.5 / np.sqrt(trace + 1.0)
-        qw = 0.25 / s
-        qx = (m[2, 1] - m[1, 2]) * s
-        qy = (m[0, 2] - m[2, 0]) * s
-        qz = (m[1, 0] - m[0, 1]) * s
-    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = 2.0 * np.sqrt(max(1.0 + m[0, 0] - m[1, 1] - m[2, 2], 1.0e-12))
-        qw = (m[2, 1] - m[1, 2]) / s
-        qx = 0.25 * s
-        qy = (m[0, 1] + m[1, 0]) / s
-        qz = (m[0, 2] + m[2, 0]) / s
-    elif m[1, 1] > m[2, 2]:
-        s = 2.0 * np.sqrt(max(1.0 + m[1, 1] - m[0, 0] - m[2, 2], 1.0e-12))
-        qw = (m[0, 2] - m[2, 0]) / s
-        qx = (m[0, 1] + m[1, 0]) / s
-        qy = 0.25 * s
-        qz = (m[1, 2] + m[2, 1]) / s
-    else:
-        s = 2.0 * np.sqrt(max(1.0 + m[2, 2] - m[0, 0] - m[1, 1], 1.0e-12))
-        qw = (m[1, 0] - m[0, 1]) / s
-        qx = (m[0, 2] + m[2, 0]) / s
-        qy = (m[1, 2] + m[2, 1]) / s
-        qz = 0.25 * s
-    q = np.asarray([qx, qy, qz, qw], dtype=np.float32)
-    q /= max(float(np.linalg.norm(q)), 1.0e-8)
-    return q
-
-
-def _robot_capsule_orientation(push_dir: np.ndarray) -> np.ndarray:
-    z_axis = _safe_normalize(push_dir, np.array([1.0, 0.0, 0.0], dtype=np.float32))
-    up_axis = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
-    x_axis = _safe_normalize(np.cross(up_axis, z_axis), np.array([0.0, 1.0, 0.0], dtype=np.float32))
-    y_axis = _safe_normalize(np.cross(z_axis, x_axis), np.array([0.0, 0.0, 1.0], dtype=np.float32))
-    rot = np.stack([x_axis, y_axis, z_axis], axis=1)
-    return _quat_from_rotmat(rot)
-
-
-def _quat_conjugate(q: np.ndarray) -> np.ndarray:
+def _quat_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float32)
-    return np.asarray([-q[0], -q[1], -q[2], q[3]], dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32)
+    vec_quat = np.asarray([v[0], v[1], v[2], 0.0], dtype=np.float32)
+    rotated = _quat_multiply(_quat_multiply(q, vec_quat), _quat_conjugate(q))
+    return rotated[:3]
 
 
-def _quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
-    x1, y1, z1, w1 = np.asarray(q1, dtype=np.float32)
-    x2, y2, z2, w2 = np.asarray(q2, dtype=np.float32)
-    return np.asarray(
-        [
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        ],
-        dtype=np.float32,
-    )
+def _ee_world_position(body_q_row: np.ndarray, offset_local: np.ndarray) -> np.ndarray:
+    body_q_row = np.asarray(body_q_row, dtype=np.float32)
+    pos = body_q_row[:3]
+    quat = body_q_row[3:7]
+    return pos + _quat_rotate_vector(quat, offset_local)
 
 
-def _quat_rotate_inverse(q: np.ndarray, points: np.ndarray) -> np.ndarray:
-    q_inv = _quat_conjugate(q)
-    points = np.asarray(points, dtype=np.float32)
-    out = np.empty_like(points)
-    for idx, p in enumerate(points):
-        p_quat = np.asarray([p[0], p[1], p[2], 0.0], dtype=np.float32)
-        rotated = _quat_multiply(_quat_multiply(q_inv, p_quat), q)
-        out[idx] = rotated[:3]
-    return out
-
-
-def _signed_distance_to_oriented_capsule(
-    points_world: np.ndarray,
-    center_world: np.ndarray,
-    quat_world: np.ndarray,
-    radius: float,
-    half_height: float,
-) -> np.ndarray:
-    local = _quat_rotate_inverse(quat_world, np.asarray(points_world, dtype=np.float32) - center_world[None, :])
-    z_clamped = np.clip(local[:, 2], -float(half_height), float(half_height))
-    nearest = np.stack([np.zeros_like(z_clamped), np.zeros_like(z_clamped), z_clamped], axis=1)
-    return np.linalg.norm(local - nearest, axis=1) - float(radius)
+def _gripper_center_world_position(body_q: np.ndarray, left_finger_idx: int, right_finger_idx: int) -> np.ndarray:
+    body_q = np.asarray(body_q, dtype=np.float32)
+    left = body_q[int(left_finger_idx), :3]
+    right = body_q[int(right_finger_idx), :3]
+    return 0.5 * (left + right)
 
 
 def _robot_target_state(t: float, meta: dict[str, Any], args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
-    start = np.asarray(meta["robot_start_pos"], dtype=np.float32)
-    end = np.asarray(meta["robot_end_pos"], dtype=np.float32)
-    zero = np.zeros((3,), dtype=np.float32)
+    start = np.asarray(meta["ee_target_start"], dtype=np.float32)
+    end = np.asarray(meta["ee_target_end"], dtype=np.float32)
+    target_rot = np.asarray(meta["ee_target_quat"], dtype=np.float32)
     settle = float(args.settle_seconds)
     push = max(float(args.push_seconds), 1.0e-8)
     hold = max(float(args.hold_seconds), 0.0)
     if t <= settle:
-        return start.copy(), zero
+        return start.copy(), target_rot.copy()
     if t <= settle + push:
         alpha = float((t - settle) / push)
         pos = (1.0 - alpha) * start + alpha * end
-        vel = (end - start) / push
-        return pos.astype(np.float32), vel.astype(np.float32)
+        return pos.astype(np.float32), target_rot.copy()
     if t <= settle + push + hold:
-        return end.copy(), zero
-    return end.copy(), zero
+        return end.copy(), target_rot.copy()
+    return end.copy(), target_rot.copy()
+
+
+def _find_index_by_suffix(labels: list[str], suffix: str) -> int:
+    for idx, label in enumerate(labels):
+        if label.endswith(suffix):
+            return idx
+    raise KeyError(f"Could not find label suffix {suffix!r} in {labels}")
 
 
 def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, dict[str, Any], dict[str, Any], int]:
@@ -356,26 +241,10 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         dtype=np.float32,
     )
     shifted_q = x0 + shift
-
     anchor_indices = _anchor_particle_indices(
         shifted_q, endpoint_indices=endpoint_indices, count_per_end=int(args.anchor_count_per_end)
     )
-
-    rope_axis = _safe_normalize(
-        shifted_q[int(endpoint_indices[1])] - shifted_q[int(endpoint_indices[0])],
-        fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32),
-    )
-    push_dir = np.cross(np.array([0.0, 0.0, 1.0], dtype=np.float32), rope_axis)
-    push_dir = _safe_normalize(push_dir, fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
-
     rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
-    robot_quat = _robot_capsule_orientation(push_dir)
-    robot_start_pos = (
-        rope_center - push_dir * float(args.robot_start_offset) + np.array([0.0, 0.0, float(args.robot_z_offset)], dtype=np.float32)
-    ).astype(np.float32)
-    robot_end_pos = (
-        rope_center + push_dir * float(args.robot_end_offset) + np.array([0.0, 0.0, float(args.robot_z_offset)], dtype=np.float32)
-    ).astype(np.float32)
 
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
@@ -409,31 +278,39 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         builder.particle_flags[idx] = int(builder.particle_flags[idx]) & ~int(newton.ParticleFlags.ACTIVE)
         builder.particle_mass[idx] = 0.0
 
-    robot_capsule_radius = float(args.robot_capsule_radius)
-    robot_capsule_half_height = float(args.robot_capsule_half_height)
-    robot_capsule_total_length = 2.0 * (robot_capsule_half_height + robot_capsule_radius)
-    robot_ixx = (1.0 / 12.0) * float(args.robot_mass) * (
-        3.0 * robot_capsule_radius * robot_capsule_radius + robot_capsule_total_length * robot_capsule_total_length
+    robot_base_pos = rope_center + np.asarray(args.robot_base_offset, dtype=np.float32)
+    franka_asset = newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf"
+    builder.add_urdf(
+        franka_asset,
+        xform=wp.transform(wp.vec3(*robot_base_pos.tolist()), wp.quat_identity()),
+        floating=False,
+        enable_self_collisions=False,
+        collapse_fixed_joints=True,
+        force_show_colliders=False,
     )
-    robot_iyy = robot_ixx
-    robot_izz = 0.5 * float(args.robot_mass) * robot_capsule_radius * robot_capsule_radius
-    robot_body = builder.add_body(
-        xform=wp.transform(wp.vec3(*robot_start_pos.tolist()), wp.quat(*robot_quat.tolist())),
-        mass=float(args.robot_mass),
-        inertia=wp.mat33(robot_ixx, 0.0, 0.0, 0.0, robot_iyy, 0.0, 0.0, 0.0, robot_izz),
-        lock_inertia=True,
-        label="robot_pusher",
+
+    builder.joint_q[:9] = FRANKA_INIT_Q.tolist()
+    builder.joint_target_pos[:9] = FRANKA_INIT_Q.tolist()
+    builder.joint_target_ke[:7] = [float(args.joint_target_ke)] * 7
+    builder.joint_target_kd[:7] = [float(args.joint_target_kd)] * 7
+    builder.joint_target_ke[7:9] = [float(args.finger_target_ke)] * 2
+    builder.joint_target_kd[7:9] = [float(args.finger_target_kd)] * 2
+    builder.joint_target_pos[7:9] = [float(args.gripper_open)] * 2
+    builder.joint_armature[:7] = [0.3] * 4 + [0.11] * 3
+    builder.joint_armature[7:9] = [0.15] * 2
+    builder.joint_effort_limit[:7] = [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+    builder.joint_effort_limit[7:9] = [20.0, 20.0]
+
+    ee_body_index = _find_index_by_suffix(builder.body_label, "/fr3_link7")
+    left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
+    right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
+    ee_offset_local = np.asarray([0.0, 0.0, 0.22], dtype=np.float32)
+    ee_target_quat = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    ee_target_start = rope_center + np.asarray(
+        [float(args.ee_start_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32
     )
-    robot_cfg = builder.default_shape_cfg.copy()
-    robot_cfg.mu = float(args.robot_contact_mu)
-    robot_cfg.ke = float(args.robot_contact_ke)
-    robot_cfg.kd = float(args.robot_contact_kd)
-    robot_shape = builder.add_shape_capsule(
-        body=robot_body,
-        radius=robot_capsule_radius,
-        half_height=robot_capsule_half_height,
-        cfg=robot_cfg,
-        label="robot_pusher_capsule",
+    ee_target_end = rope_center + np.asarray(
+        [float(args.ee_end_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32
     )
 
     model = builder.finalize(device=device)
@@ -444,19 +321,20 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
 
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
     meta = {
-        "robot_body": int(robot_body),
-        "robot_shape": int(robot_shape),
-        "robot_geometry": "capsule",
-        "robot_capsule_radius": float(robot_capsule_radius),
-        "robot_capsule_half_height": float(robot_capsule_half_height),
-        "robot_quat": robot_quat.astype(np.float32),
-        "robot_start_pos": robot_start_pos.astype(np.float32),
-        "robot_end_pos": robot_end_pos.astype(np.float32),
+        "robot_geometry": "native_franka",
+        "robot_base_pos": robot_base_pos.astype(np.float32),
+        "ee_body_index": int(ee_body_index),
+        "left_finger_index": int(left_finger_index),
+        "right_finger_index": int(right_finger_index),
+        "ee_offset_local": ee_offset_local.astype(np.float32),
+        "ee_target_quat": ee_target_quat.astype(np.float32),
+        "ee_target_start": ee_target_start.astype(np.float32),
+        "ee_target_end": ee_target_end.astype(np.float32),
+        "joint_q_init": FRANKA_INIT_Q.astype(np.float32),
         "endpoint_indices": endpoint_indices.astype(np.int32),
         "anchor_indices": anchor_indices.astype(np.int32),
         "anchor_positions": shifted_q[anchor_indices].astype(np.float32),
         "rope_center": rope_center.astype(np.float32),
-        "push_dir": push_dir.astype(np.float32),
         "render_edges": render_edges,
         "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
     }
@@ -502,8 +380,11 @@ def simulate(
     )
     state_in = model.state()
     state_out = model.state()
-    control = model.control()
     contacts = model.contacts() if newton_import_ir._use_collision_pipeline(cfg, ir_obj) else None
+    prev_joint_q = np.asarray(meta["joint_q_init"], dtype=np.float32).copy()
+    state_in.joint_q.assign(prev_joint_q)
+    state_in.joint_qd.zero_()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
     sim_dt = float(args.sim_dt) if args.sim_dt is not None else float(newton_import_ir.ir_scalar(ir_obj, "sim_dt"))
     substeps = max(1, int(args.substeps))
@@ -516,13 +397,36 @@ def simulate(
     if bool(args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
         gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
 
+    ik_joint_q = wp.array(np.asarray(meta["joint_q_init"], dtype=np.float32).reshape(1, -1), dtype=wp.float32, device=device)
+    pos_obj = ik.IKObjectivePosition(
+        link_index=int(meta["ee_body_index"]),
+        link_offset=wp.vec3(*np.asarray(meta["ee_offset_local"], dtype=np.float32).tolist()),
+        target_positions=wp.array([wp.vec3(*np.asarray(meta["ee_target_start"], dtype=np.float32).tolist())], dtype=wp.vec3, device=device),
+    )
+    rot_obj = ik.IKObjectiveRotation(
+        link_index=int(meta["ee_body_index"]),
+        link_offset_rotation=wp.quat_identity(),
+        target_rotations=wp.array([wp.vec4(*np.asarray(meta["ee_target_quat"], dtype=np.float32).tolist())], dtype=wp.vec4, device=device),
+    )
+    joint_limit_obj = ik.IKObjectiveJointLimit(
+        joint_limit_lower=model.joint_limit_lower,
+        joint_limit_upper=model.joint_limit_upper,
+        weight=10.0,
+    )
+    ik_solver = ik.IKSolver(
+        model=model,
+        n_problems=1,
+        objectives=[pos_obj, rot_obj, joint_limit_obj],
+        lambda_initial=0.1,
+        jacobian_mode=ik.IKJacobianType.ANALYTIC,
+    )
+
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
     particle_q_object: list[np.ndarray] = []
     body_q: list[np.ndarray] = []
     body_vel: list[np.ndarray] = []
-    robot_target_pos: list[np.ndarray] = []
-    robot_target_vel: list[np.ndarray] = []
+    ee_target_pos: list[np.ndarray] = []
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
@@ -531,49 +435,32 @@ def simulate(
         particle_q_object.append(q[:n_obj].copy())
         body_q.append(state_in.body_q.numpy().astype(np.float32).copy())
         body_vel.append(state_in.body_qd.numpy().astype(np.float32)[:, :3].copy())
-        target_pos_frame, target_vel_frame = _robot_target_state(
-            float(frame) * sim_dt * float(substeps), meta, args
-        )
-        robot_target_pos.append(target_pos_frame.copy())
-        robot_target_vel.append(target_vel_frame.copy())
+        target_pos_frame, _ = _robot_target_state(float(frame) * sim_dt * float(substeps), meta, args)
+        ee_target_pos.append(target_pos_frame.copy())
 
         for sub in range(substeps):
-            state_in.clear_forces()
             sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
-            target_pos, target_vel = _robot_target_state(sim_t, meta, args)
-            wp.launch(
-                _apply_body_pd_force_translation,
-                dim=1,
-                inputs=[
-                    state_in.body_q,
-                    state_in.body_qd,
-                    state_in.body_f,
-                    int(meta["robot_body"]),
-                    wp.vec3(*target_pos.tolist()),
-                    wp.vec3(*target_vel.tolist()),
-                    float(args.robot_kp),
-                    float(args.robot_kd),
-                    float(args.robot_force_limit),
-                ],
-                device=device,
-            )
+            target_pos, target_quat = _robot_target_state(sim_t, meta, args)
+            pos_obj.set_target_position(0, wp.vec3(*target_pos.tolist()))
+            rot_obj.set_target_rotation(0, wp.vec4(*target_quat.tolist()))
+            ik_solver.step(ik_joint_q, ik_joint_q, iterations=int(args.ik_iters))
 
+            joint_target_np = ik_joint_q.numpy().reshape(-1).astype(np.float32)
+            joint_target_np[7:9] = float(args.gripper_open)
+            joint_target_qd = (joint_target_np - prev_joint_q) / sim_dt
+            prev_joint_q = joint_target_np.copy()
+
+            state_in.clear_forces()
+            state_in.joint_q.assign(joint_target_np)
+            state_in.joint_qd.assign(joint_target_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             if contacts is not None:
                 model.collide(state_in, contacts)
-
-            solver.step(state_in, state_out, control, contacts, sim_dt)
+            solver.step(state_in, state_out, None, contacts, sim_dt)
             state_in, state_out = state_out, state_in
-            wp.launch(
-                _enforce_body_orientation,
-                dim=1,
-                inputs=[
-                    state_in.body_q,
-                    state_in.body_qd,
-                    int(meta["robot_body"]),
-                    wp.quat(*np.asarray(meta["robot_quat"], dtype=np.float32).tolist()),
-                ],
-                device=device,
-            )
+            state_in.joint_q.assign(joint_target_np)
+            state_in.joint_qd.assign(joint_target_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
             if drag > 0.0:
                 if gravity_axis is not None:
@@ -608,8 +495,7 @@ def simulate(
         "particle_q_object": np.stack(particle_q_object),
         "body_q": np.stack(body_q),
         "body_vel": np.stack(body_vel),
-        "robot_target_pos": np.stack(robot_target_pos),
-        "robot_target_vel": np.stack(robot_target_vel),
+        "ee_target_pos": np.stack(ee_target_pos),
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
         "wall_time": float(wall_time),
@@ -660,12 +546,7 @@ def render_video(
         str(out_mp4),
     ]
 
-    viewer = newton.viewer.ViewerGL(
-        width=width,
-        height=height,
-        vsync=False,
-        headless=bool(args.viewer_headless),
-    )
+    viewer = newton.viewer.ViewerGL(width=width, height=height, vsync=False, headless=bool(args.viewer_headless))
     ffmpeg_proc = None
     try:
         viewer.set_model(model)
@@ -682,22 +563,9 @@ def render_video(
         except Exception:
             pass
         cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
-        viewer.set_camera(
-            wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])),
-            float(args.camera_pitch),
-            float(args.camera_yaw),
-        )
-
-        try:
-            viewer.update_shape_colors({int(meta["robot_shape"]): (0.92, 0.34, 0.24)})
-        except Exception:
-            pass
+        viewer.set_camera(wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])), float(args.camera_pitch), float(args.camera_yaw))
 
         particle_radius_sim = model.particle_radius.numpy().astype(np.float32)
-        robot_capsule_radius = float(meta["robot_capsule_radius"])
-        robot_capsule_half_height = float(meta["robot_capsule_half_height"])
-        robot_visual_radius = float(robot_capsule_radius + robot_capsule_half_height)
-        robot_target_quat = np.asarray(meta["robot_quat"], dtype=np.float32)
         render_radii = compute_visual_particle_radii(
             particle_radius_sim,
             radius_scale=float(args.particle_radius_vis_scale),
@@ -714,11 +582,9 @@ def render_video(
             dtype=wp.transform,
             device=device,
         )
-        anchor_colors_wp = wp.array(
-            [wp.vec3(0.34, 0.90, 0.52) for _ in range(anchor_positions.shape[0])],
-            dtype=wp.vec3,
-            device=device,
-        )
+        anchor_colors_wp = wp.array([wp.vec3(0.34, 0.90, 0.52) for _ in range(anchor_positions.shape[0])], dtype=wp.vec3, device=device)
+        left_finger_idx = int(meta["left_finger_index"])
+        right_finger_idx = int(meta["right_finger_index"])
 
         state = model.state()
         if state.body_qd is not None:
@@ -735,9 +601,7 @@ def render_video(
                 render_indices = np.zeros((1,), dtype=np.int32)
             else:
                 sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
-                render_indices = np.clip(
-                    np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1
-                )
+                render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
 
             for out_idx, sim_idx in enumerate(render_indices):
                 state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
@@ -746,27 +610,35 @@ def render_video(
                 sim_t = float(sim_idx) * sim_frame_dt
                 viewer.begin_frame(sim_t)
                 viewer.log_state(state)
-
                 viewer.log_shapes(
-                    "/demo/robot_target",
-                    newton.GeoType.CAPSULE,
-                    (robot_capsule_radius, robot_capsule_half_height),
+                    "/demo/ee_target",
+                    newton.GeoType.SPHERE,
+                    float(args.ee_contact_radius) * 0.55,
                     wp.array(
-                        [
-                            wp.transform(
-                                wp.vec3(*sim_data["robot_target_pos"][sim_idx].astype(np.float32).tolist()),
-                                wp.quat(*robot_target_quat.tolist()),
-                            )
-                        ],
+                        [wp.transform(wp.vec3(*sim_data["ee_target_pos"][sim_idx].astype(np.float32).tolist()), wp.quat_identity())],
                         dtype=wp.transform,
                         device=device,
                     ),
                     wp.array([wp.vec3(1.0, 0.84, 0.18)], dtype=wp.vec3, device=device),
                 )
+                gripper_center = _gripper_center_world_position(
+                    sim_data["body_q"][sim_idx], left_finger_idx, right_finger_idx
+                ).astype(np.float32, copy=False)
+                viewer.log_shapes(
+                    "/demo/gripper_center",
+                    newton.GeoType.SPHERE,
+                    0.014,
+                    wp.array(
+                        [wp.transform(wp.vec3(*gripper_center.tolist()), wp.quat_identity())],
+                        dtype=wp.transform,
+                        device=device,
+                    ),
+                    wp.array([wp.vec3(0.22, 0.90, 0.96)], dtype=wp.vec3, device=device),
+                )
                 viewer.log_shapes(
                     "/demo/anchors",
                     newton.GeoType.SPHERE,
-                    robot_visual_radius * 0.28,
+                    0.018,
                     anchor_xforms_wp,
                     anchor_colors_wp,
                 )
@@ -787,32 +659,30 @@ def render_video(
                 viewer.end_frame()
                 frame = viewer.get_frame(render_ui=False).numpy()
                 if args.overlay_label:
-                    robot_pos = sim_data["body_q"][sim_idx, int(meta["robot_body"]), :3]
-                    robot_quat = sim_data["body_q"][sim_idx, int(meta["robot_body"]), 3:7]
-                    target_pos = sim_data["robot_target_pos"][sim_idx]
-                    tracking_err = float(np.linalg.norm(robot_pos - target_pos))
-                    speed = float(np.linalg.norm(sim_data["body_vel"][sim_idx, int(meta["robot_body"])]))
+                    target_pos = sim_data["ee_target_pos"][sim_idx]
+                    tracking_err = float(np.linalg.norm(gripper_center - target_pos))
+                    if sim_idx > 0:
+                        prev_gripper_center = _gripper_center_world_position(
+                            sim_data["body_q"][sim_idx - 1], left_finger_idx, right_finger_idx
+                        ).astype(np.float32, copy=False)
+                        speed = float(np.linalg.norm(gripper_center - prev_gripper_center) / sim_frame_dt)
+                    else:
+                        speed = 0.0
                     q_obj = sim_data["particle_q_object"][sim_idx]
                     particle_radius = particle_radius_sim[: q_obj.shape[0]]
                     min_clearance = float(
                         np.min(
-                            _signed_distance_to_oriented_capsule(
-                                q_obj,
-                                np.asarray(robot_pos, dtype=np.float32),
-                                np.asarray(robot_quat, dtype=np.float32),
-                                robot_capsule_radius,
-                                robot_capsule_half_height,
-                            )
-                            - particle_radius
+                            np.linalg.norm(q_obj - gripper_center[None, :], axis=1)
+                            - (particle_radius + float(args.ee_contact_radius))
                         )
                     )
                     contact_state = "ON" if min_clearance <= 0.0 else "OFF"
                     frame = overlay_text_lines_rgb(
                         frame,
                         [
-                            "Active rigid capsule pusher -> hanging rope | red=actual, yellow=target",
-                            f"tracking err: {tracking_err:.3f} m | robot speed: {speed:.3f} m/s",
-                            f"contact: {contact_state} | min clearance: {1000.0 * min_clearance:.1f} mm",
+                            "Native Newton Franka Panda + hanging rope | yellow=target, cyan=gripper center",
+                            f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s",
+                            f"contact: {contact_state} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm",
                         ],
                         font_size=int(args.label_font_size),
                     )
@@ -842,29 +712,28 @@ def build_summary(
     particle_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
     body_q = np.asarray(sim_data["body_q"], dtype=np.float32)
     body_vel = np.asarray(sim_data["body_vel"], dtype=np.float32)
-    target_pos = np.asarray(sim_data["robot_target_pos"], dtype=np.float32)
+    target_pos = np.asarray(sim_data["ee_target_pos"], dtype=np.float32)
+    particle_radius = model.particle_radius.numpy().astype(np.float32)[: particle_q.shape[1]]
 
-    robot_body = int(meta["robot_body"])
-    robot_pos = body_q[:, robot_body, :3]
-    tracking_error = np.linalg.norm(robot_pos - target_pos, axis=1)
+    left_finger_idx = int(meta["left_finger_index"])
+    right_finger_idx = int(meta["right_finger_index"])
+    gripper_center = np.stack(
+        [_gripper_center_world_position(body_q[i], left_finger_idx, right_finger_idx) for i in range(body_q.shape[0])]
+    )
+    tracking_error = np.linalg.norm(gripper_center - target_pos, axis=1)
+    gripper_speed = np.linalg.norm(np.diff(gripper_center, axis=0), axis=1) / float(sim_data["sim_dt"] * sim_data["substeps"])
+    if gripper_speed.size == 0:
+        gripper_speed = np.zeros((1,), dtype=np.float32)
 
     rope_com = particle_q.mean(axis=1)
     rope_com_disp = float(np.linalg.norm(rope_com[-1] - rope_com[0]))
 
-    particle_radius = model.particle_radius.numpy().astype(np.float32)[: particle_q.shape[1]]
-    robot_capsule_radius = float(meta["robot_capsule_radius"])
-    robot_capsule_half_height = float(meta["robot_capsule_half_height"])
     contact_frames = []
     min_clearance = []
     for frame_idx in range(particle_q.shape[0]):
-        robot_quat = body_q[frame_idx, robot_body, 3:7]
-        d = _signed_distance_to_oriented_capsule(
-            particle_q[frame_idx],
-            robot_pos[frame_idx],
-            np.asarray(robot_quat, dtype=np.float32),
-            robot_capsule_radius,
-            robot_capsule_half_height,
-        ) - particle_radius
+        d = np.linalg.norm(particle_q[frame_idx] - gripper_center[frame_idx][None, :], axis=1) - (
+            particle_radius + float(args.ee_contact_radius)
+        )
         min_d = float(np.min(d))
         min_clearance.append(min_d)
         if min_d <= 0.0:
@@ -882,16 +751,11 @@ def build_summary(
         "wall_time_sec": float(sim_data["wall_time"]),
         "rope_total_mass": float(meta["total_object_mass"]),
         "anchor_count": int(meta["anchor_indices"].shape[0]),
-        "robot_geometry": str(meta["robot_geometry"]),
-        "robot_mass": float(args.robot_mass),
-        "robot_capsule_radius_m": float(robot_capsule_radius),
-        "robot_capsule_half_height_m": float(robot_capsule_half_height),
-        "robot_force_limit": float(args.robot_force_limit),
-        "robot_kp": float(args.robot_kp),
-        "robot_kd": float(args.robot_kd),
-        "tracking_error_mean_m": float(np.mean(tracking_error)),
-        "tracking_error_max_m": float(np.max(tracking_error)),
-        "robot_speed_max_m_s": float(np.max(np.linalg.norm(body_vel[:, robot_body, :], axis=1))),
+        "robot_geometry": "native_franka",
+        "ee_body_index": int(meta["ee_body_index"]),
+        "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),
+        "gripper_center_tracking_error_max_m": float(np.max(tracking_error)),
+        "gripper_center_speed_max_m_s": float(np.max(gripper_speed)),
         "rope_com_displacement_m": rope_com_disp,
         "rope_com_z_min_m": float(np.min(rope_com[:, 2])),
         "first_contact_frame": first_contact_frame,
