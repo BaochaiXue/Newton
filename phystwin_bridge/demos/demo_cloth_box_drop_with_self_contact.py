@@ -52,6 +52,7 @@ from self_contact_bridge_kernels import (
     apply_velocity_update_from_force,
     build_filtered_self_contact_tables,
     compute_nonexcluded_overlap_stats,
+    compute_nonexcluded_overlap_curve,
     eval_filtered_self_contact_forces,
     eval_filtered_self_contact_phystwin_velocity,
 )
@@ -591,6 +592,7 @@ def simulate(
     particle_q_object: list[np.ndarray] = []
     body_q: list[np.ndarray] = []
     body_vel: list[np.ndarray] = []
+    max_particle_speed_mps = 0.0
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
@@ -720,6 +722,14 @@ def simulate(
                         device=device,
                     )
 
+            qd_obj = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj]
+            if qd_obj.size:
+                speed = np.linalg.norm(qd_obj, axis=1)
+                max_particle_speed_mps = max(
+                    max_particle_speed_mps,
+                    float(np.max(speed)),
+                )
+
         if frame == 49 or frame == 99 or frame == 199 or frame == n_frames - 1:
             print(f"  frame {frame + 1}/{n_frames}", flush=True)
 
@@ -733,6 +743,7 @@ def simulate(
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
         "wall_time": float(wall_time),
+        "max_particle_speed_mps": float(max_particle_speed_mps),
     }
 
 
@@ -966,6 +977,25 @@ def build_summary(
         radii,
         set(meta.get("excluded_pairs_cpu", set())),
     )
+    self_contact_curve = compute_nonexcluded_overlap_curve(
+        cloth_q,
+        radii,
+        set(meta.get("excluded_pairs_cpu", set())),
+    )
+    particle_radius_median = float(np.median(radii)) if radii.size else 0.0
+    particle_radius_p95 = float(np.quantile(radii, 0.95)) if radii.size else 0.0
+    max_spring_stretch_ratio = None
+    spring_edges = np.asarray(ir_obj.get("spring_edges", np.zeros((0, 2), dtype=np.int32)), dtype=np.int32)
+    spring_rest = np.asarray(
+        ir_obj.get("spring_rest_length", np.zeros((0,), dtype=np.float32)),
+        dtype=np.float32,
+    ).reshape(-1)
+    if spring_edges.size and spring_rest.size == spring_edges.shape[0]:
+        qi = cloth_q[:, spring_edges[:, 0], :]
+        qj = cloth_q[:, spring_edges[:, 1], :]
+        lengths = np.linalg.norm(qi - qj, axis=2)
+        safe_rest = np.maximum(spring_rest.reshape(1, -1), 1.0e-12)
+        max_spring_stretch_ratio = float(np.max(lengths / safe_rest))
     max_penetration_depth = None
     final_penetration_p99 = None
     if bool(meta.get("has_box", False)):
@@ -1017,7 +1047,12 @@ def build_summary(
         "rendered_frame_count": int(rendered_frame_count),
         "video_duration_target_sec": float(video_duration),
         "all_particle_positions_finite": bool(np.isfinite(cloth_q).all()),
+        "particle_radius_median_m": particle_radius_median,
+        "particle_radius_p95_m": particle_radius_p95,
         "particle_bbox_span_xyz_m": [float(v) for v in bbox_span],
+        "max_particle_speed_mps": float(sim_data.get("max_particle_speed_mps", 0.0)),
+        "max_spring_stretch_ratio": max_spring_stretch_ratio,
+        "nan_inf_frame_count": int(self_contact_curve["nonfinite_frame_count"]),
         "body_speed_initial": float(body_speed[0]),
         "body_speed_final": float(body_speed[-1]),
         "body_speed_max": float(np.max(body_speed)),
@@ -1061,6 +1096,10 @@ def build_summary(
         "final_nonexcluded_self_contact_pair_count": float(self_contact_stats["pair_count"]),
         "final_nonexcluded_self_contact_max_overlap_m": float(self_contact_stats["max_overlap"]),
         "final_nonexcluded_self_contact_p95_overlap_m": float(self_contact_stats["p95_overlap"]),
+        "peak_nonexcluded_self_contact_pair_count_over_time": float(self_contact_curve["peak_pair_count"]),
+        "peak_nonexcluded_self_contact_max_overlap_m_over_time": float(self_contact_curve["peak_max_overlap"]),
+        "peak_nonexcluded_self_contact_p95_overlap_m_over_time": float(self_contact_curve["peak_p95_overlap"]),
+        "persistent_overlap_frames": int(self_contact_curve["persistent_overlap_frames"]),
         "camera_pos": [float(v) for v in args.camera_pos],
         "camera_pitch": float(args.camera_pitch),
         "camera_yaw": float(args.camera_yaw),

@@ -380,3 +380,50 @@ def compute_nonexcluded_overlap_stats(
         "max_overlap": float(arr.max()),
         "p95_overlap": float(np.quantile(arr, 0.95)),
     }
+
+
+def compute_nonexcluded_overlap_curve(
+    points_seq: np.ndarray,
+    radii: np.ndarray,
+    excluded_pairs: set[tuple[int, int]],
+) -> dict[str, np.ndarray | float]:
+    """Computes rollout-level self-overlap statistics for non-excluded pairs.
+
+    Args:
+        points_seq: Particle positions over time with shape ``[frames, N, 3]``.
+        radii: Per-particle radii.
+        excluded_pairs: Pair set that should be ignored when evaluating self-overlap.
+
+    Returns:
+        A dictionary containing per-frame curves plus rollout-peak aggregates.
+    """
+
+    pts_seq = np.asarray(points_seq, dtype=np.float64)
+    if pts_seq.ndim != 3 or pts_seq.shape[-1] != 3:
+        raise ValueError(f"points_seq must be [F, N, 3], got {pts_seq.shape}")
+
+    pair_curve = np.zeros((pts_seq.shape[0],), dtype=np.float64)
+    max_curve = np.zeros((pts_seq.shape[0],), dtype=np.float64)
+    p95_curve = np.zeros((pts_seq.shape[0],), dtype=np.float64)
+    nonfinite_mask = np.zeros((pts_seq.shape[0],), dtype=bool)
+
+    for frame_idx, points in enumerate(pts_seq):
+        if not np.isfinite(points).all():
+            nonfinite_mask[frame_idx] = True
+            continue
+        stats = compute_nonexcluded_overlap_stats(points, radii, excluded_pairs)
+        pair_curve[frame_idx] = float(stats["pair_count"])
+        max_curve[frame_idx] = float(stats["max_overlap"])
+        p95_curve[frame_idx] = float(stats["p95_overlap"])
+
+    return {
+        "pair_count_curve": pair_curve,
+        "max_overlap_curve": max_curve,
+        "p95_overlap_curve": p95_curve,
+        "nonfinite_frame_mask": nonfinite_mask,
+        "peak_pair_count": float(pair_curve.max(initial=0.0)),
+        "peak_max_overlap": float(max_curve.max(initial=0.0)),
+        "peak_p95_overlap": float(p95_curve.max(initial=0.0)),
+        "persistent_overlap_frames": float(np.count_nonzero(max_curve > 0.0)),
+        "nonfinite_frame_count": float(np.count_nonzero(nonfinite_mask)),
+    }

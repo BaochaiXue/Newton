@@ -2031,6 +2031,258 @@ def _baseline_geom_contact_event(
     return None
 
 
+def _force_window_observer_rollout(
+    *,
+    ir_obj: dict[str, Any],
+    args: argparse.Namespace,
+    trigger_substep_global: int,
+    n_obj: int,
+    device: str,
+) -> list[dict[str, Any]]:
+    observer_args = copy.deepcopy(args)
+    observer_args.force_diagnostic = False
+    observer_args.stop_after_diagnostic = False
+    observer_args.parity_check = False
+    model, meta, _ = build_model(ir_obj, observer_args, device)
+
+    shape_contacts_enabled = bool(observer_args.shape_contacts) and bool(observer_args.add_bunny)
+    cfg = newton_import_ir.SimConfig(
+        ir_path=observer_args.ir.resolve(),
+        out_dir=observer_args.out_dir.resolve(),
+        output_prefix=observer_args.prefix,
+        spring_ke_scale=float(observer_args.spring_ke_scale),
+        spring_kd_scale=float(observer_args.spring_kd_scale),
+        angular_damping=float(observer_args.angular_damping),
+        friction_smoothing=float(observer_args.friction_smoothing),
+        enable_tri_contact=True,
+        disable_particle_contact_kernel=True,
+        shape_contacts=shape_contacts_enabled,
+        add_ground_plane=bool(observer_args.add_ground_plane),
+        strict_physics_checks=False,
+        apply_drag=bool(observer_args.apply_drag),
+        drag_damping_scale=float(observer_args.drag_damping_scale),
+        gravity=-float(observer_args.gravity_mag),
+        gravity_from_reverse_z=False,
+        up_axis="Z",
+        particle_contacts=True,
+        device=device,
+    )
+    solver = newton.solvers.SolverSemiImplicit(
+        model,
+        angular_damping=cfg.angular_damping,
+        friction_smoothing=cfg.friction_smoothing,
+        enable_tri_contact=cfg.enable_tri_contact,
+    )
+    state_in = model.state()
+    state_out = model.state()
+    control = model.control()
+    contacts = model.contacts() if newton_import_ir._use_collision_pipeline(cfg, ir_obj) else None
+
+    sim_dt = float(observer_args.sim_dt)
+    substeps = max(1, int(observer_args.substeps))
+    n_frames = max(2, int(observer_args.frames))
+    particle_grid = model.particle_grid
+    search_radius = 0.0
+    if particle_grid is not None:
+        with wp.ScopedDevice(model.device):
+            particle_grid.reserve(model.particle_count)
+        search_radius = float(model.particle_max_radius) * 2.0 + float(model.particle_cohesion)
+        search_radius = max(search_radius, float(getattr(newton_import_ir, "EPSILON", 1.0e-6)))
+
+    drag = 0.0
+    if observer_args.apply_drag and "drag_damping" in ir_obj:
+        drag = float(newton_import_ir.ir_scalar(ir_obj, "drag_damping")) * float(observer_args.drag_damping_scale)
+    _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
+    gravity_axis = None
+    gravity_norm = float(np.linalg.norm(gravity_vec))
+    if bool(observer_args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
+        gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
+
+    particle_mass_diag = np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].copy()
+    particle_radius_diag = model.particle_radius.numpy().astype(np.float32)[:n_obj].copy()
+    gravity_vec_diag = np.asarray(gravity_vec, dtype=np.float32).reshape(3)
+    force_eps = 1.0e-8
+    global_substep_index = 0
+
+    before = max(0, int(getattr(observer_args, "force_window_substeps_before", 1)))
+    after = max(0, int(getattr(observer_args, "force_window_substeps_after", 12)))
+    offset_keys = _force_window_key_offsets(after)
+    target_substeps: dict[int, str] = {}
+    if before > 0:
+        target_substeps[int(trigger_substep_global) - 1] = "trigger-1"
+    for offset in offset_keys:
+        label = "trigger" if offset == 0 else f"trigger+{int(offset)}"
+        target_substeps[int(trigger_substep_global) + int(offset)] = label
+    search_end = int(trigger_substep_global) + max(
+        int(after),
+        32 if (bool(observer_args.force_include_max_penetration) or bool(observer_args.force_include_rebound)) else int(after),
+    )
+    monitor_stride = 4
+
+    sequence_map: dict[int, dict[str, Any]] = {}
+    best_pen_snapshot: dict[str, Any] | None = None
+    best_pen_mm = -1.0
+    best_pen_substep: int | None = None
+    rebound_snapshot: dict[str, Any] | None = None
+    last_snapshot: dict[str, Any] | None = None
+
+    try:
+        for frame in range(n_frames):
+            for substep_index_in_frame in range(substeps):
+                state_in.clear_forces()
+                if particle_grid is not None:
+                    with wp.ScopedDevice(model.device):
+                        particle_grid.build(state_in.particle_q, radius=search_radius)
+                if contacts is not None:
+                    model.collide(state_in, contacts)
+
+                particle_f = state_in.particle_f if state_in.particle_count else None
+                body_f = state_in.body_f if state_in.body_count else None
+                body_f_work = body_f
+                if body_f is not None and model.joint_count and control.joint_f is not None:
+                    body_f_work = wp.clone(body_f)
+                if particle_f is None:
+                    raise RuntimeError("Force window observer requires particle forces, but particle_f is not allocated.")
+
+                eval_spring_forces(model, state_in, particle_f)
+                f_spring_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                eval_triangle_forces(model, state_in, control, particle_f)
+                eval_bending_forces(model, state_in, particle_f)
+                eval_tetrahedra_forces(model, state_in, control, particle_f)
+                f_internal_total_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                eval_body_joint_forces(
+                    model, state_in, control, body_f_work, solver.joint_attach_ke, solver.joint_attach_kd
+                )
+                if solver.enable_tri_contact:
+                    eval_triangle_contact_forces(model, state_in, particle_f)
+                f_before_particle_body_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                eval_body_contact_forces(
+                    model, state_in, contacts, friction_smoothing=solver.friction_smoothing, body_f_out=body_f_work
+                )
+                eval_particle_body_contact_forces(
+                    model, state_in, contacts, particle_f, body_f_work, body_f_in_world_frame=False
+                )
+                f_after_particle_body_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                f_external_total_np = (f_after_particle_body_np - f_before_particle_body_np).astype(np.float32, copy=False)
+
+                if int(global_substep_index) >= int(trigger_substep_global) - int(before) and int(global_substep_index) <= int(search_end):
+                    offset = int(global_substep_index) - int(trigger_substep_global)
+                    should_capture = int(global_substep_index) in target_substeps
+                    if offset >= 0 and (offset % monitor_stride == 0 or int(global_substep_index) == int(search_end)):
+                        should_capture = True
+                    if should_capture:
+                        particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        body_q_np = (
+                            state_in.body_q.numpy().astype(np.float32).copy()
+                            if state_in.body_q is not None
+                            else np.zeros((0, 7), dtype=np.float32)
+                        )
+                        body_qd_np = (
+                            state_in.body_qd.numpy().astype(np.float32).copy()
+                            if state_in.body_qd is not None
+                            else np.zeros((0, 6), dtype=np.float32)
+                        )
+                        sim_time = (frame * substeps + substep_index_in_frame) * sim_dt
+                        snapshot = _capture_force_snapshot(
+                            frame_index=frame,
+                            substep_index_in_frame=substep_index_in_frame,
+                            global_substep_index=global_substep_index,
+                            sim_time=sim_time,
+                            sim_dt=sim_dt,
+                            particle_q=particle_q_np,
+                            particle_qd=particle_qd_np,
+                            body_q=body_q_np,
+                            body_qd=body_qd_np,
+                            particle_radius=particle_radius_diag,
+                            mass=particle_mass_diag,
+                            gravity_vec=gravity_vec_diag,
+                            f_spring=f_spring_np,
+                            f_internal_total=f_internal_total_np,
+                            f_external_total=f_external_total_np,
+                            meta=meta,
+                            force_topk=int(observer_args.force_topk),
+                            force_eps=force_eps,
+                            topk_selector_mode=str(observer_args.force_topk_mode),
+                            used_manual_force_path=True,
+                        )
+                        last_snapshot = snapshot
+                        label = target_substeps.get(int(global_substep_index))
+                        if label is not None:
+                            _store_force_window_snapshot(sequence_map, snapshot, label)
+                        if int(global_substep_index) >= int(trigger_substep_global):
+                            pen_mm = _snapshot_max_penetration_mm(snapshot)
+                            if bool(observer_args.force_include_max_penetration) and pen_mm > best_pen_mm:
+                                best_pen_mm = pen_mm
+                                best_pen_snapshot = snapshot
+                                best_pen_substep = int(global_substep_index)
+                            if (
+                                bool(observer_args.force_include_rebound)
+                                and rebound_snapshot is None
+                                and best_pen_substep is not None
+                                and int(global_substep_index) > int(best_pen_substep)
+                                and best_pen_mm > 0.0
+                                and pen_mm <= 0.5 * best_pen_mm
+                            ):
+                                rebound_snapshot = snapshot
+
+                solver.integrate_particles(model, state_in, state_out, sim_dt)
+                if body_f_work is body_f:
+                    solver.integrate_bodies(model, state_in, state_out, sim_dt, solver.angular_damping)
+                else:
+                    body_f_prev = state_in.body_f
+                    state_in.body_f = body_f_work
+                    solver.integrate_bodies(model, state_in, state_out, sim_dt, solver.angular_damping)
+                    state_in.body_f = body_f_prev
+
+                state_in, state_out = state_out, state_in
+                if drag > 0.0:
+                    if gravity_axis is not None:
+                        wp.launch(
+                            _apply_drag_correction_ignore_axis,
+                            dim=n_obj,
+                            inputs=[
+                                state_in.particle_q,
+                                state_in.particle_qd,
+                                n_obj,
+                                sim_dt,
+                                drag,
+                                wp.vec3(*gravity_axis.tolist()),
+                            ],
+                            device=device,
+                        )
+                    else:
+                        wp.launch(
+                            newton_import_ir._apply_drag_correction,
+                            dim=n_obj,
+                            inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, drag],
+                            device=device,
+                        )
+
+                global_substep_index += 1
+                if int(global_substep_index) > int(search_end):
+                    break
+            if int(global_substep_index) > int(search_end):
+                break
+    finally:
+        del model
+
+    if best_pen_snapshot is not None:
+        _store_force_window_snapshot(sequence_map, best_pen_snapshot, "max penetration")
+    if rebound_snapshot is not None:
+        _store_force_window_snapshot(sequence_map, rebound_snapshot, "rebound / settle")
+    elif bool(observer_args.force_include_rebound) and last_snapshot is not None:
+        _store_force_window_snapshot(sequence_map, last_snapshot, "post-contact")
+
+    return [
+        {
+            "label": " | ".join(item["labels"]),
+            "snapshot": item["snapshot"],
+        }
+        for _, item in sorted(sequence_map.items(), key=lambda kv: kv[0])
+    ]
+
+
 def _force_diagnostic_parity_summary(
     baseline_event: dict[str, Any] | None,
     trigger_snapshot: dict[str, Any],
@@ -2177,19 +2429,6 @@ def simulate(
     if snapshot_substeps_after_trigger is None:
         snapshot_substeps_after_trigger = 0 if str(args.force_snapshot_frame) == "trigger" else 1
     snapshot_substeps_after_trigger = max(0, int(snapshot_substeps_after_trigger))
-    force_window_before = max(0, int(getattr(args, "force_window_substeps_before", 1)))
-    force_window_after = max(0, int(getattr(args, "force_window_substeps_after", 12)))
-    force_window_offsets = _force_window_key_offsets(force_window_after)
-    force_window_search_cap = max(force_window_after, 128 if (bool(args.force_include_max_penetration) or bool(args.force_include_rebound)) else force_window_after)
-    previous_step_data: dict[str, Any] | None = None
-    force_window_map: dict[int, dict[str, Any]] = {}
-    captured_offsets: set[int] = set()
-    trigger_substep_global: int | None = None
-    best_pen_snapshot: dict[str, Any] | None = None
-    best_pen_mm = -1.0
-    best_pen_offset: int | None = None
-    rebound_snapshot: dict[str, Any] | None = None
-    last_window_snapshot: dict[str, Any] | None = None
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -2283,80 +2522,45 @@ def simulate(
                         np.max(np.linalg.norm(f_external_total_np, axis=1))
                     ) if f_external_total_np.size else 0.0
                     sim_time = (frame * substeps + substep_index_in_frame) * sim_dt
-
-                    particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                    particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                    body_q_np = (
-                        state_in.body_q.numpy().astype(np.float32).copy()
-                        if state_in.body_q is not None
-                        else np.zeros((0, 7), dtype=np.float32)
-                    )
-                    body_qd_np = (
-                        state_in.body_qd.numpy().astype(np.float32).copy()
-                        if state_in.body_qd is not None
-                        else np.zeros((0, 6), dtype=np.float32)
-                    )
-
-                    current_snapshot: dict[str, Any] | None = None
-
-                    def _current_snapshot() -> dict[str, Any]:
-                        nonlocal current_snapshot
-                        if current_snapshot is None:
-                            current_snapshot = _capture_force_snapshot(
-                                frame_index=frame,
-                                substep_index_in_frame=substep_index_in_frame,
-                                global_substep_index=global_substep_index,
-                                sim_time=sim_time,
-                                sim_dt=sim_dt,
-                                particle_q=particle_q_np,
-                                particle_qd=particle_qd_np,
-                                body_q=body_q_np,
-                                body_qd=body_qd_np,
-                                particle_radius=particle_radius_diag,
-                                mass=particle_mass_diag,
-                                gravity_vec=gravity_vec_diag,
-                                f_spring=f_spring_np,
-                                f_internal_total=f_internal_total_np,
-                                f_external_total=f_external_total_np,
-                                meta=meta,
-                                force_topk=int(args.force_topk),
-                                force_eps=force_eps,
-                                topk_selector_mode=str(args.force_topk_mode),
-                                used_manual_force_path=bool(use_manual_force_path),
-                            )
-                        return current_snapshot
-
                     if (
                         trigger_snapshot is None
                         and previous_max_external_norm <= force_eps
                         and current_max_external_norm > force_eps
                     ):
-                        trigger_snapshot = _current_snapshot()
-                        trigger_substep_global = int(global_substep_index)
-                        if force_window_before > 0 and previous_step_data is not None:
-                            before_snapshot = _capture_force_snapshot(
-                                frame_index=int(previous_step_data["frame_index"]),
-                                substep_index_in_frame=int(previous_step_data["substep_index_in_frame"]),
-                                global_substep_index=int(previous_step_data["global_substep_index"]),
-                                sim_time=float(previous_step_data["sim_time"]),
-                                sim_dt=sim_dt,
-                                particle_q=np.asarray(previous_step_data["particle_q"], dtype=np.float32),
-                                particle_qd=np.asarray(previous_step_data["particle_qd"], dtype=np.float32),
-                                body_q=np.asarray(previous_step_data["body_q"], dtype=np.float32),
-                                body_qd=np.asarray(previous_step_data["body_qd"], dtype=np.float32),
-                                particle_radius=particle_radius_diag,
-                                mass=particle_mass_diag,
-                                gravity_vec=gravity_vec_diag,
-                                f_spring=np.asarray(previous_step_data["f_spring"], dtype=np.float32),
-                                f_internal_total=np.asarray(previous_step_data["f_internal_total"], dtype=np.float32),
-                                f_external_total=np.asarray(previous_step_data["f_external_total"], dtype=np.float32),
-                                meta=meta,
-                                force_topk=int(args.force_topk),
-                                force_eps=force_eps,
-                                topk_selector_mode=str(args.force_topk_mode),
-                                used_manual_force_path=bool(use_manual_force_path),
-                            )
-                            _store_force_window_snapshot(force_window_map, before_snapshot, "trigger-1")
+                        particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        body_q_np = (
+                            state_in.body_q.numpy().astype(np.float32).copy()
+                            if state_in.body_q is not None
+                            else np.zeros((0, 7), dtype=np.float32)
+                        )
+                        body_qd_np = (
+                            state_in.body_qd.numpy().astype(np.float32).copy()
+                            if state_in.body_qd is not None
+                            else np.zeros((0, 6), dtype=np.float32)
+                        )
+                        trigger_snapshot = _capture_force_snapshot(
+                            frame_index=frame,
+                            substep_index_in_frame=substep_index_in_frame,
+                            global_substep_index=global_substep_index,
+                            sim_time=sim_time,
+                            sim_dt=sim_dt,
+                            particle_q=particle_q_np,
+                            particle_qd=particle_qd_np,
+                            body_q=body_q_np,
+                            body_qd=body_qd_np,
+                            particle_radius=particle_radius_diag,
+                            mass=particle_mass_diag,
+                            gravity_vec=gravity_vec_diag,
+                            f_spring=f_spring_np,
+                            f_internal_total=f_internal_total_np,
+                            f_external_total=f_external_total_np,
+                            meta=meta,
+                            force_topk=int(args.force_topk),
+                            force_eps=force_eps,
+                            topk_selector_mode=str(args.force_topk_mode),
+                            used_manual_force_path=bool(use_manual_force_path),
+                        )
                         if str(args.force_snapshot_frame) == "trigger":
                             if snapshot_substeps_after_trigger == 0:
                                 render_snapshot = trigger_snapshot
@@ -2367,54 +2571,47 @@ def simulate(
                                 render_snapshot = trigger_snapshot
                             else:
                                 pending_snapshot_substeps = snapshot_substeps_after_trigger
-
-                    if trigger_snapshot is not None and trigger_substep_global is not None:
-                        offset = int(global_substep_index) - int(trigger_substep_global)
-                        if offset >= 0 and offset <= force_window_search_cap:
-                            needs_snapshot = False
-                            if offset in force_window_offsets and offset not in captured_offsets:
-                                needs_snapshot = True
-                            if render_snapshot is None and pending_snapshot_substeps is not None and pending_snapshot_substeps == 0:
-                                needs_snapshot = True
-                            if bool(args.force_include_max_penetration) or bool(args.force_include_rebound):
-                                needs_snapshot = True
-                            if needs_snapshot:
-                                snap = _current_snapshot()
-                                last_window_snapshot = snap
-                                if offset in force_window_offsets and offset not in captured_offsets:
-                                    label = "trigger" if offset == 0 else f"trigger+{int(offset)}"
-                                    _store_force_window_snapshot(force_window_map, snap, label)
-                                    captured_offsets.add(offset)
-                                if render_snapshot is None and pending_snapshot_substeps is not None and pending_snapshot_substeps == 0:
-                                    render_snapshot = snap
-                                pen_mm = _snapshot_max_penetration_mm(snap)
-                                if bool(args.force_include_max_penetration) and pen_mm > best_pen_mm:
-                                    best_pen_mm = pen_mm
-                                    best_pen_snapshot = snap
-                                    best_pen_offset = offset
-                                if (
-                                    bool(args.force_include_rebound)
-                                    and rebound_snapshot is None
-                                    and best_pen_offset is not None
-                                    and offset > best_pen_offset
-                                    and best_pen_mm > 0.0
-                                    and pen_mm <= 0.5 * best_pen_mm
-                                ):
-                                    rebound_snapshot = snap
+                    elif (
+                        trigger_snapshot is not None
+                        and render_snapshot is None
+                        and pending_snapshot_substeps is not None
+                        and pending_snapshot_substeps == 0
+                    ):
+                        particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        body_q_np = (
+                            state_in.body_q.numpy().astype(np.float32).copy()
+                            if state_in.body_q is not None
+                            else np.zeros((0, 7), dtype=np.float32)
+                        )
+                        body_qd_np = (
+                            state_in.body_qd.numpy().astype(np.float32).copy()
+                            if state_in.body_qd is not None
+                            else np.zeros((0, 6), dtype=np.float32)
+                        )
+                        render_snapshot = _capture_force_snapshot(
+                            frame_index=frame,
+                            substep_index_in_frame=substep_index_in_frame,
+                            global_substep_index=global_substep_index,
+                            sim_time=sim_time,
+                            sim_dt=sim_dt,
+                            particle_q=particle_q_np,
+                            particle_qd=particle_qd_np,
+                            body_q=body_q_np,
+                            body_qd=body_qd_np,
+                            particle_radius=particle_radius_diag,
+                            mass=particle_mass_diag,
+                            gravity_vec=gravity_vec_diag,
+                            f_spring=f_spring_np,
+                            f_internal_total=f_internal_total_np,
+                            f_external_total=f_external_total_np,
+                            meta=meta,
+                            force_topk=int(args.force_topk),
+                            force_eps=force_eps,
+                            topk_selector_mode=str(args.force_topk_mode),
+                            used_manual_force_path=bool(use_manual_force_path),
+                        )
                     previous_max_external_norm = current_max_external_norm
-                    previous_step_data = {
-                        "frame_index": int(frame),
-                        "substep_index_in_frame": int(substep_index_in_frame),
-                        "global_substep_index": int(global_substep_index),
-                        "sim_time": float(sim_time),
-                        "particle_q": particle_q_np,
-                        "particle_qd": particle_qd_np,
-                        "body_q": body_q_np,
-                        "body_qd": body_qd_np,
-                        "f_spring": f_spring_np,
-                        "f_internal_total": f_internal_total_np,
-                        "f_external_total": f_external_total_np,
-                    }
 
                 solver.integrate_particles(model, state_in, state_out, sim_dt)
                 if body_f_work is body_f:
@@ -2452,17 +2649,9 @@ def simulate(
             if pending_snapshot_substeps is not None and render_snapshot is None and pending_snapshot_substeps > 0:
                 pending_snapshot_substeps -= 1
             if force_diagnostic_enabled and trigger_snapshot is not None and bool(args.stop_after_diagnostic):
-                if trigger_substep_global is not None:
-                    post_offset = int(global_substep_index) - int(trigger_substep_global)
-                    if post_offset >= force_window_search_cap:
-                        if best_pen_snapshot is not None:
-                            _store_force_window_snapshot(force_window_map, best_pen_snapshot, "max penetration")
-                        if rebound_snapshot is not None:
-                            _store_force_window_snapshot(force_window_map, rebound_snapshot, "rebound / settle")
-                        elif bool(args.force_include_rebound) and last_window_snapshot is not None:
-                            _store_force_window_snapshot(force_window_map, last_window_snapshot, "post-contact")
-                        stop_requested = True
-                        diagnostic_rollout_truncated = True
+                if render_snapshot is not None:
+                    stop_requested = True
+                    diagnostic_rollout_truncated = True
             if stop_requested:
                 break
 
@@ -2515,21 +2704,6 @@ def simulate(
             "normal_source": str(summary_payload.get("normal_source", "")),
             "used_manual_force_path": bool(summary_payload.get("used_manual_force_path", use_manual_force_path)),
             "render_snapshot": diag_snapshot,
-            "window_sequence": [
-                {
-                    "global_substep_index": int(substep),
-                    "label": " | ".join(item["labels"]),
-                    "max_penetration_mm": _snapshot_max_penetration_mm(item["snapshot"]),
-                }
-                for substep, item in sorted(force_window_map.items(), key=lambda kv: kv[0])
-            ],
-            "window_sequence_snapshots": [
-                {
-                    "label": " | ".join(item["labels"]),
-                    "snapshot": item["snapshot"],
-                }
-                for _, item in sorted(force_window_map.items(), key=lambda kv: kv[0])
-            ],
         }
         if parity_summary is not None:
             force_diagnostic["parity_check"] = parity_summary
@@ -3155,16 +3329,37 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
     force_diagnostic = sim_data.get("force_diagnostic")
     if isinstance(force_diagnostic, dict) and bool(force_diagnostic.get("enabled", False)):
         diag_snapshot = force_diagnostic.pop("render_snapshot", None)
-        sequence_snapshots = force_diagnostic.pop("window_sequence_snapshots", None)
+        print("Collecting force-window keyframes...", flush=True)
+        sequence_snapshots = _force_window_observer_rollout(
+            ir_obj=ir_obj,
+            args=args,
+            trigger_substep_global=int(force_diagnostic.get("trigger_substep_global", -1)),
+            n_obj=n_obj,
+            device=device,
+        )
+        force_diagnostic["window_sequence"] = [
+            {
+                "global_substep_index": int(item["snapshot"]["global_substep_index"]),
+                "label": str(item["label"]),
+                "max_penetration_mm": _snapshot_max_penetration_mm(item["snapshot"]),
+            }
+            for item in sequence_snapshots
+        ]
         if isinstance(diag_snapshot, dict):
+            render_force_args = copy.deepcopy(args)
+            render_force_args.force_diagnostic = False
+            render_force_args.stop_after_diagnostic = False
+            render_force_args.parity_check = False
+            model_force_render, meta_force_render, _ = build_model(ir_obj, render_force_args, device)
             snapshot_png_path, rendered_snapshot_video, rendered_sequence_video = _finalize_force_diagnostic_artifacts(
-                model,
-                meta,
+                model_force_render,
+                meta_force_render,
                 args,
                 device,
                 diag_snapshot,
                 sequence_snapshots,
             )
+            del model_force_render
             force_diagnostic["snapshot_png_path"] = str(snapshot_png_path)
             force_diagnostic["snapshot_video_path"] = "" if rendered_snapshot_video is None else str(rendered_snapshot_video)
             force_diagnostic["window_video_path"] = "" if rendered_sequence_video is None else str(rendered_sequence_video)

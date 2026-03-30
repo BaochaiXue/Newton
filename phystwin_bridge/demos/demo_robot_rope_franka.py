@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native Newton Franka Panda pushes a PhysTwin rope.
+"""Native Newton Franka Panda manipulates a PhysTwin rope.
 
 This demo keeps the deformable side on the PhysTwin -> Newton bridge and uses
 a native Newton robotics asset:
@@ -7,11 +7,11 @@ a native Newton robotics asset:
 - load one rope from PhysTwin IR
 - keep it object-only and pin the rope endpoints
 - add the native Franka Panda URDF through ``ModelBuilder.add_urdf()``
-- drive the end-effector through a short Cartesian push using Newton IK
+- drive the end-effector through a task preset using Newton IK
 - solve the combined robot + rope scene with ``SolverSemiImplicit``
 
-The goal is a native robot asset baseline that is easier to defend in a
-meeting than a free-floating box / capsule proxy.
+The goal is a taskful native robot-asset baseline that is easier to defend in a
+meeting than a pure contact probe.
 """
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ from bridge_shared import compute_visual_particle_radii, overlay_text_lines_rgb,
 from rollout_storage import RolloutStorage
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
+MID_SEGMENT_WINDOW_SIZE = 24
 
 FRANKA_INIT_Q = np.asarray(
     [
@@ -79,8 +80,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--prefix", default="robot_push_rope_franka")
     p.add_argument("--device", default=path_defaults.default_device())
+    p.add_argument(
+        "--task",
+        choices=["lift_release", "push_probe"],
+        default="lift_release",
+        help="Task preset. `lift_release` is the meeting-ready default; `push_probe` keeps the older contact-probe behavior.",
+    )
+    p.add_argument(
+        "--render-mode",
+        choices=["debug", "presentation"],
+        default="presentation",
+        help="Render preset for internal debugging or meeting presentation.",
+    )
 
-    p.add_argument("--frames", type=int, default=800)
+    p.add_argument("--frames", type=int, default=None)
     p.add_argument("--sim-dt", type=float, default=1.0e-4)
     p.add_argument("--substeps", type=int, default=4)
     p.add_argument(
@@ -168,7 +181,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hold-seconds", type=float, default=0.16)
 
     p.add_argument("--render-fps", type=float, default=30.0)
-    p.add_argument("--slowdown", type=float, default=8.0)
+    p.add_argument("--slowdown", type=float, default=None)
     p.add_argument("--make-gif", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--gif-fps", type=float, default=10.0)
     p.add_argument("--gif-width", type=int, default=960)
@@ -180,15 +193,15 @@ def parse_args() -> argparse.Namespace:
         "--camera-pos",
         type=float,
         nargs=3,
-        default=(-0.90, 0.55, 0.95),
+        default=None,
         metavar=("X", "Y", "Z"),
     )
-    p.add_argument("--camera-pitch", type=float, default=-8.0)
-    p.add_argument("--camera-yaw", type=float, default=-42.0)
-    p.add_argument("--camera-fov", type=float, default=34.0)
+    p.add_argument("--camera-pitch", type=float, default=None)
+    p.add_argument("--camera-yaw", type=float, default=None)
+    p.add_argument("--camera-fov", type=float, default=None)
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
     p.add_argument("--particle-radius-vis-min", type=float, default=0.004)
-    p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--label-font-size", type=int, default=24)
     p.add_argument("--rope-line-width", type=float, default=0.02)
     p.add_argument("--spring-stride", type=int, default=20)
@@ -217,22 +230,91 @@ def _gripper_center_world_position(body_q: np.ndarray, left_finger_idx: int, rig
     return 0.5 * (left + right)
 
 
-def _robot_target_state(t: float, meta: dict[str, Any], args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
-    start = np.asarray(meta["ee_target_start"], dtype=np.float32)
-    end = np.asarray(meta["ee_target_end"], dtype=np.float32)
-    target_rot = np.asarray(meta["ee_target_quat"], dtype=np.float32)
-    settle = float(args.settle_seconds)
-    push = max(float(args.push_seconds), 1.0e-8)
-    hold = max(float(args.hold_seconds), 0.0)
-    if t <= settle:
-        return start.copy(), target_rot.copy()
-    if t <= settle + push:
-        alpha = float((t - settle) / push)
-        pos = (1.0 - alpha) * start + alpha * end
-        return pos.astype(np.float32), target_rot.copy()
-    if t <= settle + push + hold:
-        return end.copy(), target_rot.copy()
-    return end.copy(), target_rot.copy()
+def _resolve_runtime_defaults(args: argparse.Namespace) -> None:
+    if args.frames is None:
+        args.frames = 1400 if str(args.task) == "lift_release" else 900
+
+    if args.slowdown is None:
+        args.slowdown = 16.0 if str(args.render_mode) == "presentation" else 8.0
+
+    if args.camera_pos is None:
+        if str(args.render_mode) == "presentation":
+            args.camera_pos = (-1.02, 0.72, 1.02)
+            args.camera_pitch = -12.0
+            args.camera_yaw = -36.0
+            args.camera_fov = 40.0
+        else:
+            args.camera_pos = (-0.90, 0.55, 0.95)
+            args.camera_pitch = -8.0
+            args.camera_yaw = -42.0
+            args.camera_fov = 34.0
+    else:
+        args.camera_pos = tuple(float(v) for v in args.camera_pos)
+        if args.camera_pitch is None:
+            args.camera_pitch = -8.0
+        if args.camera_yaw is None:
+            args.camera_yaw = -42.0
+        if args.camera_fov is None:
+            args.camera_fov = 34.0
+
+    if args.overlay_label is None:
+        args.overlay_label = str(args.render_mode) == "debug"
+
+
+def _mid_segment_indices(points: np.ndarray, rope_center: np.ndarray, count: int = MID_SEGMENT_WINDOW_SIZE) -> np.ndarray:
+    d = np.linalg.norm(np.asarray(points, dtype=np.float32) - rope_center[None, :], axis=1)
+    return np.argsort(d)[: max(1, int(count))].astype(np.int32)
+
+
+def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -> list[dict[str, Any]]:
+    rope_center = np.asarray(rope_center, dtype=np.float32)
+    target_quat = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    if str(args.task) == "lift_release":
+        pre = rope_center + np.asarray([-0.22, 0.0, 0.05], dtype=np.float32)
+        approach = rope_center + np.asarray([0.05, 0.0, -0.055], dtype=np.float32)
+        lift = rope_center + np.asarray([0.12, 0.0, 0.10], dtype=np.float32)
+        release = rope_center + np.asarray([0.20, 0.0, 0.14], dtype=np.float32)
+        return [
+            {"name": "pre_approach", "duration": 0.08, "start": pre, "end": pre, "quat": target_quat},
+            {"name": "approach_under", "duration": 0.12, "start": pre, "end": approach, "quat": target_quat},
+            {"name": "lift", "duration": 0.12, "start": approach, "end": lift, "quat": target_quat},
+            {"name": "hold", "duration": 0.08, "start": lift, "end": lift, "quat": target_quat},
+            {"name": "release_retract", "duration": 0.16, "start": lift, "end": release, "quat": target_quat},
+        ]
+
+    start = rope_center + np.asarray([float(args.ee_start_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32)
+    end = rope_center + np.asarray([float(args.ee_end_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32)
+    retract = start.copy()
+    return [
+        {"name": "pre_approach", "duration": float(args.settle_seconds), "start": start, "end": start, "quat": target_quat},
+        {"name": "push", "duration": float(args.push_seconds), "start": start, "end": end, "quat": target_quat},
+        {"name": "hold", "duration": float(args.hold_seconds), "start": end, "end": end, "quat": target_quat},
+        {
+            "name": "release_retract",
+            "duration": max(float(args.push_seconds), 0.06),
+            "start": end,
+            "end": retract,
+            "quat": target_quat,
+        },
+    ]
+
+
+def _task_phase_state(t: float, meta: dict[str, Any]) -> tuple[str, np.ndarray, np.ndarray]:
+    phases = meta["task_phases"]
+    elapsed = 0.0
+    for phase in phases:
+        duration = max(float(phase["duration"]), 1.0e-8)
+        end_t = elapsed + duration
+        if t <= end_t:
+            alpha = 0.0 if phase["name"] == "pre_approach" or np.allclose(phase["start"], phase["end"]) else np.clip((t - elapsed) / duration, 0.0, 1.0)
+            pos = (1.0 - alpha) * np.asarray(phase["start"], dtype=np.float32) + alpha * np.asarray(phase["end"], dtype=np.float32)
+            quat = np.asarray(phase["quat"], dtype=np.float32)
+            return str(phase["name"]), pos.astype(np.float32, copy=False), quat
+        elapsed = end_t
+
+    last = phases[-1]
+    return str(last["name"]), np.asarray(last["end"], dtype=np.float32), np.asarray(last["quat"], dtype=np.float32)
 
 
 def _find_index_by_suffix(labels: list[str], suffix: str) -> int:
@@ -329,13 +411,32 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
     right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
     ee_offset_local = np.asarray([0.0, 0.0, 0.22], dtype=np.float32)
-    ee_target_quat = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    ee_target_start = rope_center + np.asarray(
-        [float(args.ee_start_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32
+    task_phases = _task_phase_definitions(rope_center, args)
+    ee_target_start = np.asarray(task_phases[0]["start"], dtype=np.float32)
+    ee_target_end = np.asarray(task_phases[-1]["end"], dtype=np.float32)
+    ee_target_quat = np.asarray(task_phases[0]["quat"], dtype=np.float32)
+    mid_segment_indices = _mid_segment_indices(shifted_q[:n_obj], rope_center)
+    anchor_bar_center = np.asarray(
+        [
+            float(np.mean(anchor_positions := shifted_q[anchor_indices], axis=0)[0]),
+            float(np.mean(anchor_positions, axis=0)[1]),
+            float(np.max(anchor_positions[:, 2]) + 0.03),
+        ],
+        dtype=np.float32,
     )
-    ee_target_end = rope_center + np.asarray(
-        [float(args.ee_end_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32
+    anchor_bar_scale = np.asarray(
+        [
+            0.015,
+            max(0.08, 0.5 * float(np.max(anchor_positions[:, 1]) - np.min(anchor_positions[:, 1])) + 0.04),
+            0.015,
+        ],
+        dtype=np.float32,
     )
+    stage_center = np.asarray(
+        [float(rope_center[0]), float(rope_center[1]), float(np.min(shifted_q[:, 2]) - 0.14)],
+        dtype=np.float32,
+    )
+    stage_scale = np.asarray([0.32, 0.18, 0.008], dtype=np.float32)
 
     model = builder.finalize(device=device)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
@@ -355,6 +456,13 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "ee_target_quat": ee_target_quat.astype(np.float32),
         "ee_target_start": ee_target_start.astype(np.float32),
         "ee_target_end": ee_target_end.astype(np.float32),
+        "task": str(args.task),
+        "task_phases": task_phases,
+        "mid_segment_indices": mid_segment_indices.astype(np.int32),
+        "anchor_bar_center": anchor_bar_center.astype(np.float32),
+        "anchor_bar_scale": anchor_bar_scale.astype(np.float32),
+        "stage_center": stage_center.astype(np.float32),
+        "stage_scale": stage_scale.astype(np.float32),
         "joint_q_init": FRANKA_INIT_Q.astype(np.float32),
         "endpoint_indices": endpoint_indices.astype(np.int32),
         "anchor_indices": anchor_indices.astype(np.int32),
@@ -467,12 +575,12 @@ def simulate(
         particle_q_object[frame] = q[:n_obj]
         body_q[frame] = state_in.body_q.numpy().astype(np.float32)
         body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
-        target_pos_frame, _ = _robot_target_state(float(frame) * sim_dt * float(substeps), meta, args)
+        _, target_pos_frame, _ = _task_phase_state(float(frame) * sim_dt * float(substeps), meta)
         ee_target_pos[frame] = target_pos_frame
 
         for sub in range(substeps):
             sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
-            target_pos, target_quat = _robot_target_state(sim_t, meta, args)
+            _, target_pos, target_quat = _task_phase_state(sim_t, meta)
             pos_obj.set_target_position(0, wp.vec3(*target_pos.tolist()))
             rot_obj.set_target_rotation(0, wp.vec4(*target_quat.tolist()))
             ik_solver.step(ik_joint_q, ik_joint_q, iterations=int(args.ik_iters))
@@ -618,6 +726,10 @@ def render_video(
         anchor_colors_wp = wp.array([wp.vec3(0.34, 0.90, 0.52) for _ in range(anchor_positions.shape[0])], dtype=wp.vec3, device=device)
         left_finger_idx = int(meta["left_finger_index"])
         right_finger_idx = int(meta["right_finger_index"])
+        anchor_bar_center = np.asarray(meta["anchor_bar_center"], dtype=np.float32)
+        anchor_bar_scale = np.asarray(meta["anchor_bar_scale"], dtype=np.float32)
+        stage_center = np.asarray(meta["stage_center"], dtype=np.float32)
+        stage_scale = np.asarray(meta["stage_scale"], dtype=np.float32)
 
         state = model.state()
         if state.body_qd is not None:
@@ -641,33 +753,35 @@ def render_video(
                 state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
 
                 sim_t = float(sim_idx) * sim_frame_dt
+                phase_name, _, _ = _task_phase_state(sim_t, meta)
                 viewer.begin_frame(sim_t)
                 viewer.log_state(state)
-                viewer.log_shapes(
-                    "/demo/ee_target",
-                    newton.GeoType.SPHERE,
-                    float(args.ee_contact_radius) * 0.55,
-                    wp.array(
-                        [wp.transform(wp.vec3(*sim_data["ee_target_pos"][sim_idx].astype(np.float32).tolist()), wp.quat_identity())],
-                        dtype=wp.transform,
-                        device=device,
-                    ),
-                    wp.array([wp.vec3(1.0, 0.84, 0.18)], dtype=wp.vec3, device=device),
-                )
                 gripper_center = _gripper_center_world_position(
                     sim_data["body_q"][sim_idx], left_finger_idx, right_finger_idx
                 ).astype(np.float32, copy=False)
-                viewer.log_shapes(
-                    "/demo/gripper_center",
-                    newton.GeoType.SPHERE,
-                    0.014,
-                    wp.array(
-                        [wp.transform(wp.vec3(*gripper_center.tolist()), wp.quat_identity())],
-                        dtype=wp.transform,
-                        device=device,
-                    ),
-                    wp.array([wp.vec3(0.22, 0.90, 0.96)], dtype=wp.vec3, device=device),
-                )
+                if str(args.render_mode) == "debug":
+                    viewer.log_shapes(
+                        "/demo/ee_target",
+                        newton.GeoType.SPHERE,
+                        float(args.ee_contact_radius) * 0.55,
+                        wp.array(
+                            [wp.transform(wp.vec3(*sim_data["ee_target_pos"][sim_idx].astype(np.float32).tolist()), wp.quat_identity())],
+                            dtype=wp.transform,
+                            device=device,
+                        ),
+                        wp.array([wp.vec3(1.0, 0.84, 0.18)], dtype=wp.vec3, device=device),
+                    )
+                    viewer.log_shapes(
+                        "/demo/gripper_center",
+                        newton.GeoType.SPHERE,
+                        0.014,
+                        wp.array(
+                            [wp.transform(wp.vec3(*gripper_center.tolist()), wp.quat_identity())],
+                            dtype=wp.transform,
+                            device=device,
+                        ),
+                        wp.array([wp.vec3(0.22, 0.90, 0.96)], dtype=wp.vec3, device=device),
+                    )
                 viewer.log_shapes(
                     "/demo/anchors",
                     newton.GeoType.SPHERE,
@@ -675,6 +789,29 @@ def render_video(
                     anchor_xforms_wp,
                     anchor_colors_wp,
                 )
+                if str(args.render_mode) == "presentation":
+                    viewer.log_shapes(
+                        "/demo/anchor_bar",
+                        newton.GeoType.BOX,
+                        tuple(float(v) for v in anchor_bar_scale.tolist()),
+                        wp.array(
+                            [wp.transform(wp.vec3(*anchor_bar_center.tolist()), wp.quat_identity())],
+                            dtype=wp.transform,
+                            device=device,
+                        ),
+                        wp.array([wp.vec3(0.52, 0.44, 0.34)], dtype=wp.vec3, device=device),
+                    )
+                    viewer.log_shapes(
+                        "/demo/stage_reference",
+                        newton.GeoType.BOX,
+                        tuple(float(v) for v in stage_scale.tolist()),
+                        wp.array(
+                            [wp.transform(wp.vec3(*stage_center.tolist()), wp.quat_identity())],
+                            dtype=wp.transform,
+                            device=device,
+                        ),
+                        wp.array([wp.vec3(0.31, 0.28, 0.22)], dtype=wp.vec3, device=device),
+                    )
 
                 if rope_edges.size and rope_line_starts_wp is not None and rope_line_ends_wp is not None:
                     q_obj = sim_data["particle_q_object"][sim_idx]
@@ -713,6 +850,7 @@ def render_video(
                     frame = overlay_text_lines_rgb(
                         frame,
                         [
+                            f"task: {args.task} | phase: {phase_name}",
                             "Native Newton Franka Panda + hanging rope | yellow=target, cyan=gripper center",
                             f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s",
                             f"contact: {contact_state} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm",
@@ -757,9 +895,18 @@ def build_summary(
     gripper_speed = np.linalg.norm(np.diff(gripper_center, axis=0), axis=1) / float(sim_data["sim_dt"] * sim_data["substeps"])
     if gripper_speed.size == 0:
         gripper_speed = np.zeros((1,), dtype=np.float32)
+    gripper_path_length = float(np.sum(np.linalg.norm(np.diff(gripper_center, axis=0), axis=1)))
 
     rope_com = particle_q.mean(axis=1)
     rope_com_disp = float(np.linalg.norm(rope_com[-1] - rope_com[0]))
+    mid_segment_indices = np.asarray(meta["mid_segment_indices"], dtype=np.int32)
+    mid_segment_z = particle_q[:, mid_segment_indices, 2].mean(axis=1)
+    frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+    phase_names = [str(_task_phase_state(float(i) * frame_dt, meta)[0]) for i in range(particle_q.shape[0])]
+    pre_frames = [i for i, name in enumerate(phase_names) if name == "pre_approach"]
+    baseline_z = float(np.mean(mid_segment_z[pre_frames])) if pre_frames else float(mid_segment_z[0])
+    rope_mid_peak_z_delta = float(np.max(mid_segment_z) - baseline_z)
+    rope_mid_final_z_delta = float(mid_segment_z[-1] - baseline_z)
 
     contact_frames = []
     min_clearance = []
@@ -773,7 +920,17 @@ def build_summary(
             contact_frames.append(frame_idx)
 
     first_contact_frame = int(contact_frames[0]) if contact_frames else None
-    frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+    release_candidates = [i for i, name in enumerate(phase_names) if name == "release_retract"]
+    release_frame = None
+    if release_candidates:
+        release_start = int(release_candidates[0])
+        contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
+        for idx in range(release_start, len(contact_mask)):
+            window = contact_mask[idx : min(len(contact_mask), idx + 3)]
+            if window.size and not np.any(window):
+                release_frame = int(idx)
+                break
+
     return {
         "ir_path": str(args.ir.resolve()),
         "output_mp4": str(out_mp4),
@@ -786,6 +943,8 @@ def build_summary(
         "anchor_count": int(meta["anchor_indices"].shape[0]),
         "anchor_constraint_mode": "inactive_fixed_particles",
         "anchor_mass_mode": str(args.anchor_mass_mode),
+        "task": str(args.task),
+        "render_mode": str(args.render_mode),
         "particle_contacts": bool(meta["particle_contacts"]),
         "particle_contact_kernel": bool(meta["particle_contact_kernel"]),
         "history_storage_mode": str(sim_data["history_storage_mode"]),
@@ -795,9 +954,13 @@ def build_summary(
         "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),
         "gripper_center_tracking_error_max_m": float(np.max(tracking_error)),
         "gripper_center_speed_max_m_s": float(np.max(gripper_speed)),
+        "gripper_center_path_length_m": gripper_path_length,
         "rope_com_displacement_m": rope_com_disp,
         "rope_com_z_min_m": float(np.min(rope_com[:, 2])),
+        "rope_mid_segment_peak_z_delta_m": rope_mid_peak_z_delta,
+        "rope_mid_segment_final_z_delta_m": rope_mid_final_z_delta,
         "first_contact_frame": first_contact_frame,
+        "release_frame": release_frame,
         "contact_active_frames": int(len(contact_frames)),
         "min_clearance_min_m": float(np.min(np.asarray(min_clearance, dtype=np.float32))),
         "min_clearance_final_m": float(min_clearance[-1]),
@@ -866,6 +1029,7 @@ def save_summary_json(args: argparse.Namespace, summary: dict[str, Any]) -> Path
 
 def main() -> int:
     args = parse_args()
+    _resolve_runtime_defaults(args)
     args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     device = str(args.device)
