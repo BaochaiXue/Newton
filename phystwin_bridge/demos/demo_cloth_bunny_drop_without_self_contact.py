@@ -1109,7 +1109,7 @@ def _make_force_diagnostic_frame(
     frame_out: np.ndarray | None = None
     try:
         viewer.set_model(model)
-        viewer.show_particles = True
+        viewer.show_particles = False
         viewer.show_triangles = True
         viewer.show_visual = True
         viewer.show_static = True
@@ -1127,6 +1127,20 @@ def _make_force_diagnostic_frame(
             float(args.camera_pitch),
             float(args.camera_yaw),
         )
+        try:
+            apply_viewer_shape_colors(
+                viewer,
+                model,
+                extra_rules=[
+                    (
+                        lambda name: "bunny" in name
+                        or (meta.get("rigid_shape") == "box" and "shape_1" in name),
+                        (0.88, 0.35, 0.28),
+                    )
+                ],
+            )
+        except Exception:
+            pass
 
         render_radii = compute_visual_particle_radii(
             model.particle_radius.numpy(),
@@ -1261,40 +1275,54 @@ def _make_force_diagnostic_frame(
                 )
 
             if topk.size:
+                topk_q_wp = wp.array(topk_q.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
+                topk_particle_radii_wp = wp.array(topk_particle_radii, dtype=wp.float32, device=device)
+                topk_particle_colors_wp = wp.array(topk_particle_colors, dtype=wp.vec3, device=device)
+                topk_closest_wp = wp.array(topk_closest.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
+                topk_closest_radii_wp = wp.array(topk_closest_radii, dtype=wp.float32, device=device)
+                topk_closest_colors_wp = wp.array(topk_closest_colors, dtype=wp.vec3, device=device)
                 viewer.log_points(
                     "/demo/diag_contact_particles",
-                    wp.array(topk_q.astype(np.float32, copy=False), dtype=wp.vec3, device=device),
-                    wp.array(topk_particle_radii, dtype=float, device=device),
-                    wp.array(topk_particle_colors, dtype=wp.vec3, device=device),
+                    topk_q_wp,
+                    topk_particle_radii_wp,
+                    topk_particle_colors_wp,
                     hidden=False,
                 )
                 viewer.log_points(
                     "/demo/diag_closest_points",
-                    wp.array(topk_closest.astype(np.float32, copy=False), dtype=wp.vec3, device=device),
-                    wp.array(topk_closest_radii, dtype=float, device=device),
-                    wp.array(topk_closest_colors, dtype=wp.vec3, device=device),
+                    topk_closest_wp,
+                    topk_closest_radii_wp,
+                    topk_closest_colors_wp,
                     hidden=False,
                 )
 
-            max_len = max(float(args.force_arrow_scale), 1.0e-6)
-            for spec in arrow_specs:
-                if topk_q.shape[0] == 0:
-                    continue
-                name = str(spec["name"])
-                vectors = np.asarray(spec["vectors"], dtype=np.float32)
-                if not bool(spec["normalize"]):
-                    scaled = vectors * max_len
-                else:
-                    norms = np.linalg.norm(vectors, axis=1)
-                    peak = float(np.max(norms)) if norms.size else 0.0
-                    if peak <= 1.0e-12:
-                        scaled = np.zeros_like(vectors, dtype=np.float32)
+                glyph_buffers: list[Any] = [
+                    topk_q_wp,
+                    topk_particle_radii_wp,
+                    topk_particle_colors_wp,
+                    topk_closest_wp,
+                    topk_closest_radii_wp,
+                    topk_closest_colors_wp,
+                ]
+                max_len = max(float(args.force_arrow_scale), 1.0e-6)
+                for spec in arrow_specs:
+                    name = str(spec["name"])
+                    vectors = np.asarray(spec["vectors"], dtype=np.float32)
+                    if not bool(spec["normalize"]):
+                        scaled = vectors * max_len
                     else:
-                        scaled = (vectors / peak * max_len).astype(np.float32, copy=False)
-                starts_np = np.asarray(spec["start"], dtype=np.float32)
-                starts = wp.array(starts_np.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
-                ends = wp.array((starts_np + scaled).astype(np.float32, copy=False), dtype=wp.vec3, device=device)
-                viewer.log_lines(f"/demo/{name}", starts, ends, spec["color"], width=0.012, hidden=False)
+                        norms = np.linalg.norm(vectors, axis=1)
+                        peak = float(np.max(norms)) if norms.size else 0.0
+                        if peak <= 1.0e-12:
+                            scaled = np.zeros_like(vectors, dtype=np.float32)
+                        else:
+                            scaled = (vectors / peak * max_len).astype(np.float32, copy=False)
+                    starts_np = np.asarray(spec["start"], dtype=np.float32)
+                    starts_wp = wp.array(starts_np.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
+                    ends_wp = wp.array((starts_np + scaled).astype(np.float32, copy=False), dtype=wp.vec3, device=device)
+                    glyph_buffers.extend([starts_wp, ends_wp])
+                    viewer.log_lines(f"/demo/{name}", starts_wp, ends_wp, spec["color"], width=0.012, hidden=False)
+                wp.synchronize_device(device)
 
             viewer.end_frame()
             frame = viewer.get_frame(render_ui=False).numpy()
@@ -1467,6 +1495,8 @@ def _render_force_diagnostic_sequence_video(
     device: str,
     sequence_items: list[dict[str, Any]],
     out_path: Path,
+    *,
+    ir_obj: dict[str, Any] | None = None,
 ) -> Path | None:
     if not sequence_items:
         return None
@@ -1508,14 +1538,28 @@ def _render_force_diagnostic_sequence_video(
         for item in sequence_items:
             snapshot = item["snapshot"]
             label = str(item["label"])
-            frame = _make_force_diagnostic_frame(
-                model,
-                meta,
-                args,
-                device,
-                snapshot,
-                snapshot_label_override=label,
-            )
+            if ir_obj is not None:
+                model_frame, meta_frame, _ = build_model(ir_obj, args, device)
+                try:
+                    frame = _make_force_diagnostic_frame(
+                        model_frame,
+                        meta_frame,
+                        args,
+                        device,
+                        snapshot,
+                        snapshot_label_override=label,
+                    )
+                finally:
+                    del model_frame
+            else:
+                frame = _make_force_diagnostic_frame(
+                    model,
+                    meta,
+                    args,
+                    device,
+                    snapshot,
+                    snapshot_label_override=label,
+                )
             frame = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8))
             payload = frame.tobytes()
             for _ in range(hold_frames):
@@ -1536,6 +1580,8 @@ def _finalize_force_diagnostic_artifacts(
     device: str,
     snapshot: dict[str, Any],
     sequence_items: list[dict[str, Any]] | None = None,
+    *,
+    ir_obj: dict[str, Any] | None = None,
 ) -> tuple[Path, Path | None, Path | None]:
     snapshot_png_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.png"
     snapshot_mp4_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.mp4"
@@ -1560,6 +1606,7 @@ def _finalize_force_diagnostic_artifacts(
         device,
         sequence_items or [],
         sequence_mp4_path,
+        ir_obj=ir_obj,
     )
     return snapshot_png_path, rendered_diag_video, rendered_sequence_video
 
@@ -1672,6 +1719,104 @@ def _overlay_zoom_panel_rgb(
     except Exception:
         font = ImageFont.load_default()
     draw.text((panel_x0 + 8, panel_y0 - 24), label, fill=(255, 255, 255, 255), font=font)
+    return np.asarray(img, dtype=np.uint8)
+
+
+def _draw_arrow_2d(draw, start: tuple[float, float], end: tuple[float, float], color: tuple[int, int, int], width: int = 4) -> None:
+    import math
+
+    draw.line((start[0], start[1], end[0], end[1]), fill=color, width=width)
+    dx = float(end[0] - start[0])
+    dy = float(end[1] - start[1])
+    norm = math.hypot(dx, dy)
+    if norm <= 1.0e-6:
+        return
+    ux, uy = dx / norm, dy / norm
+    px, py = -uy, ux
+    head_len = max(10.0, width * 2.2)
+    head_w = max(5.0, width * 1.2)
+    p1 = (end[0] - ux * head_len + px * head_w, end[1] - uy * head_len + py * head_w)
+    p2 = (end[0] - ux * head_len - px * head_w, end[1] - uy * head_len - py * head_w)
+    draw.polygon([end, p1, p2], fill=color)
+
+
+def _overlay_force_glyphs_rgb(
+    frame: np.ndarray,
+    *,
+    cam_pos: np.ndarray,
+    pitch_deg: float,
+    yaw_deg: float,
+    fov_deg: float,
+    topk_q: np.ndarray,
+    topk_closest: np.ndarray,
+    topk_anchor: np.ndarray,
+    topk_normals: np.ndarray,
+    closest_offset_world: np.ndarray,
+    external_force_normal_vec: np.ndarray,
+    internal_force_normal_vec: np.ndarray,
+    acceleration_normal_vec: np.ndarray,
+    force_arrow_scale: float,
+) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    img = Image.fromarray(np.asarray(frame, dtype=np.uint8), mode="RGB")
+    draw = ImageDraw.Draw(img, mode="RGBA")
+    width = int(frame.shape[1])
+    height = int(frame.shape[0])
+
+    def proj(world: np.ndarray) -> tuple[float, float] | None:
+        return _project_world_to_screen(
+            np.asarray(world, dtype=np.float32),
+            cam_pos=np.asarray(cam_pos, dtype=np.float32),
+            pitch_deg=float(pitch_deg),
+            yaw_deg=float(yaw_deg),
+            fov_deg=float(fov_deg),
+            width=width,
+            height=height,
+        )
+
+    # project markers first
+    for particle_pt, closest_pt in zip(topk_q, topk_closest):
+        p_px = proj(particle_pt)
+        c_px = proj(closest_pt)
+        if p_px is not None:
+            draw.ellipse((p_px[0] - 8, p_px[1] - 8, p_px[0] + 8, p_px[1] + 8), fill=(255, 219, 46, 255))
+        if c_px is not None:
+            draw.ellipse((c_px[0] - 6, c_px[1] - 6, c_px[0] + 6, c_px[1] + 6), fill=(140, 240, 250, 255))
+
+    specs = [
+        (topk_closest, topk_closest + topk_normals * float(force_arrow_scale), (255, 255, 255), 4),
+        (topk_closest, topk_closest + closest_offset_world * float(force_arrow_scale), (179, 179, 179), 3),
+        (topk_anchor, None, (242, 64, 64), 4),
+        (topk_anchor, None, (158, 82, 235), 4),
+        (topk_anchor, None, (38, 217, 64), 4),
+    ]
+    force_vecs = [
+        external_force_normal_vec,
+        internal_force_normal_vec,
+        acceleration_normal_vec,
+    ]
+    scaled_force_ends: list[np.ndarray] = []
+    for vectors in force_vecs:
+        norms = np.linalg.norm(vectors, axis=1)
+        peak = float(np.max(norms)) if norms.size else 0.0
+        if peak <= 1.0e-12:
+            scaled_force_ends.append(topk_anchor.copy())
+        else:
+            scaled = (vectors / peak * float(force_arrow_scale)).astype(np.float32, copy=False)
+            scaled_force_ends.append((topk_anchor + scaled).astype(np.float32, copy=False))
+    specs[2] = (topk_anchor, scaled_force_ends[0], (242, 64, 64), 4)
+    specs[3] = (topk_anchor, scaled_force_ends[1], (158, 82, 235), 4)
+    specs[4] = (topk_anchor, scaled_force_ends[2], (38, 217, 64), 4)
+
+    for starts, ends, color, line_w in specs:
+        for start_world, end_world in zip(starts, ends):
+            s_px = proj(start_world)
+            e_px = proj(end_world)
+            if s_px is None or e_px is None:
+                continue
+            _draw_arrow_2d(draw, s_px, e_px, color, width=line_w)
+
     return np.asarray(img, dtype=np.uint8)
 
 
@@ -3373,6 +3518,7 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
                 device,
                 diag_snapshot,
                 sequence_snapshots,
+                ir_obj=ir_obj,
             )
             del model_force_render
             force_diagnostic["snapshot_png_path"] = str(snapshot_png_path)
