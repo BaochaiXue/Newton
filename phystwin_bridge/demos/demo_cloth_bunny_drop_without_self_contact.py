@@ -1110,7 +1110,7 @@ def _make_force_diagnostic_frame(
     try:
         viewer.set_model(model)
         viewer.show_particles = True
-        viewer.show_triangles = bool(args.force_render_mode == "full")
+        viewer.show_triangles = True
         viewer.show_visual = True
         viewer.show_static = True
         viewer.show_collision = False
@@ -1298,6 +1298,21 @@ def _make_force_diagnostic_frame(
 
             viewer.end_frame()
             frame = viewer.get_frame(render_ui=False).numpy()
+            focus_center_world = None
+            if topk_closest.shape[0]:
+                focus_center_world = np.mean(topk_closest.astype(np.float32, copy=False), axis=0)
+            focus_px = None
+            if focus_center_world is not None:
+                focus_px = _project_world_to_screen(
+                    np.asarray(focus_center_world, dtype=np.float32),
+                    cam_pos=cam_pos,
+                    pitch_deg=float(args.camera_pitch),
+                    yaw_deg=float(args.camera_yaw),
+                    fov_deg=float(args.camera_fov),
+                    width=width,
+                    height=height,
+                )
+            frame = _overlay_zoom_panel_rgb(frame, center_px=focus_px, label="force zoom")
             frame = overlay_text_lines_rgb(
                 frame,
                 [
