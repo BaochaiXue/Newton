@@ -234,6 +234,12 @@ def parse_args() -> argparse.Namespace:
             "Use <= 0 to disable trimming."
         ),
     )
+    p.add_argument(
+        "--process-stage-hold-seconds",
+        type=float,
+        default=0.6,
+        help="How long each staged process-video keyframe should be held in the exported main video.",
+    )
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
     p.add_argument(
         "--particle-radius-vis-min",
@@ -246,6 +252,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--label-font-size", type=int, default=28)
     p.add_argument("--skip-render", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--keep-render-frames",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep intermediate stage/frame PNGs for process-video debugging.",
+    )
     p.add_argument(
         "--force-diagnostic",
         action=argparse.BooleanOptionalAction,
@@ -320,6 +332,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="If > 0, also encode a short static diagnostic video clip from the selected force snapshot.",
+    )
+    p.add_argument(
+        "--force-video-hold-seconds",
+        type=float,
+        default=0.35,
+        help="How long each force-diagnostic keyframe should be held in the trigger-window diagnostic video.",
+    )
+    p.add_argument(
+        "--force-window-substeps-before",
+        type=int,
+        default=1,
+        help="How many substeps before the trigger should be included in the force-video keyframe sequence.",
+    )
+    p.add_argument(
+        "--force-window-substeps-after",
+        type=int,
+        default=12,
+        help="How many substeps after the trigger should be monitored for force-video keyframes.",
+    )
+    p.add_argument(
+        "--force-include-max-penetration",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include a dedicated max-penetration keyframe in the force-video sequence.",
+    )
+    p.add_argument(
+        "--force-include-rebound",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include a rebound / settle keyframe in the force-video sequence when detected.",
     )
     p.add_argument(
         "--stop-after-diagnostic",
@@ -1047,6 +1089,7 @@ def _make_force_diagnostic_frame(
     snapshot: dict[str, Any],
     *,
     save_png_path: Path | None = None,
+    snapshot_label_override: str | None = None,
 ) -> np.ndarray:
     import newton.viewer  # noqa: PLC0415
     from PIL import Image  # noqa: PLC0415
@@ -1056,7 +1099,9 @@ def _make_force_diagnostic_frame(
     width = int(args.screen_width)
     height = int(args.screen_height)
     snapshot_substeps_after_trigger = getattr(args, "force_snapshot_substeps_after_trigger", None)
-    if snapshot_substeps_after_trigger is None:
+    if snapshot_label_override is not None:
+        snapshot_label = str(snapshot_label_override)
+    elif snapshot_substeps_after_trigger is None:
         snapshot_label = str(args.force_snapshot_frame)
     else:
         snapshot_label = f"trigger_plus_{int(snapshot_substeps_after_trigger)}"
@@ -1369,6 +1414,141 @@ def _render_force_diagnostic_video(
     return out_path
 
 
+def _force_window_key_offsets(after_substeps: int) -> list[int]:
+    base = [0, 2, 4, 8]
+    if after_substeps > 0:
+        base.append(int(after_substeps))
+    return sorted({int(v) for v in base if int(v) >= 0})
+
+
+def _snapshot_max_penetration_mm(snapshot: dict[str, Any]) -> float:
+    pen = np.asarray(snapshot["penetration_depth_signed"], dtype=np.float32)
+    if pen.size == 0:
+        return 0.0
+    return float(np.max(pen) * 1000.0)
+
+
+def _store_force_window_snapshot(
+    sequence_map: dict[int, dict[str, Any]],
+    snapshot: dict[str, Any],
+    label: str,
+) -> None:
+    substep = int(snapshot["global_substep_index"])
+    item = sequence_map.get(substep)
+    if item is None:
+        sequence_map[substep] = {
+            "snapshot": snapshot,
+            "labels": [str(label)],
+        }
+        return
+    if str(label) not in item["labels"]:
+        item["labels"].append(str(label))
+
+
+def _render_force_diagnostic_sequence_video(
+    model: newton.Model,
+    meta: dict[str, Any],
+    args: argparse.Namespace,
+    device: str,
+    sequence_items: list[dict[str, Any]],
+    out_path: Path,
+) -> Path | None:
+    if not sequence_items:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg not found in PATH")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fps = max(float(args.render_fps), 1.0)
+    hold_frames = max(1, int(round(max(float(args.force_video_hold_seconds), 1.0e-3) * fps)))
+    width = int(args.screen_width)
+    height = int(args.screen_height)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        str(out_path),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    try:
+        for item in sequence_items:
+            snapshot = item["snapshot"]
+            label = str(item["label"])
+            frame = _make_force_diagnostic_frame(
+                model,
+                meta,
+                args,
+                device,
+                snapshot,
+                snapshot_label_override=label,
+            )
+            frame = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8))
+            payload = frame.tobytes()
+            for _ in range(hold_frames):
+                proc.stdin.write(payload)
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed while encoding force-diagnostic window video")
+    finally:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    return out_path
+
+
+def _finalize_force_diagnostic_artifacts(
+    model: newton.Model,
+    meta: dict[str, Any],
+    args: argparse.Namespace,
+    device: str,
+    snapshot: dict[str, Any],
+    sequence_items: list[dict[str, Any]] | None = None,
+) -> tuple[Path, Path | None, Path | None]:
+    snapshot_png_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.png"
+    snapshot_mp4_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.mp4"
+    sequence_mp4_path = _resolve_force_dump_dir(args) / "force_diag_trigger_window.mp4"
+    diag_frame = _make_force_diagnostic_frame(
+        model,
+        meta,
+        args,
+        device,
+        snapshot,
+    )
+    _save_force_diagnostic_snapshot_frame(diag_frame, snapshot_png_path)
+    rendered_diag_video = _render_force_diagnostic_video(
+        args,
+        diag_frame,
+        snapshot_mp4_path,
+    )
+    rendered_sequence_video = _render_force_diagnostic_sequence_video(
+        model,
+        meta,
+        args,
+        device,
+        sequence_items or [],
+        sequence_mp4_path,
+    )
+    return snapshot_png_path, rendered_diag_video, rendered_sequence_video
+
+
 def _camera_basis_from_pitch_yaw(pitch_deg: float, yaw_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     pitch = np.deg2rad(float(pitch_deg))
     yaw = np.deg2rad(float(yaw_deg))
@@ -1601,6 +1781,47 @@ def _stage_label_for_frame(
     if rebound_frame is not None and frame_idx <= rebound_frame:
         return "Rebound / settle"
     return "Post-contact settle"
+
+
+def _build_process_story_keyframes(
+    *,
+    n_frames: int,
+    first_contact_frame: int | None,
+    max_penetration_frame: int | None,
+    rebound_frame: int | None,
+) -> list[tuple[int, str]]:
+    last_idx = max(0, int(n_frames) - 1)
+    if first_contact_frame is None:
+        return [(0, "Pre-contact"), (last_idx, "No contact reached")]
+
+    pre_idx = max(0, int(first_contact_frame) - 1)
+    first_idx = int(first_contact_frame)
+    if max_penetration_frame is not None and int(max_penetration_frame) > first_idx + 1:
+        growth_idx = int(round(0.5 * (first_idx + int(max_penetration_frame))))
+    else:
+        growth_idx = min(last_idx, first_idx + 1)
+    max_idx = int(max_penetration_frame) if max_penetration_frame is not None else growth_idx
+    rebound_idx = int(rebound_frame) if rebound_frame is not None else last_idx
+    settle_idx = last_idx
+
+    ordered = [
+        (pre_idx, "Pre-contact"),
+        (first_idx, "First contact"),
+        (growth_idx, "Penetration growth"),
+        (max_idx, "Max penetration"),
+        (rebound_idx, "Rebound / settle"),
+        (settle_idx, "Final settle"),
+    ]
+
+    keyframes: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for idx, label in ordered:
+        idx = int(np.clip(idx, 0, last_idx))
+        if idx in seen:
+            continue
+        seen.add(idx)
+        keyframes.append((idx, label))
+    return keyframes
 
 
 def _quat_angle_deg(q0_xyzw: np.ndarray, q1_xyzw: np.ndarray) -> float:
@@ -1942,7 +2163,6 @@ def simulate(
     trigger_snapshot: dict[str, Any] | None = None
     render_snapshot: dict[str, Any] | None = None
     parity_summary: dict[str, Any] | None = None
-    pending_snapshot_after_step = False
     pending_snapshot_substeps: int | None = None
     previous_max_external_norm = 0.0
     stop_requested = False
@@ -1957,6 +2177,19 @@ def simulate(
     if snapshot_substeps_after_trigger is None:
         snapshot_substeps_after_trigger = 0 if str(args.force_snapshot_frame) == "trigger" else 1
     snapshot_substeps_after_trigger = max(0, int(snapshot_substeps_after_trigger))
+    force_window_before = max(0, int(getattr(args, "force_window_substeps_before", 1)))
+    force_window_after = max(0, int(getattr(args, "force_window_substeps_after", 12)))
+    force_window_offsets = _force_window_key_offsets(force_window_after)
+    force_window_search_cap = max(force_window_after, 128 if (bool(args.force_include_max_penetration) or bool(args.force_include_rebound)) else force_window_after)
+    previous_step_data: dict[str, Any] | None = None
+    force_window_map: dict[int, dict[str, Any]] = {}
+    captured_offsets: set[int] = set()
+    trigger_substep_global: int | None = None
+    best_pen_snapshot: dict[str, Any] | None = None
+    best_pen_mm = -1.0
+    best_pen_offset: int | None = None
+    rebound_snapshot: dict[str, Any] | None = None
+    last_window_snapshot: dict[str, Any] | None = None
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -2050,45 +2283,80 @@ def simulate(
                         np.max(np.linalg.norm(f_external_total_np, axis=1))
                     ) if f_external_total_np.size else 0.0
                     sim_time = (frame * substeps + substep_index_in_frame) * sim_dt
+
+                    particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                    particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                    body_q_np = (
+                        state_in.body_q.numpy().astype(np.float32).copy()
+                        if state_in.body_q is not None
+                        else np.zeros((0, 7), dtype=np.float32)
+                    )
+                    body_qd_np = (
+                        state_in.body_qd.numpy().astype(np.float32).copy()
+                        if state_in.body_qd is not None
+                        else np.zeros((0, 6), dtype=np.float32)
+                    )
+
+                    current_snapshot: dict[str, Any] | None = None
+
+                    def _current_snapshot() -> dict[str, Any]:
+                        nonlocal current_snapshot
+                        if current_snapshot is None:
+                            current_snapshot = _capture_force_snapshot(
+                                frame_index=frame,
+                                substep_index_in_frame=substep_index_in_frame,
+                                global_substep_index=global_substep_index,
+                                sim_time=sim_time,
+                                sim_dt=sim_dt,
+                                particle_q=particle_q_np,
+                                particle_qd=particle_qd_np,
+                                body_q=body_q_np,
+                                body_qd=body_qd_np,
+                                particle_radius=particle_radius_diag,
+                                mass=particle_mass_diag,
+                                gravity_vec=gravity_vec_diag,
+                                f_spring=f_spring_np,
+                                f_internal_total=f_internal_total_np,
+                                f_external_total=f_external_total_np,
+                                meta=meta,
+                                force_topk=int(args.force_topk),
+                                force_eps=force_eps,
+                                topk_selector_mode=str(args.force_topk_mode),
+                                used_manual_force_path=bool(use_manual_force_path),
+                            )
+                        return current_snapshot
+
                     if (
                         trigger_snapshot is None
                         and previous_max_external_norm <= force_eps
                         and current_max_external_norm > force_eps
                     ):
-                        particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                        particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                        body_q_np = (
-                            state_in.body_q.numpy().astype(np.float32).copy()
-                            if state_in.body_q is not None
-                            else np.zeros((0, 7), dtype=np.float32)
-                        )
-                        body_qd_np = (
-                            state_in.body_qd.numpy().astype(np.float32).copy()
-                            if state_in.body_qd is not None
-                            else np.zeros((0, 6), dtype=np.float32)
-                        )
-                        trigger_snapshot = _capture_force_snapshot(
-                            frame_index=frame,
-                            substep_index_in_frame=substep_index_in_frame,
-                            global_substep_index=global_substep_index,
-                            sim_time=sim_time,
-                            sim_dt=sim_dt,
-                            particle_q=particle_q_np,
-                            particle_qd=particle_qd_np,
-                            body_q=body_q_np,
-                            body_qd=body_qd_np,
-                            particle_radius=particle_radius_diag,
-                            mass=particle_mass_diag,
-                            gravity_vec=gravity_vec_diag,
-                            f_spring=f_spring_np,
-                            f_internal_total=f_internal_total_np,
-                            f_external_total=f_external_total_np,
-                            meta=meta,
-                            force_topk=int(args.force_topk),
-                            force_eps=force_eps,
-                            topk_selector_mode=str(args.force_topk_mode),
-                            used_manual_force_path=bool(use_manual_force_path),
-                        )
+                        trigger_snapshot = _current_snapshot()
+                        trigger_substep_global = int(global_substep_index)
+                        if force_window_before > 0 and previous_step_data is not None:
+                            before_snapshot = _capture_force_snapshot(
+                                frame_index=int(previous_step_data["frame_index"]),
+                                substep_index_in_frame=int(previous_step_data["substep_index_in_frame"]),
+                                global_substep_index=int(previous_step_data["global_substep_index"]),
+                                sim_time=float(previous_step_data["sim_time"]),
+                                sim_dt=sim_dt,
+                                particle_q=np.asarray(previous_step_data["particle_q"], dtype=np.float32),
+                                particle_qd=np.asarray(previous_step_data["particle_qd"], dtype=np.float32),
+                                body_q=np.asarray(previous_step_data["body_q"], dtype=np.float32),
+                                body_qd=np.asarray(previous_step_data["body_qd"], dtype=np.float32),
+                                particle_radius=particle_radius_diag,
+                                mass=particle_mass_diag,
+                                gravity_vec=gravity_vec_diag,
+                                f_spring=np.asarray(previous_step_data["f_spring"], dtype=np.float32),
+                                f_internal_total=np.asarray(previous_step_data["f_internal_total"], dtype=np.float32),
+                                f_external_total=np.asarray(previous_step_data["f_external_total"], dtype=np.float32),
+                                meta=meta,
+                                force_topk=int(args.force_topk),
+                                force_eps=force_eps,
+                                topk_selector_mode=str(args.force_topk_mode),
+                                used_manual_force_path=bool(use_manual_force_path),
+                            )
+                            _store_force_window_snapshot(force_window_map, before_snapshot, "trigger-1")
                         if str(args.force_snapshot_frame) == "trigger":
                             if snapshot_substeps_after_trigger == 0:
                                 render_snapshot = trigger_snapshot
@@ -2099,47 +2367,54 @@ def simulate(
                                 render_snapshot = trigger_snapshot
                             else:
                                 pending_snapshot_substeps = snapshot_substeps_after_trigger
-                    elif (
-                        trigger_snapshot is not None
-                        and render_snapshot is None
-                        and pending_snapshot_substeps is not None
-                        and pending_snapshot_substeps == 0
-                    ):
-                        particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                        particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                        body_q_np = (
-                            state_in.body_q.numpy().astype(np.float32).copy()
-                            if state_in.body_q is not None
-                            else np.zeros((0, 7), dtype=np.float32)
-                        )
-                        body_qd_np = (
-                            state_in.body_qd.numpy().astype(np.float32).copy()
-                            if state_in.body_qd is not None
-                            else np.zeros((0, 6), dtype=np.float32)
-                        )
-                        render_snapshot = _capture_force_snapshot(
-                            frame_index=frame,
-                            substep_index_in_frame=substep_index_in_frame,
-                            global_substep_index=global_substep_index,
-                            sim_time=sim_time,
-                            sim_dt=sim_dt,
-                            particle_q=particle_q_np,
-                            particle_qd=particle_qd_np,
-                            body_q=body_q_np,
-                            body_qd=body_qd_np,
-                            particle_radius=particle_radius_diag,
-                            mass=particle_mass_diag,
-                            gravity_vec=gravity_vec_diag,
-                            f_spring=f_spring_np,
-                            f_internal_total=f_internal_total_np,
-                            f_external_total=f_external_total_np,
-                            meta=meta,
-                            force_topk=int(args.force_topk),
-                            force_eps=force_eps,
-                            topk_selector_mode=str(args.force_topk_mode),
-                            used_manual_force_path=bool(use_manual_force_path),
-                        )
+
+                    if trigger_snapshot is not None and trigger_substep_global is not None:
+                        offset = int(global_substep_index) - int(trigger_substep_global)
+                        if offset >= 0 and offset <= force_window_search_cap:
+                            needs_snapshot = False
+                            if offset in force_window_offsets and offset not in captured_offsets:
+                                needs_snapshot = True
+                            if render_snapshot is None and pending_snapshot_substeps is not None and pending_snapshot_substeps == 0:
+                                needs_snapshot = True
+                            if bool(args.force_include_max_penetration) or bool(args.force_include_rebound):
+                                needs_snapshot = True
+                            if needs_snapshot:
+                                snap = _current_snapshot()
+                                last_window_snapshot = snap
+                                if offset in force_window_offsets and offset not in captured_offsets:
+                                    label = "trigger" if offset == 0 else f"trigger+{int(offset)}"
+                                    _store_force_window_snapshot(force_window_map, snap, label)
+                                    captured_offsets.add(offset)
+                                if render_snapshot is None and pending_snapshot_substeps is not None and pending_snapshot_substeps == 0:
+                                    render_snapshot = snap
+                                pen_mm = _snapshot_max_penetration_mm(snap)
+                                if bool(args.force_include_max_penetration) and pen_mm > best_pen_mm:
+                                    best_pen_mm = pen_mm
+                                    best_pen_snapshot = snap
+                                    best_pen_offset = offset
+                                if (
+                                    bool(args.force_include_rebound)
+                                    and rebound_snapshot is None
+                                    and best_pen_offset is not None
+                                    and offset > best_pen_offset
+                                    and best_pen_mm > 0.0
+                                    and pen_mm <= 0.5 * best_pen_mm
+                                ):
+                                    rebound_snapshot = snap
                     previous_max_external_norm = current_max_external_norm
+                    previous_step_data = {
+                        "frame_index": int(frame),
+                        "substep_index_in_frame": int(substep_index_in_frame),
+                        "global_substep_index": int(global_substep_index),
+                        "sim_time": float(sim_time),
+                        "particle_q": particle_q_np,
+                        "particle_qd": particle_qd_np,
+                        "body_q": body_q_np,
+                        "body_qd": body_qd_np,
+                        "f_spring": f_spring_np,
+                        "f_internal_total": f_internal_total_np,
+                        "f_external_total": f_external_total_np,
+                    }
 
                 solver.integrate_particles(model, state_in, state_out, sim_dt)
                 if body_f_work is body_f:
@@ -2177,9 +2452,17 @@ def simulate(
             if pending_snapshot_substeps is not None and render_snapshot is None and pending_snapshot_substeps > 0:
                 pending_snapshot_substeps -= 1
             if force_diagnostic_enabled and trigger_snapshot is not None and bool(args.stop_after_diagnostic):
-                if render_snapshot is not None:
-                    stop_requested = True
-                    diagnostic_rollout_truncated = True
+                if trigger_substep_global is not None:
+                    post_offset = int(global_substep_index) - int(trigger_substep_global)
+                    if post_offset >= force_window_search_cap:
+                        if best_pen_snapshot is not None:
+                            _store_force_window_snapshot(force_window_map, best_pen_snapshot, "max penetration")
+                        if rebound_snapshot is not None:
+                            _store_force_window_snapshot(force_window_map, rebound_snapshot, "rebound / settle")
+                        elif bool(args.force_include_rebound) and last_window_snapshot is not None:
+                            _store_force_window_snapshot(force_window_map, last_window_snapshot, "post-contact")
+                        stop_requested = True
+                        diagnostic_rollout_truncated = True
             if stop_requested:
                 break
 
@@ -2211,22 +2494,7 @@ def simulate(
         if parity_summary is not None:
             summary_payload["parity_check"] = parity_summary
         npz_path, json_path = _write_force_diagnostic_outputs(args, trigger_snapshot, summary_payload)
-        snapshot_png_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.png"
-        snapshot_mp4_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.mp4"
         diag_snapshot = render_snapshot if render_snapshot is not None else trigger_snapshot
-        diag_frame = _make_force_diagnostic_frame(
-            model,
-            meta,
-            args,
-            device,
-            diag_snapshot,
-        )
-        _save_force_diagnostic_snapshot_frame(diag_frame, snapshot_png_path)
-        rendered_diag_video = _render_force_diagnostic_video(
-            args,
-            diag_frame,
-            snapshot_mp4_path,
-        )
         force_diagnostic = {
             "enabled": True,
             "snapshot_frame_mode": str(args.force_snapshot_frame),
@@ -2237,8 +2505,8 @@ def simulate(
             "force_eps": float(force_eps),
             "npz_path": str(npz_path),
             "summary_json_path": str(json_path),
-            "snapshot_png_path": str(snapshot_png_path),
-            "snapshot_video_path": "" if rendered_diag_video is None else str(rendered_diag_video),
+            "snapshot_png_path": "",
+            "snapshot_video_path": "",
             "contact_node_count": int(summary_payload["contact_node_count"]),
             "dominant_issue_guess": str(summary_payload["dominant_issue_guess"]),
             "topk_particle_count": int(len(summary_payload["topk_particle_records"])),
@@ -2246,6 +2514,22 @@ def simulate(
             "topk_mode": str(summary_payload.get("topk_mode", args.force_topk_mode)),
             "normal_source": str(summary_payload.get("normal_source", "")),
             "used_manual_force_path": bool(summary_payload.get("used_manual_force_path", use_manual_force_path)),
+            "render_snapshot": diag_snapshot,
+            "window_sequence": [
+                {
+                    "global_substep_index": int(substep),
+                    "label": " | ".join(item["labels"]),
+                    "max_penetration_mm": _snapshot_max_penetration_mm(item["snapshot"]),
+                }
+                for substep, item in sorted(force_window_map.items(), key=lambda kv: kv[0])
+            ],
+            "window_sequence_snapshots": [
+                {
+                    "label": " | ".join(item["labels"]),
+                    "snapshot": item["snapshot"],
+                }
+                for _, item in sorted(force_window_map.items(), key=lambda kv: kv[0])
+            ],
         }
         if parity_summary is not None:
             force_diagnostic["parity_check"] = parity_summary
@@ -2277,57 +2561,95 @@ def render_video(
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found in PATH")
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(
-        prefix=f"{out_mp4.stem}_",
-        suffix=".mp4",
-        dir="/tmp",
-    )
-    os.close(tmp_fd)
-    tmp_out_mp4 = Path(tmp_name)
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"{out_mp4.stem}_frames_", dir="/tmp"))
+    keep_dir = out_mp4.parent / f"{out_mp4.stem}_frames"
 
     import newton.viewer  # noqa: PLC0415
-
-    def _first_rigid_contact_frame() -> int | None:
-        cloth_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
-        body_q = np.asarray(sim_data["body_q"], dtype=np.float32)
-        if body_q.ndim != 3 or body_q.shape[1] == 0:
-            return None
-
-        radius = model.particle_radius.numpy().astype(np.float32)[: cloth_q.shape[1]]
-        rigid_kind = str(meta.get("rigid_shape", "bunny"))
-        if rigid_kind == "box":
-            hx, hy, hz = [float(v) for v in np.asarray(meta["box_half_extents"]).ravel()]
-            for frame_idx in range(cloth_q.shape[0]):
-                pos = body_q[frame_idx, 0, :3].astype(np.float32)
-                quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
-                rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
-                local = (cloth_q[frame_idx] - pos[None, :]) @ rot
-                sdf = _box_signed_distance(local.astype(np.float32, copy=False), hx, hy, hz)
-                if np.any(radius - sdf > 0.0):
-                    return int(frame_idx)
-            return None
-
-        faces = np.asarray(meta.get("mesh_tri_indices", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
-        verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
-        if not faces.size or not verts_local.size:
-            return None
-
-        scale = float(meta["mesh_scale"])
-        for frame_idx in range(cloth_q.shape[0]):
-            pos = body_q[frame_idx, 0, :3].astype(np.float32)
-            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
-            rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
-            verts = (verts_local * scale) @ rot.T + pos[None, :]
-            tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-            _, dist, _ = trimesh.proximity.closest_point(tri, cloth_q[frame_idx].astype(np.float64))
-            penetration = radius - dist.astype(np.float32, copy=False)
-            if np.any(penetration > 0.0):
-                return int(frame_idx)
-        return None
+    from PIL import Image  # noqa: PLC0415
 
     width = int(args.screen_width)
     height = int(args.screen_height)
     fps_out = float(args.render_fps)
+    cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
+    render_radii = compute_visual_particle_radii(
+        model.particle_radius.numpy(),
+        radius_scale=float(args.particle_radius_vis_scale),
+        radius_cap=float(args.particle_radius_vis_min),
+    )
+
+    n_sim_frames = int(sim_data["particle_q_all"].shape[0])
+    sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+    cloth_q_object = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
+    body_q_all = np.asarray(sim_data["body_q"], dtype=np.float32)
+    cloth_z = cloth_q_object[:, :, 2]
+    cloth_z_min = np.min(cloth_z, axis=1)
+    n_focus = min(48, int(cloth_q_object.shape[1]))
+    focus_world = np.zeros((n_sim_frames, 3), dtype=np.float32)
+    for frame_idx in range(n_sim_frames):
+        order = np.argsort(cloth_z[frame_idx])[:n_focus]
+        focus_world[frame_idx] = np.mean(
+            cloth_q_object[frame_idx, order].astype(np.float32, copy=False),
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+    if body_q_all.ndim == 3 and body_q_all.shape[1] > 0:
+        body_z = body_q_all[:, 0, 2].astype(np.float32, copy=False)
+    else:
+        body_z = np.zeros((n_sim_frames,), dtype=np.float32)
+    if str(meta.get("rigid_shape", "bunny")) == "box":
+        rigid_top = body_z + float(np.asarray(meta.get("box_half_extents", np.zeros(3, dtype=np.float32)))[2])
+    else:
+        rigid_top_offset = float(meta.get("bunny_top_z", 0.0)) - float(body_z[0] if body_z.size else 0.0)
+        rigid_top = body_z + rigid_top_offset
+    approx_pen_depth = np.maximum(rigid_top[:, None] - cloth_z, 0.0).astype(np.float32, copy=False)
+    penetration_max = np.max(approx_pen_depth, axis=1).astype(np.float32, copy=False)
+    penetration_p99 = np.quantile(approx_pen_depth, 0.99, axis=1).astype(np.float32, copy=False)
+    contact_frames = np.flatnonzero(penetration_max > 1.0e-8)
+    first_contact_frame = int(contact_frames[0]) if contact_frames.size else None
+    max_penetration_frame = int(np.argmax(penetration_max)) if contact_frames.size else None
+    rebound_frame = None
+    if max_penetration_frame is not None:
+        peak = float(penetration_max[max_penetration_frame])
+        for idx in range(max_penetration_frame + 1, n_sim_frames):
+            if float(penetration_max[idx]) <= 0.5 * peak:
+                rebound_frame = int(idx)
+                break
+        if rebound_frame is None:
+            rebound_frame = n_sim_frames - 1
+    rigid_focus = {
+        "focus_world": focus_world,
+        "penetration_max": penetration_max,
+        "penetration_p99": penetration_p99,
+        "first_contact_frame": first_contact_frame,
+        "max_penetration_frame": max_penetration_frame,
+        "rebound_frame": rebound_frame,
+    }
+    render_end_frame = n_sim_frames - 1
+    if first_contact_frame is not None and float(args.post_contact_video_seconds) > 0.0:
+        sim_window = float(args.post_contact_video_seconds) / max(float(args.slowdown), 1.0e-6)
+        extra_frames = int(round(sim_window / max(sim_frame_dt, 1.0e-12)))
+        render_end_frame = min(n_sim_frames - 1, int(first_contact_frame) + max(0, extra_frames))
+
+    story_keyframes = _build_process_story_keyframes(
+        n_frames=render_end_frame + 1,
+        first_contact_frame=first_contact_frame,
+        max_penetration_frame=max_penetration_frame,
+        rebound_frame=rebound_frame,
+    )
+    hold_frames = max(1, int(round(max(float(args.process_stage_hold_seconds), 1.0e-3) * fps_out)))
+    n_out_frames = max(1, len(story_keyframes) * hold_frames)
+    video_duration = float(n_out_frames) / max(fps_out, 1.0)
+
+    sim_data["first_rigid_contact_frame"] = -1 if first_contact_frame is None else int(first_contact_frame)
+    sim_data["render_end_frame"] = int(render_end_frame)
+    sim_data["rendered_frame_count"] = int(n_out_frames)
+    sim_data["video_duration_target_sec"] = float(video_duration)
+
+    mass_label = (
+        f"CLOTH TOTAL MASS: {float(meta.get('total_object_mass', 0.0)):.3g} kg"
+        f" | BUNNY MASS: {float(args.rigid_mass):.3g} kg"
+    )
+
     cmd = [
         ffmpeg,
         "-y",
@@ -2350,10 +2672,11 @@ def render_video(
         "18",
         "-pix_fmt",
         "yuv420p",
-        str(tmp_out_mp4),
+        str(out_mp4),
     ]
 
     viewer = newton.viewer.ViewerGL(width=width, height=height, vsync=False, headless=bool(args.viewer_headless))
+    ffmpeg_proc = None
     try:
         viewer.set_model(model)
         viewer.show_particles = True
@@ -2368,19 +2691,11 @@ def render_video(
             viewer.camera.fov = float(args.camera_fov)
         except Exception:
             pass
-        cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
         viewer.set_camera(
             wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])),
             float(args.camera_pitch),
             float(args.camera_yaw),
         )
-
-        render_radii = compute_visual_particle_radii(
-            model.particle_radius.numpy(),
-            radius_scale=float(args.particle_radius_vis_scale),
-            radius_cap=float(args.particle_radius_vis_min),
-        )
-
         try:
             apply_viewer_shape_colors(
                 viewer,
@@ -2399,7 +2714,6 @@ def render_video(
         cloth_edges = np.asarray(meta["render_edges"], dtype=np.int32)
         starts_wp = wp.empty(len(cloth_edges), dtype=wp.vec3, device=device) if cloth_edges.size else None
         ends_wp = wp.empty(len(cloth_edges), dtype=wp.vec3, device=device) if cloth_edges.size else None
-
         state = model.state()
         if state.particle_qd is not None:
             state.particle_qd.zero_()
@@ -2408,46 +2722,16 @@ def render_video(
 
         with temporary_particle_radius_override(model, render_radii):
             ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-            n_sim_frames = int(sim_data["particle_q_all"].shape[0])
-            sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
-            first_contact_frame = _first_rigid_contact_frame()
-            rigid_focus = _compute_rigid_focus_metrics(
-                np.asarray(sim_data["particle_q_object"], dtype=np.float32),
-                np.asarray(sim_data["body_q"], dtype=np.float32),
-                meta,
-                model.particle_radius.numpy().astype(np.float32)[: int(sim_data["particle_q_object"].shape[1])],
-            )
-            render_end_frame = n_sim_frames - 1
-            if first_contact_frame is not None and float(args.post_contact_video_seconds) > 0.0:
-                sim_window = float(args.post_contact_video_seconds) / max(float(args.slowdown), 1.0e-6)
-                extra_frames = int(round(sim_window / max(sim_frame_dt, 1.0e-12)))
-                render_end_frame = min(n_sim_frames - 1, int(first_contact_frame) + max(0, extra_frames))
-            sim_duration = max(float(render_end_frame) * sim_frame_dt, 0.0)
-            video_duration = sim_duration * max(float(args.slowdown), 1.0e-6)
-            n_out_frames = max(1, int(round(video_duration * fps_out)))
-            if n_out_frames == 1 or sim_duration <= 0.0:
-                render_indices = np.zeros((1,), dtype=np.int32)
-            else:
-                sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
-                render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, render_end_frame)
-
-            sim_data["first_rigid_contact_frame"] = -1 if first_contact_frame is None else int(first_contact_frame)
-            sim_data["render_end_frame"] = int(render_end_frame)
-            sim_data["rendered_frame_count"] = int(n_out_frames)
-            sim_data["video_duration_target_sec"] = float(video_duration)
-
-            mass_label = (
-                f"CLOTH TOTAL MASS: {float(meta.get('total_object_mass', 0.0)):.3g} kg"
-                f" | BUNNY MASS: {float(args.rigid_mass):.3g} kg"
-            )
-            for out_idx, sim_idx in enumerate(render_indices):
+            out_idx = 0
+            for stage_idx, (sim_idx, stage_label) in enumerate(story_keyframes):
+                sim_idx = int(sim_idx)
                 state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
-                state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
+                if state.body_q is not None and sim_data["body_q"].shape[1] > 0:
+                    state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
 
                 sim_t = float(sim_idx) * sim_frame_dt
                 viewer.begin_frame(sim_t)
                 viewer.log_state(state)
-
                 if args.render_springs and cloth_edges.size and starts_wp is not None and ends_wp is not None:
                     q_obj = sim_data["particle_q_object"][sim_idx]
                     starts_wp.assign(q_obj[cloth_edges[:, 0]].astype(np.float32, copy=False))
@@ -2460,9 +2744,9 @@ def render_video(
                         width=0.01,
                         hidden=False,
                     )
-
                 viewer.end_frame()
                 frame = viewer.get_frame(render_ui=False).numpy()
+
                 focus_px = _project_world_to_screen(
                     np.asarray(rigid_focus["focus_world"], dtype=np.float32)[sim_idx],
                     cam_pos=cam_pos,
@@ -2472,18 +2756,8 @@ def render_video(
                     width=width,
                     height=height,
                 )
-                frame = _overlay_zoom_panel_rgb(
-                    frame,
-                    center_px=focus_px,
-                    label="contact zoom",
-                )
+                frame = _overlay_zoom_panel_rgb(frame, center_px=focus_px, label="contact zoom")
                 if args.overlay_label:
-                    stage_label = _stage_label_for_frame(
-                        int(sim_idx),
-                        first_contact_frame=rigid_focus["first_contact_frame"],
-                        max_penetration_frame=rigid_focus["max_penetration_frame"],
-                        rebound_frame=rigid_focus["rebound_frame"],
-                    )
                     pmax = float(np.asarray(rigid_focus["penetration_max"], dtype=np.float32)[sim_idx]) * 1000.0
                     pp99 = float(np.asarray(rigid_focus["penetration_p99"], dtype=np.float32)[sim_idx]) * 1000.0
                     frame = overlay_text_lines_rgb(
@@ -2494,25 +2768,56 @@ def render_video(
                             mass_label,
                             f"stage = {stage_label}",
                             f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
-                            f"max_pen = {pmax:.3f} mm  p99_pen = {pp99:.3f} mm",
+                            f"approx_pen = {pmax:.3f} mm  p99_pen = {pp99:.3f} mm",
                         ],
                         font_size=int(args.label_font_size),
                     )
+                frame = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8))
+
+                if bool(args.keep_render_frames):
+                    stage_path = tmp_dir / f"stage_{stage_idx:03d}.png"
+                    Image.fromarray(frame, mode="RGB").save(stage_path)
+
                 assert ffmpeg_proc.stdin is not None
-                ffmpeg_proc.stdin.write(frame.tobytes())
+                payload = frame.tobytes()
+                for _ in range(hold_frames):
+                    if bool(args.keep_render_frames):
+                        frame_path = tmp_dir / f"frame_{out_idx:05d}.png"
+                        Image.fromarray(frame, mode="RGB").save(frame_path)
+                    ffmpeg_proc.stdin.write(payload)
+                    out_idx += 1
 
             assert ffmpeg_proc.stdin is not None
             ffmpeg_proc.stdin.close()
             if ffmpeg_proc.wait() != 0:
-                raise RuntimeError("ffmpeg failed")
-            tmp_out_mp4.replace(out_mp4)
+                raise RuntimeError("ffmpeg failed while encoding process video")
+            ffmpeg_proc = None
     finally:
+        if ffmpeg_proc is not None:
+            try:
+                if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
+                    ffmpeg_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                ffmpeg_proc.wait(timeout=1.0)
+            except Exception:
+                pass
         try:
             viewer.close()
         except Exception:
             pass
-        if tmp_out_mp4.exists():
-            tmp_out_mp4.unlink()
+        if bool(args.keep_render_frames):
+            try:
+                if keep_dir.exists():
+                    shutil.rmtree(keep_dir)
+                shutil.copytree(tmp_dir, keep_dir)
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(tmp_dir)
+        except Exception:
+            pass
     print(f"  Video saved: {out_mp4}", flush=True)
     return out_mp4
 
@@ -2750,6 +3055,8 @@ def build_summary(
                 "force_diagnostic_summary_json": str(force_diagnostic.get("summary_json_path", "")),
                 "force_diagnostic_snapshot_png": str(force_diagnostic.get("snapshot_png_path", "")),
                 "force_diagnostic_snapshot_video": str(force_diagnostic.get("snapshot_video_path", "")),
+                "force_diagnostic_window_video": str(force_diagnostic.get("window_video_path", "")),
+                "force_diagnostic_window_keyframe_count": int(len(force_diagnostic.get("window_sequence", []))),
                 "rollout_truncated_for_force_diagnostic": bool(
                     force_diagnostic.get("rollout_truncated", False)
                 ),
@@ -2817,26 +3124,58 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
     print("Running simulation (off)...", flush=True)
     sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
 
-    scene_npz = save_scene_npz(args, sim_data, meta, n_obj)
+    render_sim_data = sim_data
+    if bool(args.force_diagnostic) and not bool(args.skip_render):
+        print("Running separate baseline rollout for process video...", flush=True)
+        render_args = copy.deepcopy(args)
+        render_args.force_diagnostic = False
+        render_args.stop_after_diagnostic = False
+        render_args.parity_check = False
+        model_render, meta_render, n_obj_render = build_model(ir_obj, render_args, device)
+        render_sim_data = simulate(model_render, ir_obj, meta_render, render_args, n_obj_render, device)
+        render_sim_data["force_diagnostic"] = sim_data.get("force_diagnostic")
+        model_for_io = model_render
+        meta_for_io = meta_render
+        n_obj_for_io = n_obj_render
+    else:
+        model_for_io = model
+        meta_for_io = meta
+        n_obj_for_io = n_obj
+
+    scene_npz = save_scene_npz(args, render_sim_data, meta_for_io, n_obj_for_io)
     print(f"  Scene NPZ: {scene_npz}", flush=True)
 
     out_mp4: Path | None = None
-    skip_full_rollout_render = bool(args.force_diagnostic) and bool(args.stop_after_diagnostic)
-    if skip_full_rollout_render and not bool(args.skip_render):
-        print("Skipping full rollout video because --stop-after-diagnostic is active.", flush=True)
-    if not bool(args.skip_render) and not skip_full_rollout_render:
+    if not bool(args.skip_render):
         print("Rendering video...", flush=True)
         out_mp4 = args.out_dir / f"{args.prefix}_{_mass_tag(args.rigid_mass)}.mp4"
         out_mp4.parent.mkdir(parents=True, exist_ok=True)
-        render_video(model, sim_data, meta, args, device, out_mp4)
+        render_video(model_for_io, render_sim_data, meta_for_io, args, device, out_mp4)
+
+    force_diagnostic = sim_data.get("force_diagnostic")
+    if isinstance(force_diagnostic, dict) and bool(force_diagnostic.get("enabled", False)):
+        diag_snapshot = force_diagnostic.pop("render_snapshot", None)
+        sequence_snapshots = force_diagnostic.pop("window_sequence_snapshots", None)
+        if isinstance(diag_snapshot, dict):
+            snapshot_png_path, rendered_snapshot_video, rendered_sequence_video = _finalize_force_diagnostic_artifacts(
+                model,
+                meta,
+                args,
+                device,
+                diag_snapshot,
+                sequence_snapshots,
+            )
+            force_diagnostic["snapshot_png_path"] = str(snapshot_png_path)
+            force_diagnostic["snapshot_video_path"] = "" if rendered_snapshot_video is None else str(rendered_snapshot_video)
+            force_diagnostic["window_video_path"] = "" if rendered_sequence_video is None else str(rendered_sequence_video)
 
     summary = build_summary(
-        model,
+        model_for_io,
         args,
         ir_obj,
-        sim_data,
-        meta,
-        n_obj,
+        render_sim_data,
+        meta_for_io,
+        n_obj_for_io,
         out_mp4,
         particle_contacts_enabled=False,
         disable_particle_contact_kernel=True,
