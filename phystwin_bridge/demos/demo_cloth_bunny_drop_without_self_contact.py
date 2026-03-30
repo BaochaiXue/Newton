@@ -306,6 +306,12 @@ def parse_args() -> argparse.Namespace:
         help="Choose whether the rendered diagnostic snapshot uses the trigger substep or the immediately following substep.",
     )
     p.add_argument(
+        "--force-video-seconds",
+        type=float,
+        default=2.0,
+        help="If > 0, also encode a short static diagnostic video clip from the selected force snapshot.",
+    )
+    p.add_argument(
         "--stop-after-diagnostic",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1023,21 +1029,24 @@ def _write_force_diagnostic_outputs(
     return npz_path, json_path
 
 
-def _render_force_diagnostic_snapshot(
+def _make_force_diagnostic_frame(
     model: newton.Model,
     meta: dict[str, Any],
     args: argparse.Namespace,
     device: str,
     snapshot: dict[str, Any],
-    out_path: Path,
-) -> Path:
+    *,
+    save_png_path: Path | None = None,
+) -> np.ndarray:
     import newton.viewer  # noqa: PLC0415
     from PIL import Image  # noqa: PLC0415
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if save_png_path is not None:
+        save_png_path.parent.mkdir(parents=True, exist_ok=True)
     width = int(args.screen_width)
     height = int(args.screen_height)
     viewer = newton.viewer.ViewerGL(width=width, height=height, vsync=False, headless=True)
+    frame_out: np.ndarray | None = None
     try:
         viewer.set_model(model)
         viewer.show_particles = True
@@ -1204,12 +1213,78 @@ def _render_force_diagnostic_snapshot(
                 ],
                 font_size=int(args.label_font_size),
             )
-            Image.fromarray(frame, mode="RGB").save(out_path)
+            frame_out = np.asarray(frame, dtype=np.uint8)
+            if save_png_path is not None:
+                Image.fromarray(frame_out, mode="RGB").save(save_png_path)
     finally:
         try:
             viewer.close()
         except Exception:
             pass
+    if frame_out is None:
+        raise RuntimeError("Force diagnostic frame was not captured.")
+    return frame_out
+
+
+def _save_force_diagnostic_snapshot_frame(frame: np.ndarray, out_path: Path) -> Path:
+    from PIL import Image  # noqa: PLC0415
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.asarray(frame, dtype=np.uint8), mode="RGB").save(out_path)
+    return out_path
+
+
+def _render_force_diagnostic_video(
+    args: argparse.Namespace,
+    frame: np.ndarray,
+    out_path: Path,
+) -> Path | None:
+    if float(args.force_video_seconds) <= 0.0:
+        return None
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg not found in PATH")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fps = max(float(args.render_fps), 1.0)
+    frame_count = max(1, int(round(float(args.force_video_seconds) * fps)))
+    frame = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8))
+    height, width, _ = frame.shape
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        str(out_path),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    try:
+        payload = frame.tobytes()
+        for _ in range(frame_count):
+            proc.stdin.write(payload)
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed while encoding force diagnostic video")
+    finally:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
     return out_path
 
 
@@ -1805,13 +1880,20 @@ def simulate(
             summary_payload["parity_check"] = parity_summary
         npz_path, json_path = _write_force_diagnostic_outputs(args, trigger_snapshot, summary_payload)
         snapshot_png_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.png"
-        _render_force_diagnostic_snapshot(
+        snapshot_mp4_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.mp4"
+        diag_snapshot = render_snapshot if render_snapshot is not None else trigger_snapshot
+        diag_frame = _make_force_diagnostic_frame(
             model,
             meta,
             args,
             device,
-            render_snapshot if render_snapshot is not None else trigger_snapshot,
-            snapshot_png_path,
+            diag_snapshot,
+        )
+        _save_force_diagnostic_snapshot_frame(diag_frame, snapshot_png_path)
+        rendered_diag_video = _render_force_diagnostic_video(
+            args,
+            diag_frame,
+            snapshot_mp4_path,
         )
         force_diagnostic = {
             "enabled": True,
@@ -1823,6 +1905,7 @@ def simulate(
             "npz_path": str(npz_path),
             "summary_json_path": str(json_path),
             "snapshot_png_path": str(snapshot_png_path),
+            "snapshot_video_path": "" if rendered_diag_video is None else str(rendered_diag_video),
             "contact_node_count": int(summary_payload["contact_node_count"]),
             "dominant_issue_guess": str(summary_payload["dominant_issue_guess"]),
             "topk_particle_count": int(len(summary_payload["topk_particle_records"])),
@@ -2300,6 +2383,7 @@ def build_summary(
                 "force_diagnostic_npz": str(force_diagnostic.get("npz_path", "")),
                 "force_diagnostic_summary_json": str(force_diagnostic.get("summary_json_path", "")),
                 "force_diagnostic_snapshot_png": str(force_diagnostic.get("snapshot_png_path", "")),
+                "force_diagnostic_snapshot_video": str(force_diagnostic.get("snapshot_video_path", "")),
                 "rollout_truncated_for_force_diagnostic": bool(
                     force_diagnostic.get("rollout_truncated", False)
                 ),
