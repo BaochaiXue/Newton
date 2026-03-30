@@ -306,6 +306,15 @@ def parse_args() -> argparse.Namespace:
         help="Choose whether the rendered diagnostic snapshot uses the trigger substep or the immediately following substep.",
     )
     p.add_argument(
+        "--force-snapshot-substeps-after-trigger",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for how many simulation substeps after the first-contact trigger "
+            "to capture the rendered diagnostic snapshot. If omitted, follow --force-snapshot-frame."
+        ),
+    )
+    p.add_argument(
         "--force-video-seconds",
         type=float,
         default=2.0,
@@ -1045,6 +1054,11 @@ def _make_force_diagnostic_frame(
         save_png_path.parent.mkdir(parents=True, exist_ok=True)
     width = int(args.screen_width)
     height = int(args.screen_height)
+    snapshot_substeps_after_trigger = getattr(args, "force_snapshot_substeps_after_trigger", None)
+    if snapshot_substeps_after_trigger is None:
+        snapshot_label = str(args.force_snapshot_frame)
+    else:
+        snapshot_label = f"trigger_plus_{int(snapshot_substeps_after_trigger)}"
     viewer = newton.viewer.ViewerGL(width=width, height=height, vsync=False, headless=True)
     frame_out: np.ndarray | None = None
     try:
@@ -1205,7 +1219,7 @@ def _make_force_diagnostic_frame(
                 frame,
                 [
                     "FORCE DIAGNOSTIC SNAPSHOT",
-                    f"snapshot = {args.force_snapshot_frame}",
+                    f"snapshot = {snapshot_label}",
                     f"trigger substep = {int(snapshot['global_substep_index'])}",
                     "white=normal red=external purple=internal green=acceleration",
                     "gray=closest->particle | lengths normalized per family",
@@ -1628,6 +1642,7 @@ def simulate(
     render_snapshot: dict[str, Any] | None = None
     parity_summary: dict[str, Any] | None = None
     pending_snapshot_after_step = False
+    pending_snapshot_substeps: int | None = None
     previous_max_external_norm = 0.0
     stop_requested = False
     diagnostic_rollout_truncated = False
@@ -1637,6 +1652,10 @@ def simulate(
     gravity_vec_diag = np.asarray(gravity_vec, dtype=np.float32).reshape(3)
     if force_diagnostic_enabled:
         _resolve_force_dump_dir(args).mkdir(parents=True, exist_ok=True)
+    snapshot_substeps_after_trigger = getattr(args, "force_snapshot_substeps_after_trigger", None)
+    if snapshot_substeps_after_trigger is None:
+        snapshot_substeps_after_trigger = 0 if str(args.force_snapshot_frame) == "trigger" else 1
+    snapshot_substeps_after_trigger = max(0, int(snapshot_substeps_after_trigger))
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -1770,9 +1789,55 @@ def simulate(
                             used_manual_force_path=bool(use_manual_force_path),
                         )
                         if str(args.force_snapshot_frame) == "trigger":
-                            render_snapshot = trigger_snapshot
+                            if snapshot_substeps_after_trigger == 0:
+                                render_snapshot = trigger_snapshot
+                            else:
+                                pending_snapshot_substeps = snapshot_substeps_after_trigger
                         else:
-                            pending_snapshot_after_step = True
+                            if snapshot_substeps_after_trigger == 0:
+                                render_snapshot = trigger_snapshot
+                            else:
+                                pending_snapshot_substeps = snapshot_substeps_after_trigger
+                    elif (
+                        trigger_snapshot is not None
+                        and render_snapshot is None
+                        and pending_snapshot_substeps is not None
+                        and pending_snapshot_substeps == 0
+                    ):
+                        particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        body_q_np = (
+                            state_in.body_q.numpy().astype(np.float32).copy()
+                            if state_in.body_q is not None
+                            else np.zeros((0, 7), dtype=np.float32)
+                        )
+                        body_qd_np = (
+                            state_in.body_qd.numpy().astype(np.float32).copy()
+                            if state_in.body_qd is not None
+                            else np.zeros((0, 6), dtype=np.float32)
+                        )
+                        render_snapshot = _capture_force_snapshot(
+                            frame_index=frame,
+                            substep_index_in_frame=substep_index_in_frame,
+                            global_substep_index=global_substep_index,
+                            sim_time=sim_time,
+                            sim_dt=sim_dt,
+                            particle_q=particle_q_np,
+                            particle_qd=particle_qd_np,
+                            body_q=body_q_np,
+                            body_qd=body_qd_np,
+                            particle_radius=particle_radius_diag,
+                            mass=particle_mass_diag,
+                            gravity_vec=gravity_vec_diag,
+                            f_spring=f_spring_np,
+                            f_internal_total=f_internal_total_np,
+                            f_external_total=f_external_total_np,
+                            meta=meta,
+                            force_topk=int(args.force_topk),
+                            force_eps=force_eps,
+                            topk_selector_mode=str(args.force_topk_mode),
+                            used_manual_force_path=bool(use_manual_force_path),
+                        )
                     previous_max_external_norm = current_max_external_norm
 
                 solver.integrate_particles(model, state_in, state_out, sim_dt)
@@ -1808,42 +1873,8 @@ def simulate(
                     )
 
             global_substep_index += 1
-            if pending_snapshot_after_step and trigger_snapshot is not None and render_snapshot is None:
-                particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                particle_qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=False)[:n_obj].copy()
-                body_q_np = (
-                    state_in.body_q.numpy().astype(np.float32).copy()
-                    if state_in.body_q is not None
-                    else np.zeros((0, 7), dtype=np.float32)
-                )
-                body_qd_np = (
-                    state_in.body_qd.numpy().astype(np.float32).copy()
-                    if state_in.body_qd is not None
-                    else np.zeros((0, 6), dtype=np.float32)
-                )
-                render_snapshot = _capture_force_snapshot(
-                    frame_index=frame,
-                    substep_index_in_frame=substep_index_in_frame + 1,
-                    global_substep_index=global_substep_index,
-                    sim_time=(frame * substeps + substep_index_in_frame + 1) * sim_dt,
-                    sim_dt=sim_dt,
-                    particle_q=particle_q_np,
-                    particle_qd=particle_qd_np,
-                    body_q=body_q_np,
-                    body_qd=body_qd_np,
-                    particle_radius=particle_radius_diag,
-                    mass=particle_mass_diag,
-                    gravity_vec=gravity_vec_diag,
-                    f_spring=trigger_snapshot["f_spring"],
-                    f_internal_total=trigger_snapshot["f_internal_total"],
-                    f_external_total=trigger_snapshot["f_external_total"],
-                    meta=meta,
-                    force_topk=int(args.force_topk),
-                    force_eps=force_eps,
-                    topk_selector_mode=str(args.force_topk_mode),
-                    used_manual_force_path=bool(use_manual_force_path),
-                )
-                pending_snapshot_after_step = False
+            if pending_snapshot_substeps is not None and render_snapshot is None and pending_snapshot_substeps > 0:
+                pending_snapshot_substeps -= 1
             if force_diagnostic_enabled and trigger_snapshot is not None and bool(args.stop_after_diagnostic):
                 if render_snapshot is not None:
                     stop_requested = True
@@ -1898,6 +1929,7 @@ def simulate(
         force_diagnostic = {
             "enabled": True,
             "snapshot_frame_mode": str(args.force_snapshot_frame),
+            "snapshot_substeps_after_trigger": int(snapshot_substeps_after_trigger),
             "trigger_substep_global": int(trigger_snapshot["global_substep_index"]),
             "trigger_frame_index": int(trigger_snapshot["frame_index"]),
             "trigger_substep_index_in_frame": int(trigger_snapshot["substep_index_in_frame"]),
@@ -2360,6 +2392,9 @@ def build_summary(
             {
                 "force_diagnostic_enabled": bool(force_diagnostic.get("enabled", False)),
                 "force_snapshot_frame_mode": str(force_diagnostic.get("snapshot_frame_mode", "trigger")),
+                "force_snapshot_substeps_after_trigger": int(
+                    force_diagnostic.get("snapshot_substeps_after_trigger", 0)
+                ),
                 "force_diagnostic_trigger_substep_global": int(
                     force_diagnostic.get("trigger_substep_global", -1)
                 ),
