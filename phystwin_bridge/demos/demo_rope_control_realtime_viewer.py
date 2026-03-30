@@ -93,6 +93,16 @@ PROFILE_GROUPS = {
 }
 
 
+@wp.kernel
+def _gather_indexed_positions(
+    particle_q: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    out_q: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    out_q[tid] = particle_q[indices[tid]]
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = newton.examples.create_parser()
     parser.description = "Realtime Newton viewer for the original PhysTwin rope controller trajectory."
@@ -129,10 +139,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--steps-per-render",
         type=int,
-        default=1,
+        default=667,
         help=(
-            "Physics substeps advanced before each viewer draw. Keep this small to "
-            "preserve responsiveness while leaving dt and controller interpolation unchanged."
+            "Physics substeps advanced before each viewer draw. Defaults to 667 so the "
+            "viewer pacing matches the PhysTwin interactive playground baseline."
         ),
     )
     parser.add_argument(
@@ -290,8 +300,6 @@ class NewtonRopeControlViewer:
             if self.args.segment_substeps is not None
             else max(1, int(newton_import_ir.ir_scalar(self.ir, "sim_substeps")))
         )
-        self.steps_per_render = max(1, int(self.args.steps_per_render))
-
         traj = np.asarray(self.ir["controller_traj"], dtype=np.float32)
         if self.args.trajectory_frame_limit is not None:
             limit = max(1, min(int(self.args.trajectory_frame_limit), int(traj.shape[0])))
@@ -301,6 +309,8 @@ class NewtonRopeControlViewer:
         self.n_obj = int(np.asarray(self.ir["num_object_points"]).ravel()[0])
         self.n_traj_frames = int(self.ctrl_traj.shape[0])
         self.total_substeps = max(0, (self.n_traj_frames - 1) * self.segment_substeps)
+        self.total_sim_duration = float(self.total_substeps) * float(self.sim_dt)
+        self.steps_per_render = max(1, int(self.args.steps_per_render))
 
         self.cfg = newton_import_ir.SimConfig(
             ir_path=self.args.ir.resolve(),
@@ -380,6 +390,20 @@ class NewtonRopeControlViewer:
             device=self.device,
         )
         self._particle_radius_mode = "physical"
+        self._controller_point_radius = max(float(self.args.particle_radius_vis_cap) * 1.6, 0.012)
+        self._controller_points_wp = wp.empty(self.ctrl_idx.size, dtype=wp.vec3, device=self.device)
+        self._controller_point_radii_wp = wp.full(
+            self.ctrl_idx.size,
+            value=float(self._controller_point_radius),
+            dtype=wp.float32,
+            device=self.device,
+        )
+        self._controller_point_colors_wp = wp.full(
+            self.ctrl_idx.size,
+            value=wp.vec3(0.98, 0.35, 0.22),
+            dtype=wp.vec3,
+            device=self.device,
+        )
 
         self.pending_reset = False
         self.finished = False
@@ -388,6 +412,10 @@ class NewtonRopeControlViewer:
         self.frame_index = 0
         self.last_step_wall_ms = 0.0
         self.last_render_wall_ms = 0.0
+        self._wall_start_time = time.perf_counter()
+        self._render_frame_count = 0
+        self._last_render_end_time = self._wall_start_time
+        self._viewer_fps_ema = 0.0
         self.profile_enabled = False
         self.profile_mode = str(self.args.profile_mode)
         self._profile_run_samples: dict[str, list[float]] = {}
@@ -395,6 +423,7 @@ class NewtonRopeControlViewer:
         self._configure_viewer()
         if hasattr(self.viewer, "register_ui_callback"):
             self.viewer.register_ui_callback(self.render_ui, position="side")
+            self.viewer.register_ui_callback(self.render_overlay_ui, position="free")
 
         print("Newton rope realtime viewer controls:")
         print("- Space: pause / resume (built into ViewerGL)")
@@ -425,6 +454,11 @@ class NewtonRopeControlViewer:
                 float(self.args.camera_pitch),
                 float(self.args.camera_yaw),
             )
+        except Exception:
+            pass
+        try:
+            if hasattr(self.viewer, "renderer") and hasattr(self.viewer.renderer, "set_title"):
+                self.viewer.renderer.set_title("Newton Rope Replay")
         except Exception:
             pass
 
@@ -567,6 +601,30 @@ class NewtonRopeControlViewer:
         frame = min(self.global_substep // self.segment_substeps + 1, self.n_traj_frames - 1)
         sub = self.global_substep % self.segment_substeps
         return int(frame), int(sub)
+
+    def _wall_elapsed_sec(self) -> float:
+        return max(float(time.perf_counter() - self._wall_start_time), 1.0e-8)
+
+    def _effective_live_rtf(self) -> float:
+        wall = self._wall_elapsed_sec()
+        if wall <= 1.0e-8:
+            return 0.0
+        return float(self.sim_time) / wall
+
+    def _viewer_fps(self) -> float:
+        wall = self._wall_elapsed_sec()
+        if wall <= 1.0e-8:
+            return 0.0
+        return float(self._render_frame_count) / wall
+
+    def _substeps_per_sec(self) -> float:
+        wall = self._wall_elapsed_sec()
+        if wall <= 1.0e-8:
+            return 0.0
+        return float(self.global_substep) / wall
+
+    def _is_realtime_now(self) -> bool:
+        return bool(self._effective_live_rtf() >= 1.0)
 
     def _write_controller_state(self) -> None:
         if self.controller_write_mode == "precomputed":
@@ -742,10 +800,41 @@ class NewtonRopeControlViewer:
         self._ensure_visual_particle_radius()
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_in)
+        wp.launch(
+            _gather_indexed_positions,
+            dim=self.ctrl_idx.size,
+            inputs=[self.state_in.particle_q, self.ctrl_idx_wp, self._controller_points_wp],
+            device=self.device,
+        )
+        self.viewer.log_points(
+            "/demo/controller_points",
+            self._controller_points_wp,
+            self._controller_point_radii_wp,
+            self._controller_point_colors_wp,
+            hidden=False,
+        )
         self.viewer.end_frame()
         self._ensure_physical_particle_radius()
         wp.synchronize_device(self.device)
-        self.last_render_wall_ms = 1000.0 * (time.perf_counter() - t0)
+        now = time.perf_counter()
+        self.last_render_wall_ms = 1000.0 * (now - t0)
+        if self._render_frame_count > 0:
+            dt = max(now - self._last_render_end_time, 1.0e-8)
+            inst_fps = 1.0 / dt
+            if self._viewer_fps_ema <= 0.0:
+                self._viewer_fps_ema = inst_fps
+            else:
+                self._viewer_fps_ema = 0.9 * self._viewer_fps_ema + 0.1 * inst_fps
+        self._last_render_end_time = now
+        self._render_frame_count += 1
+        try:
+            if hasattr(self.viewer, "renderer") and hasattr(self.viewer.renderer, "set_title"):
+                realtime_text = "YES" if self._is_realtime_now() else "NO"
+                self.viewer.renderer.set_title(
+                    f"Newton Rope Replay | REALTIME {realtime_text} | FPS {self._viewer_fps():.1f} | RTF {self._effective_live_rtf():.2f}x"
+                )
+        except Exception:
+            pass
 
     def _reset_runtime(self) -> None:
         self.state_in = self.model.state()
@@ -762,6 +851,10 @@ class NewtonRopeControlViewer:
         self.finished = False
         self.pending_reset = False
         self._particle_radius_mode = "physical"
+        self._wall_start_time = time.perf_counter()
+        self._render_frame_count = 0
+        self._last_render_end_time = self._wall_start_time
+        self._viewer_fps_ema = 0.0
 
     def render_ui(self, imgui) -> None:
         if not getattr(self.viewer, "ui", None) or not self.viewer.ui.is_available:
@@ -774,12 +867,21 @@ class NewtonRopeControlViewer:
             imgui.text("Backend: Newton only")
             imgui.text(f"IR: {Path(self.args.ir).name}")
             imgui.text(f"runtime_device: {self.device}")
+            imgui.text(f"controller_write_mode: {self.controller_write_mode}")
+            imgui.text(f"controller_count: {self.ctrl_idx.size}")
             imgui.text(f"trajectory frame: {frame}/{max(0, self.n_traj_frames - 1)}")
             imgui.text(f"segment substep: {sub}/{max(0, self.segment_substeps - 1)}")
             imgui.text(f"global_substep: {self.global_substep}/{self.total_substeps}")
             imgui.text(f"finished: {self.finished}")
             imgui.separator()
             imgui.text(f"sim_dt: {self.sim_dt:.2e}")
+            imgui.text(f"sim_time: {self.sim_time:.3f} / {self.total_sim_duration:.3f} s")
+            imgui.text(f"wall_elapsed: {self._wall_elapsed_sec():.3f} s")
+            imgui.text(f"effective RTF: {self._effective_live_rtf():.3f}x")
+            imgui.text(f"REALTIME NOW: {'YES' if self._is_realtime_now() else 'NO'}")
+            imgui.text(f"viewer FPS(avg): {self._viewer_fps():.2f}")
+            imgui.text(f"viewer FPS(ema): {self._viewer_fps_ema:.2f}")
+            imgui.text(f"substeps/s: {self._substeps_per_sec():.1f}")
             imgui.text(f"steps_per_render: {self.steps_per_render}")
             imgui.text(f"sim time / viewer frame: {self.sim_dt * self.steps_per_render:.3e} s")
             imgui.text(f"last step wall time: {self.last_step_wall_ms:.2f} ms")
@@ -796,6 +898,39 @@ class NewtonRopeControlViewer:
                 self.pending_reset = True
             imgui.text("Space: pause/resume")
             imgui.text("H: toggle UI, F: frame camera, ESC: quit")
+        imgui.end()
+
+    def render_overlay_ui(self, imgui) -> None:
+        if not getattr(self.viewer, "ui", None) or not self.viewer.ui.is_available:
+            return
+
+        frame, sub = self._trajectory_progress()
+        flags = (
+            imgui.WindowFlags_.no_resize.value
+            | imgui.WindowFlags_.no_move.value
+            | imgui.WindowFlags_.always_auto_resize.value
+        )
+        imgui.set_next_window_pos(imgui.ImVec2(18, 18), imgui.Cond_.always)
+        if imgui.begin("Replay Stats", flags=flags):
+            imgui.text("Rope object replay in Newton")
+            imgui.text("This is NOT the raw hand video")
+            imgui.text("Red points = controller particles")
+            imgui.text(f"controller mode: {self.controller_write_mode}")
+            imgui.text(f"traj frame/sub: {frame}/{max(0, self.n_traj_frames - 1)}  |  {sub}/{max(0, self.segment_substeps - 1)}")
+            imgui.text(f"sim time: {self.sim_time:.3f} / {self.total_sim_duration:.3f} s")
+            imgui.text(f"wall elapsed: {self._wall_elapsed_sec():.3f} s")
+            imgui.text(f"effective RTF: {self._effective_live_rtf():.3f}x")
+            imgui.text(f"viewer FPS(avg/ema): {self._viewer_fps():.1f} / {self._viewer_fps_ema:.1f}")
+            imgui.text(f"substeps/s: {self._substeps_per_sec():.1f}")
+            imgui.text(f"step ms: {self.last_step_wall_ms:.2f}  render ms: {self.last_render_wall_ms:.2f}")
+            if self._is_realtime_now():
+                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.28, 0.92, 0.40, 1.0))
+                imgui.text("REALTIME: YES")
+                imgui.pop_style_color()
+            else:
+                imgui.push_style_color(imgui.Col_.text, imgui.ImVec4(0.98, 0.34, 0.26, 1.0))
+                imgui.text("REALTIME: NO")
+                imgui.pop_style_color()
         imgui.end()
 
     def test_final(self) -> None:
