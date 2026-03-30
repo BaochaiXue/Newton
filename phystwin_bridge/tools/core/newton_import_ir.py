@@ -520,6 +520,21 @@ def _write_kinematic_state(
 
 
 @wp.kernel
+def _write_kinematic_state_precomputed(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    indices: wp.array(dtype=wp.int32),
+    target_q_all: wp.array(dtype=wp.vec3),
+    target_base: int,
+):
+    """Scatter-write precomputed controller positions with zero controller velocity."""
+    tid = wp.tid()
+    i = indices[tid]
+    particle_q[i] = target_q_all[target_base + tid]
+    particle_qd[i] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
 def _apply_drag_correction(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),

@@ -47,6 +47,10 @@ WORKSPACE_ROOT = THIS_DIR.parents[2]
 DEFAULT_IR = WORKSPACE_ROOT / "Newton/phystwin_bridge/ir/rope_double_hand/phystwin_ir_v2_bf_strict.npz"
 REQUIRED_RUNTIME_DEVICE = "cuda:0"
 PROFILE_OP_NAMES = (
+    "controller_interp_cpu_ms",
+    "ctrl_target_assign_ms",
+    "ctrl_vel_assign_ms",
+    "physical_radius_assign_ms",
     "write_kinematic_state",
     "particle_grid_build",
     "model_collide",
@@ -184,6 +188,15 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile-runs", type=int, default=3)
     parser.add_argument("--profile-warmup-runs", type=int, default=1)
+    parser.add_argument(
+        "--controller-write-mode",
+        choices=["baseline", "precomputed"],
+        default="precomputed",
+        help=(
+            "baseline: interpolate and upload controller targets every substep. "
+            "precomputed: precompute all controller targets once and keep them resident on GPU."
+        ),
+    )
     parser.add_argument(
         "--profile-json",
         type=Path,
@@ -338,9 +351,18 @@ class NewtonRopeControlViewer:
             self.search_radius = max(self.search_radius, float(getattr(newton_import_ir, "EPSILON", 1.0e-6)))
 
         self.ctrl_idx_wp = wp.array(self.ctrl_idx.astype(np.int32), dtype=wp.int32, device=self.device)
+        self.controller_write_mode = str(self.args.controller_write_mode)
         self.ctrl_target_wp = wp.empty(self.ctrl_idx.size, dtype=wp.vec3, device=self.device)
         self.ctrl_vel_wp = wp.empty(self.ctrl_idx.size, dtype=wp.vec3, device=self.device)
         self.ctrl_vel_zero = np.zeros((self.ctrl_idx.size, 3), dtype=np.float32)
+        self.ctrl_targets_precomputed_wp = None
+        if self.controller_write_mode == "precomputed":
+            ctrl_targets_precomputed = self._precompute_controller_targets()
+            self.ctrl_targets_precomputed_wp = wp.array(
+                ctrl_targets_precomputed,
+                dtype=wp.vec3,
+                device=self.device,
+            )
 
         self.drag = 0.0
         if self.cfg.apply_drag and "drag_damping" in self.ir:
@@ -351,6 +373,13 @@ class NewtonRopeControlViewer:
             self._physical_particle_radius * float(self.args.particle_radius_vis_scale),
             float(self.args.particle_radius_vis_cap),
         ).astype(np.float32)
+        self._physical_particle_radius_wp = wp.clone(self.model.particle_radius)
+        self._visual_particle_radius_wp = wp.array(
+            self._visual_particle_radius.astype(np.float32, copy=False),
+            dtype=wp.float32,
+            device=self.device,
+        )
+        self._particle_radius_mode = "physical"
 
         self.pending_reset = False
         self.finished = False
@@ -409,6 +438,39 @@ class NewtonRopeControlViewer:
 
     def _record_profile_sample(self, name: str, duration_ms: float) -> None:
         self._profile_run_samples.setdefault(name, []).append(float(duration_ms))
+
+    def _profile_host_block(self, name: str, fn, *args, **kwargs):
+        t0 = time.perf_counter()
+        result = fn(*args, **kwargs)
+        self._record_profile_sample(name, 1000.0 * (time.perf_counter() - t0))
+        return result
+
+    def _ensure_physical_particle_radius(self) -> None:
+        if self._particle_radius_mode == "physical":
+            return
+        if self.profile_enabled:
+            self._profile_call(
+                "physical_radius_assign_ms",
+                self.model.particle_radius.assign,
+                self._physical_particle_radius_wp,
+            )
+        else:
+            self.model.particle_radius.assign(self._physical_particle_radius_wp)
+        self._particle_radius_mode = "physical"
+
+    def _ensure_visual_particle_radius(self) -> None:
+        if self._particle_radius_mode == "visual":
+            return
+        self.model.particle_radius.assign(self._visual_particle_radius_wp)
+        self._particle_radius_mode = "visual"
+
+    def _precompute_controller_targets(self) -> np.ndarray:
+        if self.total_substeps <= 0:
+            return np.asarray(self.ctrl_traj[0], dtype=np.float32).copy()
+        all_targets = np.empty((self.total_substeps, self.ctrl_idx.size, 3), dtype=np.float32)
+        for global_substep in range(self.total_substeps):
+            all_targets[global_substep] = self._controller_target_for_substep(global_substep)
+        return all_targets.reshape(-1, 3).astype(np.float32, copy=False)
 
     def _solver_step_granular(self) -> None:
         wp.synchronize_device(self.device)
@@ -507,10 +569,53 @@ class NewtonRopeControlViewer:
         return int(frame), int(sub)
 
     def _write_controller_state(self) -> None:
-        target = self._controller_target_for_substep(self.global_substep)
-        self.ctrl_target_wp.assign(target)
-        self.ctrl_vel_wp.assign(self.ctrl_vel_zero)
+        if self.controller_write_mode == "precomputed":
+            if self.total_substeps <= 0:
+                target_base = 0
+            else:
+                target_base = int(self.global_substep * self.ctrl_idx.size)
+            if self.profile_enabled:
+                self._profile_call(
+                    "write_kinematic_state",
+                    wp.launch,
+                    newton_import_ir._write_kinematic_state_precomputed,
+                    dim=self.ctrl_idx.size,
+                    inputs=[
+                        self.state_in.particle_q,
+                        self.state_in.particle_qd,
+                        self.ctrl_idx_wp,
+                        self.ctrl_targets_precomputed_wp,
+                        target_base,
+                    ],
+                    device=self.device,
+                )
+            else:
+                wp.launch(
+                    newton_import_ir._write_kinematic_state_precomputed,
+                    dim=self.ctrl_idx.size,
+                    inputs=[
+                        self.state_in.particle_q,
+                        self.state_in.particle_qd,
+                        self.ctrl_idx_wp,
+                        self.ctrl_targets_precomputed_wp,
+                        target_base,
+                    ],
+                    device=self.device,
+                )
+            return
+
+        target = (
+            self._profile_host_block(
+                "controller_interp_cpu_ms",
+                self._controller_target_for_substep,
+                self.global_substep,
+            )
+            if self.profile_enabled
+            else self._controller_target_for_substep(self.global_substep)
+        )
         if self.profile_enabled:
+            self._profile_call("ctrl_target_assign_ms", self.ctrl_target_wp.assign, target)
+            self._profile_call("ctrl_vel_assign_ms", self.ctrl_vel_wp.assign, self.ctrl_vel_zero)
             self._profile_call(
                 "write_kinematic_state",
                 wp.launch,
@@ -526,6 +631,8 @@ class NewtonRopeControlViewer:
                 device=self.device,
             )
         else:
+            self.ctrl_target_wp.assign(target)
+            self.ctrl_vel_wp.assign(self.ctrl_vel_zero)
             wp.launch(
                 newton_import_ir._write_kinematic_state,
                 dim=self.ctrl_idx.size,
@@ -608,7 +715,7 @@ class NewtonRopeControlViewer:
             self._reset_runtime()
         wp.synchronize_device(self.device)
         t0 = time.perf_counter()
-        self.model.particle_radius.assign(self._physical_particle_radius)
+        self._ensure_physical_particle_radius()
         for _ in range(self.steps_per_render):
             if self.finished:
                 break
@@ -622,7 +729,7 @@ class NewtonRopeControlViewer:
     def step_no_sync(self) -> None:
         if self.pending_reset:
             self._reset_runtime()
-        self.model.particle_radius.assign(self._physical_particle_radius)
+        self._ensure_physical_particle_radius()
         for _ in range(self.steps_per_render):
             if self.finished:
                 break
@@ -632,11 +739,11 @@ class NewtonRopeControlViewer:
     def render(self) -> None:
         wp.synchronize_device(self.device)
         t0 = time.perf_counter()
-        self.model.particle_radius.assign(self._visual_particle_radius)
+        self._ensure_visual_particle_radius()
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_in)
         self.viewer.end_frame()
-        self.model.particle_radius.assign(self._physical_particle_radius)
+        self._ensure_physical_particle_radius()
         wp.synchronize_device(self.device)
         self.last_render_wall_ms = 1000.0 * (time.perf_counter() - t0)
 
@@ -654,6 +761,7 @@ class NewtonRopeControlViewer:
         self.frame_index = 0
         self.finished = False
         self.pending_reset = False
+        self._particle_radius_mode = "physical"
 
     def render_ui(self, imgui) -> None:
         if not getattr(self.viewer, "ui", None) or not self.viewer.ui.is_available:
@@ -821,6 +929,10 @@ class NewtonRopeControlViewer:
         payload = {
             "ir": str(self.args.ir),
             "runtime_device": self.device,
+            "controller_write_mode": str(self.controller_write_mode),
+            "controller_count": int(self.ctrl_idx.size),
+            "n_obj": int(self.n_obj),
+            "spring_count": int(self.model.spring_count),
             "sim_dt": float(self.sim_dt),
             "segment_substeps": int(self.segment_substeps),
             "steps_per_render": int(self.steps_per_render),

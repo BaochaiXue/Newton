@@ -48,6 +48,13 @@ from bridge_deformable_common import (
 )
 from bridge_shared import apply_viewer_shape_colors, compute_visual_particle_radii, temporary_particle_radius_override
 from bridge_shared import overlay_text_lines_rgb
+from self_contact_bridge_kernels import (
+    apply_velocity_update_from_force,
+    build_filtered_self_contact_tables,
+    compute_nonexcluded_overlap_stats,
+    eval_filtered_self_contact_forces,
+    eval_filtered_self_contact_phystwin_velocity,
+)
 from semiimplicit_bridge_kernels import (
     eval_body_contact_forces,
     eval_body_joint_forces,
@@ -249,6 +256,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label-font-size", type=int, default=28)
     p.add_argument("--skip-render", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
+        "--self-contact-mode",
+        choices=["off", "native", "custom", "phystwin"],
+        default="native",
+        help=(
+            "off: disable particle self-contact; "
+            "native: use Newton's built-in particle kernel; "
+            "custom: disable native kernel and use bridge-side penalty self-contact with filtered pairs; "
+            "phystwin: disable native kernel and use bridge-side PhysTwin-style velocity correction."
+        ),
+    )
+    p.add_argument(
+        "--custom-self-contact-hops",
+        type=int,
+        default=1,
+        help=(
+            "Graph-hop exclusion radius for custom self-contact filtering. "
+            "1 excludes direct spring neighbors; 2 excludes neighbors-of-neighbors as well."
+        ),
+    )
+    p.add_argument(
         "--decouple-shape-materials",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -291,6 +318,18 @@ def _shape_scaling_args(args: argparse.Namespace) -> argparse.Namespace:
     return alias_args
 
 
+def _self_contact_case_tag(mode: str) -> str:
+    if mode == "native":
+        return "self_native"
+    if mode == "custom":
+        return "self_custom"
+    if mode == "phystwin":
+        return "self_phystwin"
+    if mode == "off":
+        return "self_off"
+    raise ValueError(f"Unsupported self_contact_mode: {mode}")
+
+
 def _assign_shape_material_triplet(model, ke: np.ndarray, kd: np.ndarray, kf: np.ndarray) -> None:
     model.shape_material_ke.assign(np.asarray(ke, dtype=np.float32))
     model.shape_material_kd.assign(np.asarray(kd, dtype=np.float32))
@@ -301,6 +340,7 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     box_enabled = _box_enabled(args)
     shape_contacts_enabled = bool(args.shape_contacts) and box_enabled
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
+    self_contact_mode = str(args.self_contact_mode)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
         out_dir=args.out_dir.resolve(),
@@ -310,7 +350,7 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         angular_damping=float(args.angular_damping),
         friction_smoothing=float(args.friction_smoothing),
         enable_tri_contact=True,
-        disable_particle_contact_kernel=False,
+        disable_particle_contact_kernel=(self_contact_mode != "native"),
         shape_contacts=shape_contacts_enabled,
         add_ground_plane=bool(args.add_ground_plane),
         strict_physics_checks=False,
@@ -385,6 +425,12 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
             )
 
     model = builder.finalize(device=device)
+    custom_self_contact_grid = None
+    if self_contact_mode in {"custom", "phystwin"}:
+        custom_self_contact_grid = model.particle_grid
+        model.particle_grid = None
+    elif self_contact_mode == "off":
+        model.particle_grid = None
     shape_material_ke_base = model.shape_material_ke.numpy().astype(np.float32, copy=False).copy()
     shape_material_kd_base = model.shape_material_kd.numpy().astype(np.float32, copy=False).copy()
     shape_material_kf_base = model.shape_material_kf.numpy().astype(np.float32, copy=False).copy()
@@ -407,6 +453,26 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
     edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
+    custom_neighbor_table = None
+    custom_neighbor_count = None
+    excluded_pairs_cpu: set[tuple[int, int]] = set()
+    exclusion_summary = {
+        "filter_hops": float(args.custom_self_contact_hops),
+        "excluded_neighbor_min": 0.0,
+        "excluded_neighbor_mean": 0.0,
+        "excluded_neighbor_median": 0.0,
+        "excluded_neighbor_max": 0.0,
+        "excluded_pair_count": 0.0,
+    }
+    if True:
+        custom_neighbor_table, custom_neighbor_count, excluded_pairs_cpu, exclusion_summary = (
+            build_filtered_self_contact_tables(
+                edges,
+                n_particles=n_obj,
+                hops=int(args.custom_self_contact_hops),
+                device=device,
+            )
+        )
     meta = {
         "solver_name": "semiimplicit",
         "rigid_shape": "box",
@@ -419,7 +485,18 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "gravity_vec": np.asarray(gravity_vec, dtype=np.float32),
         "cloth_shift": shift.astype(np.float32, copy=False),
         "render_edges": render_edges,
-        "particle_contacts_enabled": True,
+        "self_contact_mode": self_contact_mode,
+        "particle_contacts_enabled": self_contact_mode != "off",
+        "custom_self_contact_hops": int(args.custom_self_contact_hops),
+        "custom_self_contact_grid": custom_self_contact_grid,
+        "custom_neighbor_table": custom_neighbor_table,
+        "custom_neighbor_count": custom_neighbor_count,
+        "excluded_pairs_cpu": excluded_pairs_cpu,
+        "excluded_pair_count": int(exclusion_summary["excluded_pair_count"]),
+        "excluded_neighbor_min": float(exclusion_summary["excluded_neighbor_min"]),
+        "excluded_neighbor_mean": float(exclusion_summary["excluded_neighbor_mean"]),
+        "excluded_neighbor_median": float(exclusion_summary["excluded_neighbor_median"]),
+        "excluded_neighbor_max": float(exclusion_summary["excluded_neighbor_max"]),
         "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
         "shape_material_ke_base": shape_material_ke_base,
         "shape_material_kd_base": shape_material_kd_base,
@@ -439,6 +516,10 @@ def simulate(
     n_obj: int,
     device: str,
 ) -> dict[str, Any]:
+    self_contact_mode = str(args.self_contact_mode)
+    use_native_self_contact = self_contact_mode == "native"
+    use_custom_self_contact = self_contact_mode == "custom"
+    use_phystwin_self_contact = self_contact_mode == "phystwin"
     shape_contacts_enabled = bool(args.shape_contacts) and _box_enabled(args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
@@ -449,7 +530,7 @@ def simulate(
         angular_damping=float(args.angular_damping),
         friction_smoothing=float(args.friction_smoothing),
         enable_tri_contact=True,
-        disable_particle_contact_kernel=False,
+        disable_particle_contact_kernel=(not use_native_self_contact),
         shape_contacts=shape_contacts_enabled,
         add_ground_plane=bool(args.add_ground_plane),
         strict_physics_checks=False,
@@ -476,7 +557,7 @@ def simulate(
     sim_dt = float(args.sim_dt)
     substeps = max(1, int(args.substeps))
 
-    particle_grid = model.particle_grid
+    particle_grid = model.particle_grid if use_native_self_contact else meta.get("custom_self_contact_grid")
     search_radius = 0.0
     if particle_grid is not None:
         with wp.ScopedDevice(model.device):
@@ -495,6 +576,15 @@ def simulate(
     use_decoupled_shape_materials = bool(args.decouple_shape_materials) or (
         not np.isclose(float(ir_obj.get("weight_scale", 1.0)), 1.0)
     )
+    use_manual_force_path = (
+        bool(use_decoupled_shape_materials)
+        or use_custom_self_contact
+        or use_phystwin_self_contact
+    )
+    phystwin_collision_dist = float(np.asarray(ir_obj["contact_collision_dist"]).ravel()[0])
+    phystwin_collide_elas = float(np.asarray(ir_obj["contact_collide_object_elas"]).ravel()[0])
+    phystwin_collide_fric = float(np.asarray(ir_obj["contact_collide_object_fric"]).ravel()[0])
+    phystwin_qd_tmp = wp.empty_like(state_in.particle_qd) if use_phystwin_self_contact else None
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -526,7 +616,7 @@ def simulate(
             if contacts is not None:
                 model.collide(state_in, contacts)
 
-            if not use_decoupled_shape_materials:
+            if not use_manual_force_path:
                 solver.step(state_in, state_out, control, contacts, sim_dt)
             else:
                 particle_f = state_in.particle_f if state_in.particle_count else None
@@ -542,7 +632,34 @@ def simulate(
                 eval_body_joint_forces(
                     model, state_in, control, body_f_work, solver.joint_attach_ke, solver.joint_attach_kd
                 )
-                eval_particle_contact_forces(model, state_in, particle_f)
+                if use_phystwin_self_contact:
+                    apply_velocity_update_from_force(model, state_in, dt=sim_dt)
+                    particle_f.zero_()
+                    if phystwin_qd_tmp is None:
+                        raise RuntimeError("PhysTwin self-contact path requires a temporary velocity buffer.")
+                    eval_filtered_self_contact_phystwin_velocity(
+                        model,
+                        state_in,
+                        particle_grid,
+                        meta["custom_neighbor_table"],
+                        meta["custom_neighbor_count"],
+                        collision_dist=phystwin_collision_dist,
+                        collide_elas=phystwin_collide_elas,
+                        collide_fric=phystwin_collide_fric,
+                        particle_qd_out=phystwin_qd_tmp,
+                    )
+                    state_in.particle_qd.assign(phystwin_qd_tmp)
+                elif use_native_self_contact:
+                    eval_particle_contact_forces(model, state_in, particle_f)
+                elif use_custom_self_contact:
+                    eval_filtered_self_contact_forces(
+                        model,
+                        state_in,
+                        particle_f,
+                        particle_grid,
+                        meta["custom_neighbor_table"],
+                        meta["custom_neighbor_count"],
+                    )
                 if solver.enable_tri_contact:
                     eval_triangle_contact_forces(model, state_in, particle_f)
 
@@ -754,7 +871,7 @@ def render_video(
                         frame,
                         [
                             "CLOTH BOX DROP",
-                            "SELF COLLISION: ON",
+                            f"SELF COLLISION: {str(args.self_contact_mode).upper()}",
                             mass_label,
                             f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
                         ],
@@ -844,6 +961,11 @@ def build_summary(
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     bbox_span = cloth_q.reshape(-1, 3).max(axis=0) - cloth_q.reshape(-1, 3).min(axis=0)
     radii = model.particle_radius.numpy().astype(np.float32)[:n_obj]
+    self_contact_stats = compute_nonexcluded_overlap_stats(
+        cloth_q[-1],
+        radii,
+        set(meta.get("excluded_pairs_cpu", set())),
+    )
     max_penetration_depth = None
     final_penetration_p99 = None
     if bool(meta.get("has_box", False)):
@@ -858,7 +980,8 @@ def build_summary(
         final_penetration_p99 = float(np.quantile(penetration[-1], 0.99))
     return {
         "experiment": "cloth_box_drop_object_only",
-        "self_collision_case": "on",
+        "self_collision_case": "on" if str(args.self_contact_mode) != "off" else "off",
+        "self_contact_mode": str(args.self_contact_mode),
         "ir_path": str(args.ir.resolve()),
         "object_only": True,
         "drop_height_m": float(args.drop_height),
@@ -913,6 +1036,12 @@ def build_summary(
         "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
         "spring_ke_scale": float(spring_ke_scale),
         "spring_kd_scale": float(spring_kd_scale),
+        "custom_self_contact_hops": int(args.custom_self_contact_hops),
+        "excluded_pair_count": int(meta.get("excluded_pair_count", 0)),
+        "excluded_neighbor_min": float(meta.get("excluded_neighbor_min", 0.0)),
+        "excluded_neighbor_mean": float(meta.get("excluded_neighbor_mean", 0.0)),
+        "excluded_neighbor_median": float(meta.get("excluded_neighbor_median", 0.0)),
+        "excluded_neighbor_max": float(meta.get("excluded_neighbor_max", 0.0)),
         "shape_contact_scale": (
             None if args.shape_contact_scale is None else float(args.shape_contact_scale)
         ),
@@ -929,6 +1058,9 @@ def build_summary(
         "particle_self_contact_scale": float(args.particle_self_contact_scale),
         "particle_contacts_enabled": bool(particle_contacts_enabled),
         "disable_particle_contact_kernel": bool(disable_particle_contact_kernel),
+        "final_nonexcluded_self_contact_pair_count": float(self_contact_stats["pair_count"]),
+        "final_nonexcluded_self_contact_max_overlap_m": float(self_contact_stats["max_overlap"]),
+        "final_nonexcluded_self_contact_p95_overlap_m": float(self_contact_stats["p95_overlap"]),
         "camera_pos": [float(v) for v in args.camera_pos],
         "camera_pitch": float(args.camera_pitch),
         "camera_yaw": float(args.camera_yaw),
@@ -945,26 +1077,32 @@ def save_summary_json(args: argparse.Namespace, summary: dict[str, Any]) -> Path
     return summary_path
 
 
-def _case_out_dir(base_out_dir: Path) -> Path:
-    return base_out_dir / "self_on"
+def _case_out_dir(base_out_dir: Path, mode: str) -> Path:
+    return base_out_dir / _self_contact_case_tag(mode)
 
 
 def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], device: str) -> dict[str, Path]:
     args = copy.deepcopy(base_args)
-    args.out_dir = _case_out_dir(base_args.out_dir)
+    args.out_dir = _case_out_dir(base_args.out_dir, str(base_args.self_contact_mode))
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    args.prefix = f"{base_args.prefix}_on"
-    args.disable_particle_contact_kernel = False
+    args.prefix = f"{base_args.prefix}_{str(base_args.self_contact_mode)}"
+    if str(base_args.self_contact_mode) == "custom":
+        args.prefix += f"_h{int(base_args.custom_self_contact_hops)}"
+    args.disable_particle_contact_kernel = str(args.self_contact_mode) != "native"
     ir_obj = _copy_object_only_ir(raw_ir, args)
     if "contact_collision_dist" in ir_obj:
         scaled_dist = float(np.asarray(ir_obj["contact_collision_dist"]).ravel()[0]) * float(args.contact_dist_scale)
-        scaled_dist *= float(args.on_contact_dist_scale)
+        if str(args.self_contact_mode) != "off":
+            scaled_dist *= float(args.on_contact_dist_scale)
         ir_obj["contact_collision_dist"] = np.asarray(scaled_dist, dtype=np.float32)
 
-    print(f"Building cloth+box model (on) from {args.ir.resolve()}", flush=True)
+    print(
+        f"Building cloth+box model ({str(args.self_contact_mode)}) from {args.ir.resolve()}",
+        flush=True,
+    )
     model, meta, n_obj = build_model(ir_obj, args, device)
 
-    print("Running simulation (on)...", flush=True)
+    print(f"Running simulation ({str(args.self_contact_mode)})...", flush=True)
     sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
 
     scene_npz = save_scene_npz(args, sim_data, meta, n_obj)
@@ -985,8 +1123,8 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
         meta,
         n_obj,
         out_mp4,
-        particle_contacts_enabled=True,
-        disable_particle_contact_kernel=False,
+        particle_contacts_enabled=bool(meta.get("particle_contacts_enabled", False)),
+        disable_particle_contact_kernel=bool(args.disable_particle_contact_kernel),
     )
     summary_path = save_summary_json(args, summary)
     print(f"  Summary: {summary_path}", flush=True)
