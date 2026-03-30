@@ -45,6 +45,7 @@ from bridge_deformable_common import (
 )
 from bridge_shared import (
     apply_viewer_shape_colors,
+    camera_position,
     compute_visual_particle_radii,
     overlay_text_lines_rgb,
     temporary_particle_radius_override,
@@ -1108,6 +1109,27 @@ def _make_force_diagnostic_frame(
         topk_anchor = (
             topk_q + topk_normals * anchor_offset[:, None]
         ).astype(np.float32, copy=False)
+        topk_particle_radii = np.clip(
+            topk_render_radii * 1.6,
+            0.006,
+            0.015,
+        ).astype(np.float32, copy=False) if topk.size else np.zeros((0,), dtype=np.float32)
+        topk_particle_colors = (
+            np.tile(np.asarray([[1.0, 0.86, 0.18]], dtype=np.float32), (topk.size, 1))
+            if topk.size
+            else np.zeros((0, 3), dtype=np.float32)
+        )
+        topk_closest_radii = (
+            np.full((topk.size,), 0.006, dtype=np.float32)
+            if topk.size
+            else np.zeros((0,), dtype=np.float32)
+        )
+        topk_closest_colors = (
+            np.tile(np.asarray([[0.55, 0.95, 0.98]], dtype=np.float32), (topk.size, 1))
+            if topk.size
+            else np.zeros((0, 3), dtype=np.float32)
+        )
+        diag_summary = _force_summary_payload(snapshot, eps=1.0e-8)
         arrow_specs = [
             {
                 "name": "diag_normal",
@@ -1193,6 +1215,22 @@ def _make_force_diagnostic_frame(
                     hidden=False,
                 )
 
+            if topk.size:
+                viewer.log_points(
+                    "/demo/diag_contact_particles",
+                    wp.array(topk_q.astype(np.float32, copy=False), dtype=wp.vec3, device=device),
+                    wp.array(topk_particle_radii, dtype=float, device=device),
+                    wp.array(topk_particle_colors, dtype=wp.vec3, device=device),
+                    hidden=False,
+                )
+                viewer.log_points(
+                    "/demo/diag_closest_points",
+                    wp.array(topk_closest.astype(np.float32, copy=False), dtype=wp.vec3, device=device),
+                    wp.array(topk_closest_radii, dtype=float, device=device),
+                    wp.array(topk_closest_colors, dtype=wp.vec3, device=device),
+                    hidden=False,
+                )
+
             max_len = max(float(args.force_arrow_scale), 1.0e-6)
             for spec in arrow_specs:
                 if topk_q.shape[0] == 0:
@@ -1222,10 +1260,39 @@ def _make_force_diagnostic_frame(
                     f"snapshot = {snapshot_label}",
                     f"trigger substep = {int(snapshot['global_substep_index'])}",
                     "white=normal red=external purple=internal green=acceleration",
-                    "gray=closest->particle | lengths normalized per family",
+                    "gray=closest->particle cyan=closest-point gold=topk particle",
+                    "lengths normalized per family",
                     f"topk_mode = {str(snapshot['topk_selector_mode'])} | normal_source = {str(snapshot['normal_source'])}",
                 ],
                 font_size=int(args.label_font_size),
+            )
+            hud_lines = [
+                (
+                    f"geom={int(diag_summary['geom_contact_node_count'])}  "
+                    f"force={int(diag_summary['force_contact_node_count'])}  "
+                    f"topk={int(len(topk))}"
+                ),
+                (
+                    f"pen_med={float(diag_summary['median_penetration_mm']):.3f} mm  "
+                    f"ext/stop={float(diag_summary['median_ext_over_stop']):.3f}"
+                ),
+                (
+                    f"wrong_dir={float(diag_summary['wrong_direction_ratio']):.2f}  "
+                    f"inward_acc={float(diag_summary['inward_acceleration_ratio']):.2f}  "
+                    f"internal_dom={float(diag_summary['internal_dominates_ratio']):.2f}"
+                ),
+                f"issue = {str(diag_summary['dominant_issue_guess'])}",
+            ]
+            hud_font = max(16, int(args.label_font_size * 0.9))
+            hud_y = max(18, height - (hud_font + 8) * len(hud_lines) - 28)
+            frame = overlay_text_lines_rgb(
+                frame,
+                hud_lines,
+                font_size=hud_font,
+                x=18,
+                y=hud_y,
+                line_gap=8,
+                bg_alpha=130,
             )
             frame_out = np.asarray(frame, dtype=np.uint8)
             if save_png_path is not None:
@@ -1300,6 +1367,240 @@ def _render_force_diagnostic_video(
         if proc.stdin and not proc.stdin.closed:
             proc.stdin.close()
     return out_path
+
+
+def _camera_basis_from_pitch_yaw(pitch_deg: float, yaw_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pitch = np.deg2rad(float(pitch_deg))
+    yaw = np.deg2rad(float(yaw_deg))
+    forward = np.asarray(
+        [
+            np.cos(pitch) * np.cos(yaw),
+            np.cos(pitch) * np.sin(yaw),
+            np.sin(pitch),
+        ],
+        dtype=np.float32,
+    )
+    forward /= max(np.linalg.norm(forward), 1.0e-8)
+    world_up = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    right = np.cross(forward, world_up).astype(np.float32, copy=False)
+    if np.linalg.norm(right) <= 1.0e-8:
+        right = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    right /= max(np.linalg.norm(right), 1.0e-8)
+    up = np.cross(right, forward).astype(np.float32, copy=False)
+    up /= max(np.linalg.norm(up), 1.0e-8)
+    return forward, right, up
+
+
+def _project_world_to_screen(
+    point_world: np.ndarray,
+    *,
+    cam_pos: np.ndarray,
+    pitch_deg: float,
+    yaw_deg: float,
+    fov_deg: float,
+    width: int,
+    height: int,
+) -> tuple[float, float] | None:
+    forward, right, up = _camera_basis_from_pitch_yaw(pitch_deg, yaw_deg)
+    v = np.asarray(point_world, dtype=np.float32) - np.asarray(cam_pos, dtype=np.float32)
+    z = float(np.dot(v, forward))
+    if z <= 1.0e-6:
+        return None
+    x = float(np.dot(v, right))
+    y = float(np.dot(v, up))
+    aspect = float(width) / max(float(height), 1.0)
+    tan_half = np.tan(np.deg2rad(float(fov_deg)) * 0.5)
+    if tan_half <= 1.0e-8:
+        return None
+    ndc_x = x / (z * tan_half * aspect)
+    ndc_y = y / (z * tan_half)
+    px = (ndc_x * 0.5 + 0.5) * float(width)
+    py = (0.5 - ndc_y * 0.5) * float(height)
+    return float(px), float(py)
+
+
+def _overlay_zoom_panel_rgb(
+    frame: np.ndarray,
+    *,
+    center_px: tuple[float, float] | None,
+    label: str = "contact zoom",
+    panel_frac: float = 0.32,
+    zoom: float = 2.6,
+    margin: int = 18,
+) -> np.ndarray:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return frame
+    if center_px is None:
+        return frame
+    frame = np.asarray(frame)
+    if frame.ndim != 3 or frame.shape[2] < 3:
+        return frame.astype(np.uint8, copy=False)
+    if frame.shape[2] > 3:
+        frame = frame[:, :, :3]
+    if np.issubdtype(frame.dtype, np.floating):
+        if float(np.nanmax(frame)) <= 1.0 + 1.0e-6:
+            frame = np.clip(frame * 255.0, 0.0, 255.0)
+        else:
+            frame = np.clip(frame, 0.0, 255.0)
+    frame = np.ascontiguousarray(frame.astype(np.uint8, copy=False))
+    height, width = frame.shape[:2]
+    panel_w = max(160, int(width * panel_frac))
+    panel_h = max(120, int(height * panel_frac))
+    crop_w = max(40, int(panel_w / max(zoom, 1.0)))
+    crop_h = max(40, int(panel_h / max(zoom, 1.0)))
+    cx = int(round(center_px[0]))
+    cy = int(round(center_px[1]))
+    x0 = int(np.clip(cx - crop_w // 2, 0, max(0, width - crop_w)))
+    y0 = int(np.clip(cy - crop_h // 2, 0, max(0, height - crop_h)))
+    x1 = min(width, x0 + crop_w)
+    y1 = min(height, y0 + crop_h)
+    if x1 <= x0 or y1 <= y0:
+        return frame
+
+    img = Image.fromarray(frame, mode="RGB")
+    crop = img.crop((x0, y0, x1, y1)).resize((panel_w, panel_h), resample=Image.Resampling.BICUBIC)
+    draw = ImageDraw.Draw(img, mode="RGBA")
+
+    draw.rectangle((x0, y0, x1, y1), outline=(255, 215, 0, 255), width=3)
+
+    panel_x1 = width - margin
+    panel_y0 = margin + 120
+    panel_x0 = panel_x1 - panel_w
+    panel_y1 = panel_y0 + panel_h
+    draw.rectangle((panel_x0 - 4, panel_y0 - 28, panel_x1 + 4, panel_y1 + 4), fill=(0, 0, 0, 95))
+    img.paste(crop, (panel_x0, panel_y0))
+    draw.rectangle((panel_x0, panel_y0, panel_x1, panel_y1), outline=(255, 215, 0, 255), width=4)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 24)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((panel_x0 + 8, panel_y0 - 24), label, fill=(255, 255, 255, 255), font=font)
+    return np.asarray(img, dtype=np.uint8)
+
+
+def _compute_rigid_focus_metrics(
+    cloth_q: np.ndarray,
+    body_q: np.ndarray,
+    meta: dict[str, Any],
+    particle_radius: np.ndarray,
+) -> dict[str, np.ndarray | int | None]:
+    n_frames = int(cloth_q.shape[0])
+    focus_world = np.zeros((n_frames, 3), dtype=np.float32)
+    penetration_max = np.zeros((n_frames,), dtype=np.float32)
+    penetration_p99 = np.zeros((n_frames,), dtype=np.float32)
+    rigid_kind = str(meta.get("rigid_shape", "bunny"))
+    if body_q.ndim != 3 or body_q.shape[1] == 0:
+        return {
+            "focus_world": focus_world,
+            "penetration_max": penetration_max,
+            "penetration_p99": penetration_p99,
+            "first_contact_frame": None,
+            "max_penetration_frame": None,
+            "rebound_frame": None,
+        }
+
+    if rigid_kind == "box":
+        hx, hy, hz = [float(v) for v in np.asarray(meta["box_half_extents"]).ravel()]
+        for frame_idx in range(n_frames):
+            pos = body_q[frame_idx, 0, :3].astype(np.float32)
+            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
+            surface = _box_surface_info(
+                cloth_q[frame_idx].astype(np.float32, copy=False),
+                pos,
+                quat_xyzw,
+                np.asarray(meta["box_half_extents"], dtype=np.float32),
+                particle_radius,
+            )
+            pen = np.asarray(surface["penetration_depth_signed"], dtype=np.float32)
+            penetration_max[frame_idx] = float(np.max(pen)) if pen.size else 0.0
+            penetration_p99[frame_idx] = float(np.quantile(pen, 0.99)) if pen.size else 0.0
+            cand = np.flatnonzero(pen > 1.0e-8)
+            if cand.size == 0:
+                unsigned = np.asarray(surface["unsigned_distance_to_surface"], dtype=np.float32)
+                order = np.argsort(unsigned)[: min(32, unsigned.size)]
+                cand = order.astype(np.int32, copy=False)
+            if cand.size:
+                pts = np.asarray(surface["closest_point_world"], dtype=np.float32)[cand]
+                focus_world[frame_idx] = np.mean(pts, axis=0).astype(np.float32, copy=False)
+            else:
+                focus_world[frame_idx] = pos.astype(np.float32, copy=False)
+    else:
+        faces = np.asarray(meta.get("mesh_tri_indices", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
+        verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+        scale = float(meta.get("mesh_scale", 1.0))
+        for frame_idx in range(n_frames):
+            pos = body_q[frame_idx, 0, :3].astype(np.float32)
+            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
+            surface = _mesh_surface_info(
+                cloth_q[frame_idx].astype(np.float32, copy=False),
+                pos,
+                quat_xyzw,
+                meta,
+                particle_radius,
+            )
+            pen = np.asarray(surface["penetration_depth_signed"], dtype=np.float32)
+            penetration_max[frame_idx] = float(np.max(pen)) if pen.size else 0.0
+            penetration_p99[frame_idx] = float(np.quantile(pen, 0.99)) if pen.size else 0.0
+            cand = np.flatnonzero(pen > 1.0e-8)
+            if cand.size == 0:
+                unsigned = np.asarray(surface["unsigned_distance_to_surface"], dtype=np.float32)
+                order = np.argsort(unsigned)[: min(32, unsigned.size)]
+                cand = order.astype(np.int32, copy=False)
+            if cand.size:
+                pts = 0.5 * (
+                    np.asarray(surface["closest_point_world"], dtype=np.float32)[cand]
+                    + cloth_q[frame_idx][cand].astype(np.float32, copy=False)
+                )
+                focus_world[frame_idx] = np.mean(pts, axis=0).astype(np.float32, copy=False)
+            else:
+                rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+                verts = (verts_local * scale) @ rot.T + pos[None, :]
+                focus_world[frame_idx] = np.mean(verts, axis=0).astype(np.float32, copy=False)
+
+    contact_frames = np.flatnonzero(penetration_max > 1.0e-8)
+    first_contact = int(contact_frames[0]) if contact_frames.size else None
+    max_frame = int(np.argmax(penetration_max)) if penetration_max.size and float(np.max(penetration_max)) > 1.0e-8 else None
+    rebound = None
+    if max_frame is not None:
+        max_pen = float(penetration_max[max_frame])
+        for idx in range(max_frame + 1, n_frames):
+            if float(penetration_max[idx]) <= 0.5 * max_pen:
+                rebound = int(idx)
+                break
+        if rebound is None:
+            rebound = n_frames - 1
+    return {
+        "focus_world": focus_world,
+        "penetration_max": penetration_max,
+        "penetration_p99": penetration_p99,
+        "first_contact_frame": first_contact,
+        "max_penetration_frame": max_frame,
+        "rebound_frame": rebound,
+    }
+
+
+def _stage_label_for_frame(
+    frame_idx: int,
+    *,
+    first_contact_frame: int | None,
+    max_penetration_frame: int | None,
+    rebound_frame: int | None,
+) -> str:
+    if first_contact_frame is None:
+        return "Pre-contact"
+    if frame_idx < first_contact_frame:
+        return "Pre-contact"
+    if frame_idx == first_contact_frame:
+        return "First contact"
+    if max_penetration_frame is not None and frame_idx < max_penetration_frame:
+        return "Penetration growth"
+    if max_penetration_frame is not None and frame_idx == max_penetration_frame:
+        return "Max penetration"
+    if rebound_frame is not None and frame_idx <= rebound_frame:
+        return "Rebound / settle"
+    return "Post-contact settle"
 
 
 def _quat_angle_deg(q0_xyzw: np.ndarray, q1_xyzw: np.ndarray) -> float:
@@ -2110,6 +2411,12 @@ def render_video(
             n_sim_frames = int(sim_data["particle_q_all"].shape[0])
             sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
             first_contact_frame = _first_rigid_contact_frame()
+            rigid_focus = _compute_rigid_focus_metrics(
+                np.asarray(sim_data["particle_q_object"], dtype=np.float32),
+                np.asarray(sim_data["body_q"], dtype=np.float32),
+                meta,
+                model.particle_radius.numpy().astype(np.float32)[: int(sim_data["particle_q_object"].shape[1])],
+            )
             render_end_frame = n_sim_frames - 1
             if first_contact_frame is not None and float(args.post_contact_video_seconds) > 0.0:
                 sim_window = float(args.post_contact_video_seconds) / max(float(args.slowdown), 1.0e-6)
@@ -2156,14 +2463,38 @@ def render_video(
 
                 viewer.end_frame()
                 frame = viewer.get_frame(render_ui=False).numpy()
+                focus_px = _project_world_to_screen(
+                    np.asarray(rigid_focus["focus_world"], dtype=np.float32)[sim_idx],
+                    cam_pos=cam_pos,
+                    pitch_deg=float(args.camera_pitch),
+                    yaw_deg=float(args.camera_yaw),
+                    fov_deg=float(args.camera_fov),
+                    width=width,
+                    height=height,
+                )
+                frame = _overlay_zoom_panel_rgb(
+                    frame,
+                    center_px=focus_px,
+                    label="contact zoom",
+                )
                 if args.overlay_label:
+                    stage_label = _stage_label_for_frame(
+                        int(sim_idx),
+                        first_contact_frame=rigid_focus["first_contact_frame"],
+                        max_penetration_frame=rigid_focus["max_penetration_frame"],
+                        rebound_frame=rigid_focus["rebound_frame"],
+                    )
+                    pmax = float(np.asarray(rigid_focus["penetration_max"], dtype=np.float32)[sim_idx]) * 1000.0
+                    pp99 = float(np.asarray(rigid_focus["penetration_p99"], dtype=np.float32)[sim_idx]) * 1000.0
                     frame = overlay_text_lines_rgb(
                         frame,
                         [
                             "CLOTH BUNNY DROP",
                             "SELF COLLISION: OFF",
                             mass_label,
+                            f"stage = {stage_label}",
                             f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
+                            f"max_pen = {pmax:.3f} mm  p99_pen = {pp99:.3f} mm",
                         ],
                         font_size=int(args.label_font_size),
                     )
