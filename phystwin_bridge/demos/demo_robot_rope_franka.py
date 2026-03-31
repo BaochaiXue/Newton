@@ -710,7 +710,6 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
     ee_offset_local = np.asarray([0.0, 0.0, 0.22], dtype=np.float32)
     task_phases = _task_phase_definitions(rope_center, args)
-    ee_target_start = np.asarray(task_phases[0]["start"], dtype=np.float32)
     ee_target_end = np.asarray(task_phases[-1]["end"], dtype=np.float32)
     ee_target_quat = np.asarray(task_phases[0]["quat"], dtype=np.float32)
     mid_segment_indices = _mid_segment_indices(shifted_q[:n_obj], rope_center)
@@ -780,6 +779,16 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         model.particle_grid = None
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     model.set_gravity(gravity_vec)
+    init_state = model.state()
+    init_state.joint_q.assign(FRANKA_INIT_Q.astype(np.float32))
+    init_state.joint_qd.zero_()
+    newton.eval_fk(model, init_state.joint_q, init_state.joint_qd, init_state)
+    init_body_q = init_state.body_q.numpy().astype(np.float32)
+    ee_target_start = _ee_world_position(init_body_q[int(ee_body_index)], ee_offset_local)
+    task_phases[0]["start"] = ee_target_start.astype(np.float32, copy=False)
+    task_phases[0]["end"] = ee_target_start.astype(np.float32, copy=False)
+    if len(task_phases) > 1:
+        task_phases[1]["start"] = ee_target_start.astype(np.float32, copy=False)
 
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
     meta = {
