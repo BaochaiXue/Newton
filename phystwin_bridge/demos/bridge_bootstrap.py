@@ -69,6 +69,30 @@ if not hasattr(wp, "quat_to_euler"):
 
     wp.quat_to_euler = _quat_to_euler_compat
 
+if not hasattr(wp, "transform_twist"):
+    @wp.func
+    def _transform_twist_compat(t: wp.transform, x: wp.spatial_vector) -> wp.spatial_vector:
+        p = wp.transform_get_translation(t)
+        v = wp.spatial_top(x)
+        w = wp.spatial_bottom(x)
+        w_out = wp.transform_vector(t, w)
+        v_out = wp.transform_vector(t, v) + wp.cross(p, w_out)
+        return wp.spatial_vector(v_out, w_out)
+
+    wp.transform_twist = _transform_twist_compat
+
+if not hasattr(wp, "transform_wrench"):
+    @wp.func
+    def _transform_wrench_compat(t: wp.transform, x: wp.spatial_vector) -> wp.spatial_vector:
+        p = wp.transform_get_translation(t)
+        f = wp.spatial_top(x)
+        tau = wp.spatial_bottom(x)
+        f_out = wp.transform_vector(t, f)
+        tau_out = wp.transform_vector(t, tau) + wp.cross(p, f_out)
+        return wp.spatial_vector(f_out, tau_out)
+
+    wp.transform_wrench = _transform_wrench_compat
+
 path_defaults = load_core_module(
     "phystwin_bridge_path_defaults",
     CORE_DIR / "path_defaults.py",

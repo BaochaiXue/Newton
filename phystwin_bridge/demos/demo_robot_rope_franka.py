@@ -92,6 +92,25 @@ def parse_args() -> argparse.Namespace:
         default="presentation",
         help="Render preset for internal debugging or meeting presentation.",
     )
+    p.add_argument(
+        "--robot-motion-mode",
+        choices=["ik", "replay"],
+        default="ik",
+        help=(
+            "Robot motion source. `ik` uses the native Newton IK objective path. "
+            "`replay` replays a native-robot body trajectory from a prior validated run "
+            "while keeping the rope in the semi-implicit simulation."
+        ),
+    )
+    p.add_argument(
+        "--replay-source",
+        type=Path,
+        default=None,
+        help=(
+            "Directory containing `robot_push_rope_franka_body_q.npy` and related files for "
+            "`--robot-motion-mode replay`."
+        ),
+    )
 
     p.add_argument("--frames", type=int, default=None)
     p.add_argument("--sim-dt", type=float, default=1.0e-4)
@@ -228,6 +247,146 @@ def _gripper_center_world_position(body_q: np.ndarray, left_finger_idx: int, rig
     left = body_q[int(left_finger_idx), :3]
     right = body_q[int(right_finger_idx), :3]
     return 0.5 * (left + right)
+
+
+def _quat_relative(q_curr: np.ndarray, q_prev: np.ndarray) -> np.ndarray:
+    dq = _quat_multiply(np.asarray(q_curr, dtype=np.float32), _quat_conjugate(np.asarray(q_prev, dtype=np.float32)))
+    if float(dq[3]) < 0.0:
+        dq = -dq
+    return dq.astype(np.float32, copy=False)
+
+
+def _quat_delta_to_angular_velocity(q_curr: np.ndarray, q_prev: np.ndarray, dt: float) -> np.ndarray:
+    dq = _quat_relative(q_curr, q_prev)
+    vec = np.asarray(dq[:3], dtype=np.float32)
+    w = float(np.clip(dq[3], -1.0, 1.0))
+    vec_norm = float(np.linalg.norm(vec))
+    if vec_norm < 1.0e-8 or dt <= 0.0:
+        return np.zeros((3,), dtype=np.float32)
+    angle = 2.0 * np.arctan2(vec_norm, w)
+    axis = vec / vec_norm
+    return (axis * (angle / dt)).astype(np.float32, copy=False)
+
+
+def _resample_indices(src_frames: int, dst_frames: int) -> np.ndarray:
+    if src_frames <= 1 or dst_frames <= 1:
+        return np.zeros((dst_frames,), dtype=np.int32)
+    return np.clip(
+        np.rint(np.linspace(0.0, float(src_frames - 1), int(dst_frames), endpoint=True)).astype(np.int32),
+        0,
+        src_frames - 1,
+    )
+
+
+def _load_replay_trajectory(source_dir: Path, n_frames: int, frame_dt: float) -> dict[str, np.ndarray]:
+    source_dir = Path(source_dir).resolve()
+    body_q_path = source_dir / "robot_push_rope_franka_body_q.npy"
+    target_path = source_dir / "robot_push_rope_franka_ee_target_pos.npy"
+    if not body_q_path.exists():
+        raise FileNotFoundError(f"Replay source missing body trajectory: {body_q_path}")
+
+    body_q_src = np.asarray(np.load(body_q_path), dtype=np.float32)
+    if body_q_src.ndim != 3 or body_q_src.shape[-1] != 7:
+        raise ValueError(f"Unexpected replay body_q shape: {body_q_src.shape}")
+    sample_idx = _resample_indices(int(body_q_src.shape[0]), int(n_frames))
+    body_q = body_q_src[sample_idx].astype(np.float32, copy=False)
+
+    body_qd = np.zeros((int(n_frames), body_q.shape[1], 6), dtype=np.float32)
+    if int(n_frames) > 1:
+        for frame in range(1, int(n_frames)):
+            prev = body_q[frame - 1]
+            curr = body_q[frame]
+            body_qd[frame, :, :3] = (curr[:, :3] - prev[:, :3]) / float(frame_dt)
+            for body_idx in range(body_q.shape[1]):
+                body_qd[frame, body_idx, 3:] = _quat_delta_to_angular_velocity(
+                    curr[body_idx, 3:7],
+                    prev[body_idx, 3:7],
+                    float(frame_dt),
+                )
+        body_qd[0] = body_qd[1]
+
+    if target_path.exists():
+        ee_target_src = np.asarray(np.load(target_path), dtype=np.float32)
+        ee_target = ee_target_src[_resample_indices(int(ee_target_src.shape[0]), int(n_frames))].astype(np.float32, copy=False)
+    else:
+        ee_target = np.zeros((int(n_frames), 3), dtype=np.float32)
+
+    return {
+        "source_dir": str(source_dir),
+        "body_q": body_q,
+        "body_qd": body_qd,
+        "ee_target_pos": ee_target,
+    }
+
+
+def _gripper_contact_proxies_world(
+    body_q: np.ndarray,
+    left_finger_idx: int,
+    right_finger_idx: int,
+) -> dict[str, np.ndarray]:
+    body_q = np.asarray(body_q, dtype=np.float32)
+    left = body_q[int(left_finger_idx), :3]
+    right = body_q[int(right_finger_idx), :3]
+    center = 0.5 * (left + right)
+    return {
+        "gripper_center": np.asarray(center, dtype=np.float32),
+        "left_finger": np.asarray(left, dtype=np.float32),
+        "right_finger": np.asarray(right, dtype=np.float32),
+    }
+
+
+def _gripper_contact_proxy_radii(contact_radius: float) -> dict[str, float]:
+    contact_radius = float(contact_radius)
+    effective_radius = max(0.012, 0.60 * contact_radius)
+    return {
+        "gripper_center": effective_radius,
+        "left_finger": effective_radius,
+        "right_finger": effective_radius,
+        "finger_span": effective_radius,
+    }
+
+
+def _point_segment_min_distance(points: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    points = np.asarray(points, dtype=np.float32)
+    start = np.asarray(start, dtype=np.float32)
+    end = np.asarray(end, dtype=np.float32)
+    segment = end - start
+    denom = float(np.dot(segment, segment))
+    if denom <= 1.0e-12:
+        return float(np.min(np.linalg.norm(points - start[None, :], axis=1)))
+    t = np.clip(((points - start[None, :]) @ segment) / denom, 0.0, 1.0)
+    proj = start[None, :] + t[:, None] * segment[None, :]
+    return float(np.min(np.linalg.norm(points - proj, axis=1)))
+
+
+def _min_gripper_proxy_clearance(
+    particle_q: np.ndarray,
+    particle_radius: np.ndarray,
+    proxy_positions: dict[str, np.ndarray],
+    contact_radius: float,
+) -> tuple[float, str, dict[str, float]]:
+    proxy_radii = _gripper_contact_proxy_radii(contact_radius)
+    per_proxy_min: dict[str, float] = {}
+    best_name = "gripper_center"
+    best_clearance = float("inf")
+    for name, proxy_pos in proxy_positions.items():
+        d = np.linalg.norm(particle_q - proxy_pos[None, :], axis=1) - (particle_radius + proxy_radii.get(name, float(contact_radius)))
+        min_d = float(np.min(d))
+        per_proxy_min[name] = min_d
+        if min_d < best_clearance:
+            best_clearance = min_d
+            best_name = name
+    left = proxy_positions.get("left_finger")
+    right = proxy_positions.get("right_finger")
+    if left is not None and right is not None:
+        span_min_d = _point_segment_min_distance(particle_q, left, right) - (
+            float(np.min(particle_radius)) + proxy_radii["finger_span"]
+        )
+        per_proxy_min["finger_span"] = float(span_min_d)
+        if span_min_d < best_clearance:
+            best_clearance = float(span_min_d)
+            best_name = "finger_span"
+    return best_clearance, best_name, per_proxy_min
 
 
 def _resolve_runtime_defaults(args: argparse.Namespace) -> None:
@@ -448,6 +607,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
     meta = {
         "robot_geometry": "native_franka",
+        "robot_motion_mode": str(args.robot_motion_mode),
         "robot_base_pos": robot_base_pos.astype(np.float32),
         "ee_body_index": int(ee_body_index),
         "left_finger_index": int(left_finger_index),
@@ -558,6 +718,13 @@ def simulate(
     )
 
     n_frames = max(2, int(args.frames))
+    frame_dt = sim_dt * float(substeps)
+    replay = None
+    if str(args.robot_motion_mode) == "replay":
+        if args.replay_source is None:
+            raise ValueError("--replay-source is required when --robot-motion-mode replay")
+        replay = _load_replay_trajectory(Path(args.replay_source), n_frames=n_frames, frame_dt=frame_dt)
+
     store = RolloutStorage(args.out_dir, args.prefix, mode=str(args.history_storage))
     particle_q0 = state_in.particle_q.numpy().astype(np.float32)
     body_q0 = state_in.body_q.numpy().astype(np.float32)
@@ -570,37 +737,53 @@ def simulate(
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
+        if replay is not None:
+            state_in.body_q.assign(replay["body_q"][frame])
+            state_in.body_qd.assign(replay["body_qd"][frame])
         q = state_in.particle_q.numpy().astype(np.float32)
         particle_q_all[frame] = q
         particle_q_object[frame] = q[:n_obj]
         body_q[frame] = state_in.body_q.numpy().astype(np.float32)
         body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
-        _, target_pos_frame, _ = _task_phase_state(float(frame) * sim_dt * float(substeps), meta)
-        ee_target_pos[frame] = target_pos_frame
+        if replay is not None:
+            ee_target_pos[frame] = replay["ee_target_pos"][frame]
+        else:
+            _, target_pos_frame, _ = _task_phase_state(float(frame) * frame_dt, meta)
+            ee_target_pos[frame] = target_pos_frame
 
         for sub in range(substeps):
-            sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
-            _, target_pos, target_quat = _task_phase_state(sim_t, meta)
-            pos_obj.set_target_position(0, wp.vec3(*target_pos.tolist()))
-            rot_obj.set_target_rotation(0, wp.vec4(*target_quat.tolist()))
-            ik_solver.step(ik_joint_q, ik_joint_q, iterations=int(args.ik_iters))
-
-            joint_target_np = ik_joint_q.numpy().reshape(-1).astype(np.float32)
-            joint_target_np[7:9] = float(args.gripper_open)
-            joint_target_qd = (joint_target_np - prev_joint_q) / sim_dt
-            prev_joint_q = joint_target_np.copy()
-
             state_in.clear_forces()
-            state_in.joint_q.assign(joint_target_np)
-            state_in.joint_qd.assign(joint_target_qd)
-            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            if replay is not None:
+                body_q_frame = replay["body_q"][frame]
+                body_qd_frame = replay["body_qd"][frame]
+                state_in.body_q.assign(body_q_frame)
+                state_in.body_qd.assign(body_qd_frame)
+            else:
+                sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
+                _, target_pos, target_quat = _task_phase_state(sim_t, meta)
+                pos_obj.set_target_position(0, wp.vec3(*target_pos.tolist()))
+                rot_obj.set_target_rotation(0, wp.vec4(*target_quat.tolist()))
+                ik_solver.step(ik_joint_q, ik_joint_q, iterations=int(args.ik_iters))
+
+                joint_target_np = ik_joint_q.numpy().reshape(-1).astype(np.float32)
+                joint_target_np[7:9] = float(args.gripper_open)
+                joint_target_qd = (joint_target_np - prev_joint_q) / sim_dt
+                prev_joint_q = joint_target_np.copy()
+
+                state_in.joint_q.assign(joint_target_np)
+                state_in.joint_qd.assign(joint_target_qd)
+                newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             if contacts is not None:
                 model.collide(state_in, contacts)
             solver.step(state_in, state_out, None, contacts, sim_dt)
+            if replay is not None:
+                state_out.body_q.assign(body_q_frame)
+                state_out.body_qd.assign(body_qd_frame)
+            else:
+                state_out.joint_q.assign(joint_target_np)
+                state_out.joint_qd.assign(joint_target_qd)
+                newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
             state_in, state_out = state_out, state_in
-            state_in.joint_q.assign(joint_target_np)
-            state_in.joint_qd.assign(joint_target_qd)
-            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
 
             if drag > 0.0:
                 if gravity_axis is not None:
@@ -636,6 +819,8 @@ def simulate(
         "body_q": body_q,
         "body_vel": body_vel,
         "ee_target_pos": ee_target_pos,
+        "robot_motion_mode": str(args.robot_motion_mode),
+        "replay_source": (None if replay is None else str(replay["source_dir"])),
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
         "wall_time": float(wall_time),
@@ -756,9 +941,10 @@ def render_video(
                 phase_name, _, _ = _task_phase_state(sim_t, meta)
                 viewer.begin_frame(sim_t)
                 viewer.log_state(state)
-                gripper_center = _gripper_center_world_position(
+                gripper_proxies = _gripper_contact_proxies_world(
                     sim_data["body_q"][sim_idx], left_finger_idx, right_finger_idx
-                ).astype(np.float32, copy=False)
+                )
+                gripper_center = gripper_proxies["gripper_center"].astype(np.float32, copy=False)
                 if str(args.render_mode) == "debug":
                     viewer.log_shapes(
                         "/demo/ee_target",
@@ -840,11 +1026,11 @@ def render_video(
                         speed = 0.0
                     q_obj = sim_data["particle_q_object"][sim_idx]
                     particle_radius = particle_radius_sim[: q_obj.shape[0]]
-                    min_clearance = float(
-                        np.min(
-                            np.linalg.norm(q_obj - gripper_center[None, :], axis=1)
-                            - (particle_radius + float(args.ee_contact_radius))
-                        )
+                    min_clearance, min_proxy_name, _ = _min_gripper_proxy_clearance(
+                        q_obj,
+                        particle_radius,
+                        gripper_proxies,
+                        float(args.ee_contact_radius),
                     )
                     contact_state = "ON" if min_clearance <= 0.0 else "OFF"
                     frame = overlay_text_lines_rgb(
@@ -853,7 +1039,7 @@ def render_video(
                             f"task: {args.task} | phase: {phase_name}",
                             "Native Newton Franka Panda + hanging rope | yellow=target, cyan=gripper center",
                             f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s",
-                            f"contact: {contact_state} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm",
+                            f"contact: {contact_state} via {min_proxy_name} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm",
                         ],
                         font_size=int(args.label_font_size),
                     )
@@ -891,6 +1077,8 @@ def build_summary(
     gripper_center = np.stack(
         [_gripper_center_world_position(body_q[i], left_finger_idx, right_finger_idx) for i in range(body_q.shape[0])]
     )
+    left_finger_pos = body_q[:, left_finger_idx, :3].astype(np.float32, copy=False)
+    right_finger_pos = body_q[:, right_finger_idx, :3].astype(np.float32, copy=False)
     tracking_error = np.linalg.norm(gripper_center - target_pos, axis=1)
     gripper_speed = np.linalg.norm(np.diff(gripper_center, axis=0), axis=1) / float(sim_data["sim_dt"] * sim_data["substeps"])
     if gripper_speed.size == 0:
@@ -907,19 +1095,38 @@ def build_summary(
     baseline_z = float(np.mean(mid_segment_z[pre_frames])) if pre_frames else float(mid_segment_z[0])
     rope_mid_peak_z_delta = float(np.max(mid_segment_z) - baseline_z)
     rope_mid_final_z_delta = float(mid_segment_z[-1] - baseline_z)
+    rope_mid_peak_frame = int(np.argmax(mid_segment_z))
 
     contact_frames = []
     min_clearance = []
+    min_clearance_source = []
+    gripper_center_clearance = []
+    left_finger_clearance = []
+    right_finger_clearance = []
+    finger_span_clearance = []
     for frame_idx in range(particle_q.shape[0]):
-        d = np.linalg.norm(particle_q[frame_idx] - gripper_center[frame_idx][None, :], axis=1) - (
-            particle_radius + float(args.ee_contact_radius)
+        min_d, min_source, per_proxy_min = _min_gripper_proxy_clearance(
+            particle_q[frame_idx],
+            particle_radius,
+            {
+                "gripper_center": gripper_center[frame_idx],
+                "left_finger": left_finger_pos[frame_idx],
+                "right_finger": right_finger_pos[frame_idx],
+            },
+            float(args.ee_contact_radius),
         )
-        min_d = float(np.min(d))
         min_clearance.append(min_d)
+        min_clearance_source.append(min_source)
+        gripper_center_clearance.append(float(per_proxy_min["gripper_center"]))
+        left_finger_clearance.append(float(per_proxy_min["left_finger"]))
+        right_finger_clearance.append(float(per_proxy_min["right_finger"]))
+        finger_span_clearance.append(float(per_proxy_min.get("finger_span", min_d)))
         if min_d <= 0.0:
             contact_frames.append(frame_idx)
 
     first_contact_frame = int(contact_frames[0]) if contact_frames else None
+    last_contact_frame = int(contact_frames[-1]) if contact_frames else None
+    contact_peak_frame = int(np.argmin(np.asarray(min_clearance, dtype=np.float32))) if min_clearance else None
     release_candidates = [i for i, name in enumerate(phase_names) if name == "release_retract"]
     release_frame = None
     if release_candidates:
@@ -930,6 +1137,49 @@ def build_summary(
             if window.size and not np.any(window):
                 release_frame = int(idx)
                 break
+
+    pre_contact_mask = np.asarray([name == "pre_approach" for name in phase_names], dtype=bool)
+    contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
+    release_mask = np.asarray([name == "release_retract" for name in phase_names], dtype=bool)
+    contact_duration_s = float(np.count_nonzero(contact_mask) * frame_dt)
+    first_contact_phase = None if first_contact_frame is None else str(phase_names[first_contact_frame])
+
+    def _masked_mean(values: np.ndarray, mask: np.ndarray) -> float | None:
+        if values.size == 0 or not np.any(mask):
+            return None
+        return float(np.mean(values[mask]))
+
+    def _masked_max(values: np.ndarray, mask: np.ndarray) -> float | None:
+        if values.size == 0 or not np.any(mask):
+            return None
+        return float(np.max(values[mask]))
+
+    pre_tracking_mean = _masked_mean(tracking_error, pre_contact_mask)
+    contact_tracking_mean = _masked_mean(tracking_error, contact_mask)
+    release_tracking_mean = _masked_mean(tracking_error, release_mask)
+    pre_speed_mean = _masked_mean(gripper_speed, pre_contact_mask[: gripper_speed.shape[0]])
+    contact_speed_mean = _masked_mean(gripper_speed, contact_mask[: gripper_speed.shape[0]])
+    release_speed_mean = _masked_mean(gripper_speed, release_mask[: gripper_speed.shape[0]])
+
+    unique_phase_sequence: list[str] = []
+    for name in phase_names:
+        if not unique_phase_sequence or unique_phase_sequence[-1] != name:
+            unique_phase_sequence.append(name)
+
+    source_counts: dict[str, int] = {}
+    for name, active in zip(min_clearance_source, contact_mask.tolist(), strict=False):
+        if not active:
+            continue
+        source_counts[name] = int(source_counts.get(name, 0) + 1)
+
+    min_clearance_np = np.asarray(min_clearance, dtype=np.float32)
+    gripper_center_clearance_np = np.asarray(gripper_center_clearance, dtype=np.float32)
+    left_finger_clearance_np = np.asarray(left_finger_clearance, dtype=np.float32)
+    right_finger_clearance_np = np.asarray(right_finger_clearance, dtype=np.float32)
+    finger_span_clearance_np = np.asarray(finger_span_clearance, dtype=np.float32)
+    contact_peak_source = (
+        None if contact_peak_frame is None else str(min_clearance_source[int(contact_peak_frame)])
+    )
 
     return {
         "ir_path": str(args.ir.resolve()),
@@ -947,23 +1197,51 @@ def build_summary(
         "render_mode": str(args.render_mode),
         "particle_contacts": bool(meta["particle_contacts"]),
         "particle_contact_kernel": bool(meta["particle_contact_kernel"]),
+        "robot_motion_mode": str(sim_data.get("robot_motion_mode", meta.get("robot_motion_mode", "ik"))),
+        "replay_source": sim_data.get("replay_source"),
         "history_storage_mode": str(sim_data["history_storage_mode"]),
         "history_storage_files": sim_data["history_storage_files"],
         "robot_geometry": "native_franka",
         "ee_body_index": int(meta["ee_body_index"]),
         "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),
         "gripper_center_tracking_error_max_m": float(np.max(tracking_error)),
+        "gripper_center_tracking_error_pre_contact_mean_m": pre_tracking_mean,
+        "gripper_center_tracking_error_during_contact_mean_m": contact_tracking_mean,
+        "gripper_center_tracking_error_release_mean_m": release_tracking_mean,
         "gripper_center_speed_max_m_s": float(np.max(gripper_speed)),
+        "gripper_center_speed_pre_contact_mean_m_s": pre_speed_mean,
+        "gripper_center_speed_during_contact_mean_m_s": contact_speed_mean,
+        "gripper_center_speed_release_mean_m_s": release_speed_mean,
         "gripper_center_path_length_m": gripper_path_length,
+        "contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
+        "contact_proxy_radius_m": float(_gripper_contact_proxy_radii(float(args.ee_contact_radius))["gripper_center"]),
+        "contact_proxy_radii_m": _gripper_contact_proxy_radii(float(args.ee_contact_radius)),
         "rope_com_displacement_m": rope_com_disp,
         "rope_com_z_min_m": float(np.min(rope_com[:, 2])),
         "rope_mid_segment_peak_z_delta_m": rope_mid_peak_z_delta,
         "rope_mid_segment_final_z_delta_m": rope_mid_final_z_delta,
+        "rope_mid_segment_peak_frame": rope_mid_peak_frame,
+        "contact_started": bool(first_contact_frame is not None),
         "first_contact_frame": first_contact_frame,
+        "first_contact_time_s": (None if first_contact_frame is None else float(first_contact_frame * frame_dt)),
+        "last_contact_frame": last_contact_frame,
+        "last_contact_time_s": (None if last_contact_frame is None else float(last_contact_frame * frame_dt)),
+        "first_contact_phase": first_contact_phase,
+        "contact_peak_frame": contact_peak_frame,
         "release_frame": release_frame,
+        "release_time_s": (None if release_frame is None else float(release_frame * frame_dt)),
+        "contact_duration_s": contact_duration_s,
         "contact_active_frames": int(len(contact_frames)),
-        "min_clearance_min_m": float(np.min(np.asarray(min_clearance, dtype=np.float32))),
+        "contact_phase_count": int(np.count_nonzero(contact_mask)),
+        "task_phase_sequence": unique_phase_sequence,
+        "min_clearance_min_m": float(np.min(min_clearance_np)),
         "min_clearance_final_m": float(min_clearance[-1]),
+        "gripper_center_clearance_min_m": float(np.min(gripper_center_clearance_np)),
+        "left_finger_clearance_min_m": float(np.min(left_finger_clearance_np)),
+        "right_finger_clearance_min_m": float(np.min(right_finger_clearance_np)),
+        "finger_span_clearance_min_m": float(np.min(finger_span_clearance_np)),
+        "contact_proxy_counts": source_counts,
+        "contact_peak_proxy": contact_peak_source,
     }
 
 

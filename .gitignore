@@ -2,6 +2,7 @@
 phystwin_bridge/inputs/cases/
 phystwin_bridge/ir/
 phystwin_bridge/outputs/
+phystwin_bridge/results/
 
 # Temporary render artifacts
 phystwin_bridge/**/._tmp_cmp2x3_*/

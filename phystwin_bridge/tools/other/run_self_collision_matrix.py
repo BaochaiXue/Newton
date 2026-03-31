@@ -456,7 +456,7 @@ def main() -> int:
                 "- `self_collision_decision_table.csv`",
                 "- `self_collision_decision.md`",
                 "- `self_collision_decision_4panel.png`",
-                "- `self_collision_selected_mode.mp4` when a provisional mode has a render artifact",
+                "- `self_collision_provisional_selected_mode.mp4` when a provisional mode has a render artifact",
                 "",
                 "Final A/B/C decision remains blank until bunny sanity check, OFF-baseline regression, and equivalence evidence are attached.",
                 "",
@@ -539,7 +539,7 @@ def main() -> int:
     if selected_mode is not None:
         selected_payload = case_outputs.get(selected_mode, {})
         if selected_payload.get("mp4_path") is not None:
-            selected_mp4 = out_dir / "self_collision_selected_mode.mp4"
+            selected_mp4 = out_dir / "self_collision_provisional_selected_mode.mp4"
             shutil.copy2(Path(str(selected_payload["mp4_path"])), selected_mp4)
 
     csv_path = out_dir / "self_collision_decision_table.csv"

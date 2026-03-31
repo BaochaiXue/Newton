@@ -47,7 +47,6 @@ from bridge_deformable_common import (
 )
 from bridge_shared import (
     apply_viewer_shape_colors,
-    camera_position,
     compute_visual_particle_radii,
     overlay_text_lines_rgb,
     temporary_particle_radius_override,
@@ -338,8 +337,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--force-video-hold-seconds",
         type=float,
-        default=0.35,
-        help="How long each force-diagnostic keyframe should be held in the trigger-window diagnostic video.",
+        default=0.067,
+        help=(
+            "How long each rendered force-diagnostic frame should be held in the trigger-window video. "
+            "Keep this short so the clip remains a true sequence instead of a held-card slideshow."
+        ),
     )
     p.add_argument(
         "--force-window-substeps-before",
@@ -350,8 +352,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--force-window-substeps-after",
         type=int,
-        default=12,
-        help="How many substeps after the trigger should be monitored for force-video keyframes.",
+        default=24,
+        help=(
+            "How many dense post-trigger substeps should be rendered in the force-video sequence "
+            "before any coarser tail sampling is allowed."
+        ),
     )
     p.add_argument(
         "--force-include-max-penetration",
@@ -436,6 +441,12 @@ def parse_args() -> argparse.Namespace:
             "but scaled shape_material_ke/kd/kf for particle-shape contacts. "
             "This avoids softening bunny-ground support when low-mass cloth contact is rescaled."
         ),
+    )
+    p.add_argument(
+        "--defer-force-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write a force-render bundle and skip expensive force-window artifact rendering in this run.",
     )
     return p.parse_args()
 
@@ -611,6 +622,8 @@ def _render_force_artifacts_subprocess(
     ir_obj: dict[str, Any],
     diag_snapshot: dict[str, Any],
     sequence_snapshots: list[dict[str, Any]],
+    render_sim_data: dict[str, Any] | None = None,
+    video_mp4_path: Path | None = None,
 ) -> tuple[Path, Path | None, Path | None]:
     force_dir = _resolve_force_dump_dir(args)
     force_dir.mkdir(parents=True, exist_ok=True)
@@ -621,6 +634,8 @@ def _render_force_artifacts_subprocess(
         "ir_obj": ir_obj,
         "diag_snapshot": diag_snapshot,
         "sequence_snapshots": sequence_snapshots,
+        "render_sim_data": render_sim_data,
+        "video_mp4_path": "" if video_mp4_path is None else str(video_mp4_path),
     }
     with bundle_path.open("wb") as handle:
         pickle.dump(bundle, handle)
@@ -635,6 +650,36 @@ def _render_force_artifacts_subprocess(
         snapshot_mp4_path if snapshot_mp4_path.exists() else None,
         sequence_mp4_path if sequence_mp4_path.exists() else None,
     )
+
+
+def _write_force_render_bundle(
+    *,
+    args: argparse.Namespace,
+    device: str,
+    ir_obj: dict[str, Any],
+    diag_snapshot: dict[str, Any],
+    render_sim_data: dict[str, Any],
+    trigger_substep_global: int,
+    summary_json_path: Path,
+    video_mp4_path: Path | None = None,
+) -> Path:
+    force_dir = _resolve_force_dump_dir(args)
+    force_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = force_dir / "force_render_bundle.pkl"
+    bundle = {
+        "args": args,
+        "device": device,
+        "ir_obj": ir_obj,
+        "diag_snapshot": diag_snapshot,
+        "sequence_snapshots": [],
+        "render_sim_data": render_sim_data,
+        "trigger_substep_global": int(trigger_substep_global),
+        "summary_json_path": str(summary_json_path),
+        "video_mp4_path": "" if video_mp4_path is None else str(video_mp4_path),
+    }
+    with bundle_path.open("wb") as handle:
+        pickle.dump(bundle, handle)
+    return bundle_path
 
 
 def _normalized(values: np.ndarray) -> np.ndarray:
@@ -738,32 +783,70 @@ def _resolve_force_camera(
     focus_world: np.ndarray | None,
     particle_world: np.ndarray | None,
 ) -> tuple[np.ndarray, float, float, float]:
+    pitch = float(args.force_camera_pitch if args.force_camera_pitch is not None else args.camera_pitch)
+    yaw = float(args.force_camera_yaw if args.force_camera_yaw is not None else args.camera_yaw)
+    fov = float(args.force_camera_fov if args.force_camera_fov is not None else args.camera_fov)
     if args.force_camera_pos is not None:
         cam_pos = np.asarray(args.force_camera_pos, dtype=np.float32).reshape(3)
-        pitch = float(args.force_camera_pitch if args.force_camera_pitch is not None else args.camera_pitch)
-        yaw = float(args.force_camera_yaw if args.force_camera_yaw is not None else args.camera_yaw)
-        fov = float(args.force_camera_fov if args.force_camera_fov is not None else args.camera_fov)
         return cam_pos, pitch, yaw, fov
-
-    focus = None if focus_world is None else np.asarray(focus_world, dtype=np.float32).reshape(3)
-    if focus is None:
-        cam_pos = np.asarray(args.camera_pos, dtype=np.float32).reshape(3)
-        pitch = float(args.force_camera_pitch if args.force_camera_pitch is not None else args.camera_pitch)
-        yaw = float(args.force_camera_yaw if args.force_camera_yaw is not None else args.camera_yaw)
-        fov = float(args.force_camera_fov if args.force_camera_fov is not None else max(30.0, min(float(args.camera_fov), 40.0)))
-        return cam_pos, pitch, yaw, fov
-
-    yaw = float(args.force_camera_yaw if args.force_camera_yaw is not None else args.camera_yaw)
-    pitch = float(args.force_camera_pitch if args.force_camera_pitch is not None else -8.0)
-    fov = float(args.force_camera_fov if args.force_camera_fov is not None else 34.0)
-    spread = 0.04
+    points: list[np.ndarray] = []
     if particle_world is not None:
-        particle_world = np.asarray(particle_world, dtype=np.float32).reshape(-1, 3)
-        if particle_world.size:
-            spread = float(np.max(np.linalg.norm(particle_world - focus[None, :], axis=1)))
-    distance = float(np.clip(max(0.20, 3.5 * spread), 0.20, 0.42))
-    cam_pos = np.asarray(camera_position(focus, yaw_deg=yaw, pitch_deg=pitch, distance=distance), dtype=np.float32)
-    return cam_pos, pitch, yaw, fov
+        pts = np.asarray(particle_world, dtype=np.float32).reshape(-1, 3)
+        if pts.size:
+            points.append(pts)
+    if focus_world is not None:
+        points.append(np.asarray(focus_world, dtype=np.float32).reshape(1, 3))
+    if points:
+        scene_points = np.concatenate(points, axis=0)
+        cam_pos, _ = _fit_camera_to_points(
+            scene_points,
+            yaw_deg=yaw,
+            pitch_deg=pitch,
+            fov_deg=fov,
+            aspect=float(args.screen_width) / max(float(args.screen_height), 1.0),
+        )
+        return cam_pos, pitch, yaw, fov
+    return np.asarray(args.camera_pos, dtype=np.float32).reshape(3), pitch, yaw, fov
+
+
+def _resolve_main_camera(args: argparse.Namespace) -> tuple[np.ndarray, float, float, float]:
+    cam_pos = np.asarray(args.camera_pos, dtype=np.float32).reshape(3)
+    return cam_pos, float(args.camera_pitch), float(args.camera_yaw), float(args.camera_fov)
+
+
+def _continuous_output_frame_indices(
+    *,
+    n_sim_frames: int,
+    render_end_frame: int,
+    sim_frame_dt: float,
+    fps_out: float,
+    slowdown: float,
+) -> np.ndarray:
+    usable = max(1, min(int(render_end_frame) + 1, int(n_sim_frames)))
+    if usable <= 1:
+        return np.zeros((1,), dtype=np.int32)
+    if fps_out <= 0.0 or sim_frame_dt <= 0.0:
+        return np.arange(usable, dtype=np.int32)
+
+    sim_end_time = float(usable - 1) * float(sim_frame_dt)
+    out_duration = max(sim_end_time * max(float(slowdown), 1.0), sim_end_time)
+    out_count = max(usable, int(round(out_duration * float(fps_out))) + 1)
+    out_times = np.arange(out_count, dtype=np.float32) / max(float(fps_out), 1.0e-8)
+    sim_times = out_times / max(float(slowdown), 1.0e-8)
+    indices = np.rint(sim_times / max(float(sim_frame_dt), 1.0e-8)).astype(np.int32, copy=False)
+    indices = np.clip(indices, 0, usable - 1)
+    return indices
+
+
+def _compute_force_visual_particle_radii(
+    physical_radii: np.ndarray,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    return compute_visual_particle_radii(
+        physical_radii,
+        radius_scale=min(float(args.particle_radius_vis_scale), 1.35),
+        radius_cap=min(float(args.particle_radius_vis_min), 0.0035),
+    )
 
 
 def _box_surface_info(
@@ -1034,6 +1117,42 @@ def _capture_force_snapshot(
     }
 
 
+def _capture_force_snapshot_from_raw_state(
+    raw_state: dict[str, Any],
+    *,
+    meta: dict[str, Any],
+    particle_radius: np.ndarray,
+    mass: np.ndarray,
+    gravity_vec: np.ndarray,
+    force_topk: int,
+    force_eps: float,
+    topk_selector_mode: str,
+    used_manual_force_path: bool,
+) -> dict[str, Any]:
+    return _capture_force_snapshot(
+        frame_index=int(raw_state["frame_index"]),
+        substep_index_in_frame=int(raw_state["substep_index_in_frame"]),
+        global_substep_index=int(raw_state["global_substep_index"]),
+        sim_time=float(raw_state["sim_time"]),
+        sim_dt=float(raw_state["sim_dt"]),
+        particle_q=np.asarray(raw_state["particle_q"], dtype=np.float32),
+        particle_qd=np.asarray(raw_state["particle_qd"], dtype=np.float32),
+        body_q=np.asarray(raw_state["body_q"], dtype=np.float32),
+        body_qd=np.asarray(raw_state["body_qd"], dtype=np.float32),
+        particle_radius=np.asarray(particle_radius, dtype=np.float32),
+        mass=np.asarray(mass, dtype=np.float32),
+        gravity_vec=np.asarray(gravity_vec, dtype=np.float32),
+        f_spring=np.asarray(raw_state["f_spring"], dtype=np.float32),
+        f_internal_total=np.asarray(raw_state["f_internal_total"], dtype=np.float32),
+        f_external_total=np.asarray(raw_state["f_external_total"], dtype=np.float32),
+        meta=meta,
+        force_topk=int(force_topk),
+        force_eps=float(force_eps),
+        topk_selector_mode=str(topk_selector_mode),
+        used_manual_force_path=bool(used_manual_force_path),
+    )
+
+
 def _force_summary_payload(snapshot: dict[str, Any], *, eps: float) -> dict[str, Any]:
     ext_norm = np.asarray(snapshot["external_force_norm"], dtype=np.float32)
     geom_contact_mask = np.asarray(snapshot["geom_contact_mask"], dtype=bool)
@@ -1290,6 +1409,22 @@ def _force_frame_primitives(
         gap_scale = np.minimum(1.0, float(args.force_gap_display_cap) / np.maximum(gap_norm, 1.0e-8))
         gap_vectors = (gap_vectors * gap_scale[:, None]).astype(np.float32, copy=False)
 
+    external_force_normal_vec = (
+        np.asarray(snapshot["external_force_normal_vec"], dtype=np.float32)[topk]
+        if topk.size
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    internal_force_normal_vec = (
+        np.asarray(snapshot["internal_force_normal_vec"], dtype=np.float32)[topk]
+        if topk.size
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+    acceleration_normal_vec = (
+        np.asarray(snapshot["acceleration_normal_vec"], dtype=np.float32)[topk]
+        if topk.size
+        else np.zeros((0, 3), dtype=np.float32)
+    )
+
     arrow_specs = [
         {
             "name": "diag_normal",
@@ -1308,21 +1443,21 @@ def _force_frame_primitives(
         {
             "name": "diag_external_normal",
             "start": closest_anchor,
-            "vectors": np.asarray(snapshot["external_force_normal_vec"], dtype=np.float32)[topk],
+            "vectors": external_force_normal_vec,
             "color": (0.95, 0.25, 0.25),
             "normalize": True,
         },
         {
             "name": "diag_internal_normal",
             "start": closest_anchor,
-            "vectors": np.asarray(snapshot["internal_force_normal_vec"], dtype=np.float32)[topk],
+            "vectors": internal_force_normal_vec,
             "color": (0.62, 0.32, 0.92),
             "normalize": True,
         },
         {
             "name": "diag_accel_normal",
             "start": closest_anchor,
-            "vectors": np.asarray(snapshot["acceleration_normal_vec"], dtype=np.float32)[topk],
+            "vectors": acceleration_normal_vec,
             "color": (0.15, 0.85, 0.25),
             "normalize": True,
         },
@@ -1372,6 +1507,12 @@ def _force_frame_primitives(
         "topk": topk,
         "topk_q": topk_q,
         "topk_closest": topk_closest,
+        "topk_normals": topk_normals.astype(np.float32, copy=False),
+        "closest_anchor": closest_anchor.astype(np.float32, copy=False),
+        "gap_vectors": gap_vectors.astype(np.float32, copy=False),
+        "external_force_normal_vec": external_force_normal_vec.astype(np.float32, copy=False),
+        "internal_force_normal_vec": internal_force_normal_vec.astype(np.float32, copy=False),
+        "acceleration_normal_vec": acceleration_normal_vec.astype(np.float32, copy=False),
         "topk_particle_radii": topk_particle_radii,
         "topk_particle_colors": topk_particle_colors,
         "topk_closest_radii": topk_closest_radii,
@@ -1401,17 +1542,18 @@ def _render_force_diagnostic_frame_with_viewer(
     snapshot_label: str,
 ) -> np.ndarray:
     primitives = _force_frame_primitives(snapshot, render_radii, args)
-    diag_summary = _force_summary_payload(snapshot, eps=1.0e-8)
-
-    cam_pos = primitives["cam_pos"]
+    cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
+    cam_pitch = float(args.camera_pitch)
+    cam_yaw = float(args.camera_yaw)
+    cam_fov = float(args.camera_fov)
     try:
-        viewer.camera.fov = float(primitives["cam_fov"])
+        viewer.camera.fov = cam_fov
     except Exception:
         pass
     viewer.set_camera(
         wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])),
-        float(primitives["cam_pitch"]),
-        float(primitives["cam_yaw"]),
+        cam_pitch,
+        cam_yaw,
     )
 
     state.particle_q.assign(np.asarray(snapshot["particle_q"], dtype=np.float32))
@@ -1438,87 +1580,76 @@ def _render_force_diagnostic_frame_with_viewer(
             hidden=False,
         )
 
-    glyph_buffers: list[Any] = []
-    topk_q = np.asarray(primitives["topk_q"], dtype=np.float32)
-    topk_closest = np.asarray(primitives["topk_closest"], dtype=np.float32)
-    if topk_q.shape[0]:
-        topk_q_wp = wp.array(topk_q.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
-        topk_particle_radii_wp = wp.array(
-            np.asarray(primitives["topk_particle_radii"], dtype=np.float32), dtype=wp.float32, device=device
-        )
-        topk_particle_colors_wp = wp.array(
-            np.asarray(primitives["topk_particle_colors"], dtype=np.float32), dtype=wp.vec3, device=device
-        )
-        topk_closest_wp = wp.array(topk_closest.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
-        topk_closest_radii_wp = wp.array(
-            np.asarray(primitives["topk_closest_radii"], dtype=np.float32), dtype=wp.float32, device=device
-        )
-        topk_closest_colors_wp = wp.array(
-            np.asarray(primitives["topk_closest_colors"], dtype=np.float32), dtype=wp.vec3, device=device
-        )
-        viewer.log_points(
-            "/demo/diag_contact_particles",
-            topk_q_wp,
-            topk_particle_radii_wp,
-            topk_particle_colors_wp,
-            hidden=False,
-        )
-        viewer.log_points(
-            "/demo/diag_closest_points",
-            topk_closest_wp,
-            topk_closest_radii_wp,
-            topk_closest_colors_wp,
-            hidden=False,
-        )
-        glyph_buffers.extend(
-            [
-                topk_q_wp,
-                topk_particle_radii_wp,
-                topk_particle_colors_wp,
-                topk_closest_wp,
-                topk_closest_radii_wp,
-                topk_closest_colors_wp,
-            ]
-        )
-        max_len = max(float(args.force_arrow_scale), 1.0e-6)
-        for spec in primitives["arrow_specs"]:
-            name = str(spec["name"])
-            vectors = np.asarray(spec["vectors"], dtype=np.float32)
-            if bool(spec["normalize"]):
-                norms = np.linalg.norm(vectors, axis=1)
-                peak = float(np.max(norms)) if norms.size else 0.0
-                if peak <= 1.0e-12:
-                    scaled = np.zeros_like(vectors, dtype=np.float32)
-                else:
-                    scaled = (vectors / peak * max_len).astype(np.float32, copy=False)
-            else:
-                scaled = vectors.astype(np.float32, copy=False)
-            starts_np = np.asarray(spec["start"], dtype=np.float32)
-            starts_glyph_wp = wp.array(starts_np.astype(np.float32, copy=False), dtype=wp.vec3, device=device)
-            ends_glyph_wp = wp.array((starts_np + scaled).astype(np.float32, copy=False), dtype=wp.vec3, device=device)
-            glyph_buffers.extend([starts_glyph_wp, ends_glyph_wp])
-            viewer.log_lines(f"/demo/{name}", starts_glyph_wp, ends_glyph_wp, spec["color"], width=0.014, hidden=False)
-
     wp.synchronize_device(device)
     viewer.end_frame()
     wp.synchronize_device(device)
-    frame = viewer.get_frame(render_ui=False).numpy()
+    frame = np.array(viewer.get_frame(render_ui=False).numpy(), dtype=np.uint8, copy=True)
+    return _compose_force_diagnostic_overlay_frame(
+        frame=frame,
+        args=args,
+        snapshot=snapshot,
+        snapshot_label=snapshot_label,
+        primitives=primitives,
+        cam_pos=cam_pos,
+        cam_pitch=cam_pitch,
+        cam_yaw=cam_yaw,
+        cam_fov=cam_fov,
+    )
+
+
+def _compose_force_diagnostic_overlay_frame(
+    *,
+    frame: np.ndarray,
+    args: argparse.Namespace,
+    snapshot: dict[str, Any],
+    snapshot_label: str,
+    primitives: dict[str, Any],
+    cam_pos: np.ndarray,
+    cam_pitch: float,
+    cam_yaw: float,
+    cam_fov: float,
+) -> np.ndarray:
+    diag_summary = _force_summary_payload(snapshot, eps=1.0e-8)
+    frame = _overlay_force_glyphs_rgb(
+        np.asarray(frame, dtype=np.uint8),
+        cam_pos=cam_pos,
+        pitch_deg=cam_pitch,
+        yaw_deg=cam_yaw,
+        fov_deg=cam_fov,
+        topk_q=np.asarray(primitives["topk_q"], dtype=np.float32),
+        topk_closest=np.asarray(primitives["topk_closest"], dtype=np.float32),
+        topk_anchor=np.asarray(primitives["closest_anchor"], dtype=np.float32),
+        topk_normals=np.asarray(primitives["topk_normals"], dtype=np.float32),
+        closest_offset_world=np.asarray(primitives["gap_vectors"], dtype=np.float32),
+        external_force_normal_vec=np.asarray(primitives["external_force_normal_vec"], dtype=np.float32),
+        internal_force_normal_vec=np.asarray(primitives["internal_force_normal_vec"], dtype=np.float32),
+        acceleration_normal_vec=np.asarray(primitives["acceleration_normal_vec"], dtype=np.float32),
+        force_arrow_scale=float(args.force_arrow_scale),
+        normal_display_len=float(args.force_normal_display_len),
+        gap_display_cap=float(args.force_gap_display_cap),
+    )
 
     if str(args.force_video_layout) == "split":
         focus_px = _project_world_to_screen(
             np.asarray(primitives["focus_center_world"], dtype=np.float32),
             cam_pos=cam_pos,
-            pitch_deg=float(primitives["cam_pitch"]),
-            yaw_deg=float(primitives["cam_yaw"]),
-            fov_deg=float(primitives["cam_fov"]),
+            pitch_deg=cam_pitch,
+            yaw_deg=cam_yaw,
+            fov_deg=cam_fov,
             width=int(args.screen_width),
             height=int(args.screen_height),
         )
-        frame = _overlay_zoom_panel_rgb(frame, center_px=focus_px, label="contact zoom")
+        frame = _overlay_zoom_panel_rgb(
+            frame,
+            center_px=focus_px,
+            label="contact zoom",
+            panel_frac=0.32 if int(len(primitives["topk"])) <= 2 else 0.30,
+            zoom=3.6 if int(len(primitives["topk"])) <= 2 else 3.0,
+        )
 
     trigger_substep = int(snapshot.get("trigger_substep_global", snapshot["global_substep_index"]))
     top_lines = [
-        f"FORCE DIAGNOSTIC | {snapshot_label}",
+        f"FORCE MECHANISM | {snapshot_label}",
         "white normal | gray gap | red external | purple internal | green acceleration",
     ]
     frame = overlay_text_lines_rgb(
@@ -1561,6 +1692,33 @@ def _render_force_diagnostic_frame_with_viewer(
     return np.array(frame, dtype=np.uint8, copy=True)
 
 
+def _make_force_diagnostic_frame_from_rgb(
+    model: newton.Model,
+    args: argparse.Namespace,
+    snapshot: dict[str, Any],
+    frame_rgb: np.ndarray,
+    *,
+    cam_pos: np.ndarray,
+    cam_pitch: float,
+    cam_yaw: float,
+    cam_fov: float,
+    snapshot_label: str,
+) -> np.ndarray:
+    render_radii = _compute_force_visual_particle_radii(model.particle_radius.numpy(), args)
+    primitives = _force_frame_primitives(snapshot, render_radii, args)
+    return _compose_force_diagnostic_overlay_frame(
+        frame=np.asarray(frame_rgb, dtype=np.uint8),
+        args=args,
+        snapshot=snapshot,
+        snapshot_label=str(snapshot_label),
+        primitives=primitives,
+        cam_pos=np.asarray(cam_pos, dtype=np.float32),
+        cam_pitch=float(cam_pitch),
+        cam_yaw=float(cam_yaw),
+        cam_fov=float(cam_fov),
+    )
+
+
 def _make_force_diagnostic_frame(
     model: newton.Model,
     meta: dict[str, Any],
@@ -1584,11 +1742,7 @@ def _make_force_diagnostic_frame(
     else:
         snapshot_label = f"trigger_plus_{int(snapshot_substeps_after_trigger)}"
 
-    render_radii = compute_visual_particle_radii(
-        model.particle_radius.numpy(),
-        radius_scale=float(args.particle_radius_vis_scale),
-        radius_cap=float(args.particle_radius_vis_min),
-    )
+    render_radii = _compute_force_visual_particle_radii(model.particle_radius.numpy(), args)
     cloth_edges = np.asarray(meta["render_edges"], dtype=np.int32)
     viewer = newton.viewer.ViewerGL(
         width=int(args.screen_width),
@@ -1599,7 +1753,7 @@ def _make_force_diagnostic_frame(
     frame_out: np.ndarray | None = None
     try:
         viewer.set_model(model)
-        viewer.show_particles = False
+        viewer.show_particles = True
         viewer.show_triangles = True
         viewer.show_visual = True
         viewer.show_static = True
@@ -1750,6 +1904,7 @@ def _render_force_diagnostic_sequence_video(
     out_path: Path,
     *,
     ir_obj: dict[str, Any] | None = None,
+    first_frame_out_path: Path | None = None,
 ) -> Path | None:
     if not sequence_items:
         return None
@@ -1760,7 +1915,6 @@ def _render_force_diagnostic_sequence_video(
         raise RuntimeError("ffmpeg not found in PATH")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fps = max(float(args.render_fps), 1.0)
-    hold_frames = max(1, int(round(max(float(args.force_video_hold_seconds), 1.0e-3) * fps)))
     width = int(args.screen_width)
     height = int(args.screen_height)
     cmd = [
@@ -1791,7 +1945,7 @@ def _render_force_diagnostic_sequence_video(
     rendered_frames: list[np.ndarray] = []
     try:
         viewer.set_model(model)
-        viewer.show_particles = False
+        viewer.show_particles = True
         viewer.show_triangles = True
         viewer.show_visual = True
         viewer.show_static = True
@@ -1810,11 +1964,7 @@ def _render_force_diagnostic_sequence_video(
                 )
             ],
         )
-        render_radii = compute_visual_particle_radii(
-            model.particle_radius.numpy(),
-            radius_scale=float(args.particle_radius_vis_scale),
-            radius_cap=float(args.particle_radius_vis_min),
-        )
+        render_radii = _compute_force_visual_particle_radii(model.particle_radius.numpy(), args)
         cloth_edges = np.asarray(meta["render_edges"], dtype=np.int32)
         starts_wp = wp.empty(len(cloth_edges), dtype=wp.vec3, device=device) if cloth_edges.size else None
         ends_wp = wp.empty(len(cloth_edges), dtype=wp.vec3, device=device) if cloth_edges.size else None
@@ -1853,6 +2003,11 @@ def _render_force_diagnostic_sequence_video(
                 )
                 frame_copy = np.array(frame, dtype=np.uint8, copy=True)
                 rendered_frames.append(frame_copy)
+                if (item_idx + 1) == len(sequence_items) or ((item_idx + 1) % 10 == 0):
+                    print(
+                        f"  force frame {item_idx + 1}/{len(sequence_items)}",
+                        flush=True,
+                    )
     finally:
         try:
             viewer.close()
@@ -1862,9 +2017,26 @@ def _render_force_diagnostic_sequence_video(
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     assert proc.stdin is not None
     try:
-        for frame in rendered_frames:
+        if rendered_frames and first_frame_out_path is not None:
+            _save_force_diagnostic_snapshot_frame(rendered_frames[0], first_frame_out_path)
+        repeat_counts: list[int] = []
+        for item_idx, item in enumerate(sequence_items):
+            current_time = float(item["snapshot"]["sim_time"])
+            if item_idx + 1 < len(sequence_items):
+                next_time = float(sequence_items[item_idx + 1]["snapshot"]["sim_time"])
+                sim_delta = max(next_time - current_time, 1.0e-6)
+            else:
+                sim_delta = max(float(args.sim_dt), 1.0e-6)
+            repeat = max(1, int(round(sim_delta * float(args.slowdown) * fps)))
+            label = str(item["label"]).lower()
+            if any(token in label for token in ("trigger", "max penetration", "rebound", "post-contact")):
+                repeat = max(repeat, 2)
+            repeat = min(repeat, 6)
+            repeat_counts.append(int(repeat))
+
+        for frame, repeat in zip(rendered_frames, repeat_counts, strict=False):
             payload = frame.tobytes()
-            for _ in range(hold_frames):
+            for _ in range(int(repeat)):
                 proc.stdin.write(payload)
         proc.stdin.close()
         if proc.wait() != 0:
@@ -1872,6 +2044,302 @@ def _render_force_diagnostic_sequence_video(
     finally:
         if proc.stdin and not proc.stdin.closed:
             proc.stdin.close()
+    return out_path
+
+
+def _render_force_diagnostic_video_over_base_video(
+    model: newton.Model,
+    args: argparse.Namespace,
+    sim_data: dict[str, Any],
+    sequence_items: list[dict[str, Any]],
+    base_video_path: Path,
+    out_path: Path,
+    *,
+    snapshot_frame_index: int | None = None,
+    snapshot_out_path: Path | None = None,
+) -> Path | None:
+    if not sequence_items:
+        return None
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg not found in PATH")
+    if not base_video_path.exists():
+        raise FileNotFoundError(f"base phenomenon video not found: {base_video_path}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    width = int(args.screen_width)
+    height = int(args.screen_height)
+    fps = max(float(args.render_fps), 1.0)
+    bytes_per_frame = width * height * 3
+
+    sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+    n_sim_frames = int(np.asarray(sim_data["particle_q_all"]).shape[0])
+    render_end_frame = int(sim_data.get("render_end_frame", max(0, n_sim_frames - 1)))
+    render_indices = np.asarray(
+        sim_data.get(
+            "render_output_frame_indices",
+            _continuous_output_frame_indices(
+                n_sim_frames=n_sim_frames,
+                render_end_frame=render_end_frame,
+                sim_frame_dt=sim_frame_dt,
+                fps_out=float(args.render_fps),
+                slowdown=float(args.slowdown),
+            ),
+        ),
+        dtype=np.int32,
+    ).reshape(-1)
+    decode_cmd = [
+        ffmpeg,
+        "-i",
+        str(base_video_path),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-",
+    ]
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        str(out_path),
+    ]
+
+    render_radii = _compute_force_visual_particle_radii(model.particle_radius.numpy(), args)
+    cam_pos = np.asarray(sim_data.get("render_camera_pos", np.asarray(args.camera_pos, dtype=np.float32)), dtype=np.float32)
+    cam_pitch = float(sim_data.get("render_camera_pitch_deg", float(args.camera_pitch)))
+    cam_yaw = float(sim_data.get("render_camera_yaw_deg", float(args.camera_yaw)))
+    cam_fov = float(sim_data.get("render_camera_fov_deg", float(args.camera_fov)))
+    snapshot_map: dict[int, dict[str, Any]] = {}
+    label_map: dict[int, str] = {}
+    for item in sequence_items:
+        snapshot = item["snapshot"]
+        frame_idx = int(snapshot.get("frame_index", int(snapshot["global_substep_index"]) // max(1, int(sim_data["substeps"]))))
+        snapshot_map[frame_idx] = snapshot
+        label_map[frame_idx] = str(item["label"])
+
+    decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    assert decoder.stdout is not None
+    saved_snapshot = False
+    try:
+        for frame_idx, sim_idx_raw in enumerate(render_indices.tolist()):
+            raw = decoder.stdout.read(bytes_per_frame)
+            if len(raw) < bytes_per_frame:
+                break
+            sim_idx = int(sim_idx_raw)
+            snapshot = snapshot_map.get(sim_idx)
+            if snapshot is None:
+                nearest = min(snapshot_map.keys(), key=lambda idx: abs(int(idx) - sim_idx))
+                snapshot = snapshot_map[nearest]
+                snapshot_label = label_map.get(nearest, "full process")
+            else:
+                snapshot_label = label_map.get(sim_idx, "full process")
+
+            primitives = _force_frame_primitives(snapshot, render_radii, args)
+            rgb = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
+            rgb = _compose_force_diagnostic_overlay_frame(
+                frame=rgb,
+                args=args,
+                snapshot=snapshot,
+                snapshot_label=snapshot_label,
+                primitives=primitives,
+                cam_pos=cam_pos,
+                cam_pitch=cam_pitch,
+                cam_yaw=cam_yaw,
+                cam_fov=cam_fov,
+            )
+            if (
+                snapshot_out_path is not None
+                and not saved_snapshot
+                and snapshot_frame_index is not None
+                and int(snapshot.get("frame_index", sim_idx)) == int(snapshot_frame_index)
+            ):
+                _save_force_diagnostic_snapshot_frame(rgb, snapshot_out_path)
+                saved_snapshot = True
+            proc.stdin.write(np.asarray(rgb, dtype=np.uint8).tobytes())
+        proc.stdin.close()
+        decoder.stdout.close()
+        decoder.wait()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed while encoding full-process force video")
+    finally:
+        if decoder.stdout and not decoder.stdout.closed:
+            decoder.stdout.close()
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    return out_path
+
+
+def _render_force_diagnostic_video_over_saved_frames(
+    model: newton.Model,
+    args: argparse.Namespace,
+    sim_data: dict[str, Any],
+    sequence_items: list[dict[str, Any]],
+    frames_dir: Path,
+    out_path: Path,
+    *,
+    snapshot_frame_index: int | None = None,
+    snapshot_out_path: Path | None = None,
+) -> Path | None:
+    if not sequence_items:
+        return None
+    from PIL import Image  # noqa: PLC0415
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg not found in PATH")
+    if not frames_dir.exists():
+        raise FileNotFoundError(f"saved phenomenon frames not found: {frames_dir}")
+
+    frame_paths = sorted(frames_dir.glob("frame_*.png"))
+    if not frame_paths:
+        raise RuntimeError(f"no saved phenomenon frame PNGs under {frames_dir}")
+
+    width = int(args.screen_width)
+    height = int(args.screen_height)
+    fps = max(float(args.render_fps), 1.0)
+    n_sim_frames = int(np.asarray(sim_data["particle_q_all"]).shape[0])
+    render_end_frame = int(sim_data.get("render_end_frame", max(0, n_sim_frames - 1)))
+    sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+    render_indices = np.asarray(
+        sim_data.get(
+            "render_output_frame_indices",
+            _continuous_output_frame_indices(
+                n_sim_frames=n_sim_frames,
+                render_end_frame=render_end_frame,
+                sim_frame_dt=sim_frame_dt,
+                fps_out=float(args.render_fps),
+                slowdown=float(args.slowdown),
+            ),
+        ),
+        dtype=np.int32,
+    ).reshape(-1)
+    if render_indices.shape[0] > len(frame_paths):
+        render_indices = render_indices[: len(frame_paths)]
+    frame_paths = frame_paths[: render_indices.shape[0]]
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-vcodec",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "-",
+        "-an",
+        "-vcodec",
+        "libx264",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        str(out_path),
+    ]
+
+    render_radii = _compute_force_visual_particle_radii(model.particle_radius.numpy(), args)
+    cam_pos = np.asarray(sim_data.get("render_camera_pos", np.asarray(args.camera_pos, dtype=np.float32)), dtype=np.float32)
+    cam_pitch = float(sim_data.get("render_camera_pitch_deg", float(args.camera_pitch)))
+    cam_yaw = float(sim_data.get("render_camera_yaw_deg", float(args.camera_yaw)))
+    cam_fov = float(sim_data.get("render_camera_fov_deg", float(args.camera_fov)))
+    snapshot_map: dict[int, dict[str, Any]] = {}
+    label_map: dict[int, str] = {}
+    for item in sequence_items:
+        snapshot = item["snapshot"]
+        frame_idx = int(snapshot.get("frame_index", int(snapshot["global_substep_index"]) // max(1, int(sim_data["substeps"]))))
+        snapshot_map[frame_idx] = snapshot
+        label_map[frame_idx] = str(item["label"])
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    assert proc.stdin is not None
+    saved_snapshot = False
+    try:
+        for out_idx, frame_path in enumerate(frame_paths):
+            sim_idx = int(render_indices[out_idx])
+            snapshot = snapshot_map.get(sim_idx)
+            if snapshot is None:
+                nearest = min(snapshot_map.keys(), key=lambda idx: abs(int(idx) - sim_idx))
+                snapshot = snapshot_map[nearest]
+                snapshot_label = label_map.get(nearest, "full process")
+            else:
+                snapshot_label = label_map.get(sim_idx, "full process")
+
+            primitives = _force_frame_primitives(snapshot, render_radii, args)
+            with Image.open(frame_path) as handle:
+                rgb = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+            rgb = _compose_force_diagnostic_overlay_frame(
+                frame=rgb,
+                args=args,
+                snapshot=snapshot,
+                snapshot_label=snapshot_label,
+                primitives=primitives,
+                cam_pos=cam_pos,
+                cam_pitch=cam_pitch,
+                cam_yaw=cam_yaw,
+                cam_fov=cam_fov,
+            )
+            if (
+                snapshot_out_path is not None
+                and not saved_snapshot
+                and snapshot_frame_index is not None
+                and int(snapshot.get("frame_index", sim_idx)) == int(snapshot_frame_index)
+            ):
+                _save_force_diagnostic_snapshot_frame(rgb, snapshot_out_path)
+                saved_snapshot = True
+            proc.stdin.write(np.asarray(rgb, dtype=np.uint8).tobytes())
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError("ffmpeg failed while encoding full-process force video")
+    finally:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+
+    if snapshot_out_path is not None and not saved_snapshot and frame_paths:
+        with Image.open(frame_paths[0]) as handle:
+            rgb = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+        first_sim_idx = int(render_indices[0]) if render_indices.size else 0
+        snapshot0 = snapshot_map.get(first_sim_idx, sequence_items[0]["snapshot"])
+        label0 = label_map.get(first_sim_idx, str(sequence_items[0]["label"]))
+        rgb = _compose_force_diagnostic_overlay_frame(
+            frame=rgb,
+            args=args,
+            snapshot=snapshot0,
+            snapshot_label=label0,
+            primitives=_force_frame_primitives(snapshot0, render_radii, args),
+            cam_pos=cam_pos,
+            cam_pitch=cam_pitch,
+            cam_yaw=cam_yaw,
+            cam_fov=cam_fov,
+        )
+        _save_force_diagnostic_snapshot_frame(rgb, snapshot_out_path)
     return out_path
 
 
@@ -1884,13 +2352,40 @@ def _finalize_force_diagnostic_artifacts(
     sequence_items: list[dict[str, Any]] | None = None,
     *,
     ir_obj: dict[str, Any] | None = None,
+    sim_data: dict[str, Any] | None = None,
+    base_video_path: Path | None = None,
+    base_frames_dir: Path | None = None,
 ) -> tuple[Path, Path | None, Path | None]:
+    from PIL import Image  # noqa: PLC0415
+
     snapshot_png_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.png"
     snapshot_mp4_path = _resolve_force_dump_dir(args) / "force_diag_trigger_snapshot.mp4"
     sequence_mp4_path = _resolve_force_dump_dir(args) / "force_diag_trigger_window.mp4"
     rendered_sequence_video = None
     if sequence_items:
-        if ir_obj is not None:
+        if base_frames_dir is not None and sim_data is not None and Path(base_frames_dir).exists():
+            rendered_sequence_video = _render_force_diagnostic_video_over_saved_frames(
+                model,
+                args,
+                sim_data,
+                sequence_items or [],
+                Path(base_frames_dir),
+                sequence_mp4_path,
+                snapshot_frame_index=int(snapshot.get("frame_index", -1)),
+                snapshot_out_path=snapshot_png_path,
+            )
+        elif base_video_path is not None and sim_data is not None and Path(base_video_path).exists():
+            rendered_sequence_video = _render_force_diagnostic_video_over_base_video(
+                model,
+                args,
+                sim_data,
+                sequence_items or [],
+                Path(base_video_path),
+                sequence_mp4_path,
+                snapshot_frame_index=int(snapshot.get("frame_index", -1)),
+                snapshot_out_path=snapshot_png_path,
+            )
+        elif ir_obj is not None:
             model_seq, meta_seq, _ = build_model(ir_obj, args, device)
             try:
                 rendered_sequence_video = _render_force_diagnostic_sequence_video(
@@ -1901,6 +2396,7 @@ def _finalize_force_diagnostic_artifacts(
                     sequence_items or [],
                     sequence_mp4_path,
                     ir_obj=None,
+                    first_frame_out_path=None,
                 )
             finally:
                 del model_seq
@@ -1913,18 +2409,22 @@ def _finalize_force_diagnostic_artifacts(
                     sequence_items or [],
                     sequence_mp4_path,
                     ir_obj=None,
+                    first_frame_out_path=None,
                 )
-    diag_frame = _make_force_diagnostic_frame(
-        model,
-        meta,
-        args,
-        device,
-        snapshot,
-    )
-    _save_force_diagnostic_snapshot_frame(diag_frame, snapshot_png_path)
+    if snapshot_png_path.exists():
+        diag_frame = np.asarray(Image.open(snapshot_png_path).convert("RGB"), dtype=np.uint8)
+    else:
+        diag_frame = _make_force_diagnostic_frame(
+            model,
+            meta,
+            args,
+            device,
+            snapshot,
+        )
+        _save_force_diagnostic_snapshot_frame(diag_frame, snapshot_png_path)
     rendered_diag_video = _render_force_diagnostic_video(
         args,
-        diag_frame,
+        np.asarray(diag_frame if diag_frame is not None else Image.open(snapshot_png_path).convert("RGB"), dtype=np.uint8),
         snapshot_mp4_path,
     )
     return snapshot_png_path, rendered_diag_video, rendered_sequence_video
@@ -1950,6 +2450,37 @@ def _camera_basis_from_pitch_yaw(pitch_deg: float, yaw_deg: float) -> tuple[np.n
     up = np.cross(right, forward).astype(np.float32, copy=False)
     up /= max(np.linalg.norm(up), 1.0e-8)
     return forward, right, up
+
+
+def _fit_camera_to_points(
+    points_world: np.ndarray,
+    *,
+    yaw_deg: float,
+    pitch_deg: float,
+    fov_deg: float,
+    aspect: float,
+    min_distance: float = 0.22,
+    pad: float = 1.14,
+) -> tuple[np.ndarray, np.ndarray]:
+    points = np.asarray(points_world, dtype=np.float32).reshape(-1, 3)
+    if points.size == 0:
+        origin = np.zeros((3,), dtype=np.float32)
+        return origin, origin
+    bbox_min = np.min(points, axis=0)
+    bbox_max = np.max(points, axis=0)
+    center = (0.5 * (bbox_min + bbox_max)).astype(np.float32, copy=False)
+    forward, right, up = _camera_basis_from_pitch_yaw(pitch_deg, yaw_deg)
+    rel = points - center[None, :]
+    x = np.abs(rel @ right)
+    y = np.abs(rel @ up)
+    z_off = rel @ forward
+    tan_half_y = max(np.tan(np.deg2rad(float(fov_deg)) * 0.5), 1.0e-6)
+    tan_half_x = tan_half_y * max(float(aspect), 1.0e-6)
+    req_x = np.max(x / tan_half_x - z_off) if x.size else 0.0
+    req_y = np.max(y / tan_half_y - z_off) if y.size else 0.0
+    distance = max(float(min_distance), float(pad) * max(float(req_x), float(req_y), 0.0))
+    cam_pos = (center - forward * distance).astype(np.float32, copy=False)
+    return cam_pos, center.astype(np.float32, copy=False)
 
 
 def _project_world_to_screen(
@@ -2027,10 +2558,10 @@ def _overlay_zoom_panel_rgb(
     draw.rectangle((x0, y0, x1, y1), outline=(255, 215, 0, 255), width=3)
 
     panel_x1 = width - margin
-    panel_y0 = margin + 120
+    panel_y0 = max(margin + 96, (height - panel_h) // 2)
     panel_x0 = panel_x1 - panel_w
     panel_y1 = panel_y0 + panel_h
-    draw.rectangle((panel_x0 - 4, panel_y0 - 28, panel_x1 + 4, panel_y1 + 4), fill=(0, 0, 0, 95))
+    draw.rectangle((panel_x0 - 8, panel_y0 - 30, panel_x1 + 8, panel_y1 + 8), fill=(0, 0, 0, 108))
     img.paste(crop, (panel_x0, panel_y0))
     draw.rectangle((panel_x0, panel_y0, panel_x1, panel_y1), outline=(255, 215, 0, 255), width=4)
     try:
@@ -2075,6 +2606,8 @@ def _overlay_force_glyphs_rgb(
     internal_force_normal_vec: np.ndarray,
     acceleration_normal_vec: np.ndarray,
     force_arrow_scale: float,
+    normal_display_len: float,
+    gap_display_cap: float,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw
 
@@ -2099,13 +2632,19 @@ def _overlay_force_glyphs_rgb(
         p_px = proj(particle_pt)
         c_px = proj(closest_pt)
         if p_px is not None:
-            draw.ellipse((p_px[0] - 8, p_px[1] - 8, p_px[0] + 8, p_px[1] + 8), fill=(255, 219, 46, 255))
+            draw.ellipse((p_px[0] - 7, p_px[1] - 7, p_px[0] + 7, p_px[1] + 7), fill=(255, 219, 46, 235))
         if c_px is not None:
-            draw.ellipse((c_px[0] - 6, c_px[1] - 6, c_px[0] + 6, c_px[1] + 6), fill=(140, 240, 250, 255))
+            draw.ellipse((c_px[0] - 5, c_px[1] - 5, c_px[0] + 5, c_px[1] + 5), fill=(140, 240, 250, 235))
+
+    gap_vectors = np.asarray(closest_offset_world, dtype=np.float32)
+    if gap_vectors.size:
+        gap_norm = np.linalg.norm(gap_vectors, axis=1)
+        gap_scale = np.minimum(1.0, float(gap_display_cap) / np.maximum(gap_norm, 1.0e-8))
+        gap_vectors = (gap_vectors * gap_scale[:, None]).astype(np.float32, copy=False)
 
     specs = [
-        (topk_closest, topk_closest + topk_normals * float(force_arrow_scale), (255, 255, 255), 4),
-        (topk_closest, topk_closest + closest_offset_world * float(force_arrow_scale), (179, 179, 179), 3),
+        (topk_closest, topk_closest + topk_normals * float(normal_display_len), (255, 255, 255), 4),
+        (topk_closest, topk_closest + gap_vectors, (179, 179, 179), 4),
         (topk_anchor, None, (242, 64, 64), 4),
         (topk_anchor, None, (158, 82, 235), 4),
         (topk_anchor, None, (38, 217, 64), 4),
@@ -2124,9 +2663,9 @@ def _overlay_force_glyphs_rgb(
         else:
             scaled = (vectors / peak * float(force_arrow_scale)).astype(np.float32, copy=False)
             scaled_force_ends.append((topk_anchor + scaled).astype(np.float32, copy=False))
-    specs[2] = (topk_anchor, scaled_force_ends[0], (242, 64, 64), 4)
-    specs[3] = (topk_anchor, scaled_force_ends[1], (158, 82, 235), 4)
-    specs[4] = (topk_anchor, scaled_force_ends[2], (38, 217, 64), 4)
+    specs[2] = (topk_anchor, scaled_force_ends[0], (242, 64, 64), 5)
+    specs[3] = (topk_anchor, scaled_force_ends[1], (158, 82, 235), 5)
+    specs[4] = (topk_anchor, scaled_force_ends[2], (38, 217, 64), 5)
 
     for starts, ends, color, line_w in specs:
         for start_world, end_world in zip(starts, ends):
@@ -2160,63 +2699,24 @@ def _compute_rigid_focus_metrics(
             "rebound_frame": None,
         }
 
+    cloth_z = cloth_q[:, :, 2].astype(np.float32, copy=False)
+    n_focus = min(48, int(cloth_q.shape[1]))
+    for frame_idx in range(n_frames):
+        order = np.argsort(cloth_z[frame_idx])[:n_focus]
+        focus_world[frame_idx] = np.mean(
+            cloth_q[frame_idx, order].astype(np.float32, copy=False),
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+    body_z = body_q[:, 0, 2].astype(np.float32, copy=False)
     if rigid_kind == "box":
-        hx, hy, hz = [float(v) for v in np.asarray(meta["box_half_extents"]).ravel()]
-        for frame_idx in range(n_frames):
-            pos = body_q[frame_idx, 0, :3].astype(np.float32)
-            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
-            surface = _box_surface_info(
-                cloth_q[frame_idx].astype(np.float32, copy=False),
-                pos,
-                quat_xyzw,
-                np.asarray(meta["box_half_extents"], dtype=np.float32),
-                particle_radius,
-            )
-            pen = np.asarray(surface["penetration_depth_signed"], dtype=np.float32)
-            penetration_max[frame_idx] = float(np.max(pen)) if pen.size else 0.0
-            penetration_p99[frame_idx] = float(np.quantile(pen, 0.99)) if pen.size else 0.0
-            cand = np.flatnonzero(pen > 1.0e-8)
-            if cand.size == 0:
-                unsigned = np.asarray(surface["unsigned_distance_to_surface"], dtype=np.float32)
-                order = np.argsort(unsigned)[: min(32, unsigned.size)]
-                cand = order.astype(np.int32, copy=False)
-            if cand.size:
-                pts = np.asarray(surface["closest_point_world"], dtype=np.float32)[cand]
-                focus_world[frame_idx] = np.mean(pts, axis=0).astype(np.float32, copy=False)
-            else:
-                focus_world[frame_idx] = pos.astype(np.float32, copy=False)
+        rigid_top = body_z + float(np.asarray(meta.get("box_half_extents", np.zeros(3, dtype=np.float32)))[2])
     else:
-        faces = np.asarray(meta.get("mesh_tri_indices", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
-        verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
-        scale = float(meta.get("mesh_scale", 1.0))
-        for frame_idx in range(n_frames):
-            pos = body_q[frame_idx, 0, :3].astype(np.float32)
-            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32)
-            surface = _mesh_surface_info(
-                cloth_q[frame_idx].astype(np.float32, copy=False),
-                pos,
-                quat_xyzw,
-                meta,
-                particle_radius,
-            )
-            pen = np.asarray(surface["penetration_depth_signed"], dtype=np.float32)
-            penetration_max[frame_idx] = float(np.max(pen)) if pen.size else 0.0
-            penetration_p99[frame_idx] = float(np.quantile(pen, 0.99)) if pen.size else 0.0
-            cand = np.flatnonzero(pen > 1.0e-8)
-            if cand.size == 0:
-                unsigned = np.asarray(surface["unsigned_distance_to_surface"], dtype=np.float32)
-                order = np.argsort(unsigned)[: min(32, unsigned.size)]
-                cand = order.astype(np.int32, copy=False)
-            if cand.size:
-                pts = 0.5 * (
-                    np.asarray(surface["closest_point_world"], dtype=np.float32)[cand]
-                    + cloth_q[frame_idx][cand].astype(np.float32, copy=False)
-                )
-                focus_world[frame_idx] = np.mean(pts, axis=0).astype(np.float32, copy=False)
-            else:
-                rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
-                verts = (verts_local * scale) @ rot.T + pos[None, :]
-                focus_world[frame_idx] = np.mean(verts, axis=0).astype(np.float32, copy=False)
+        rigid_top_offset = float(meta.get("bunny_top_z", 0.0)) - float(body_z[0] if body_z.size else 0.0)
+        rigid_top = body_z + rigid_top_offset
+    approx_pen_depth = np.maximum(rigid_top[:, None] - cloth_z, 0.0).astype(np.float32, copy=False)
+    penetration_max = np.max(approx_pen_depth, axis=1).astype(np.float32, copy=False)
+    penetration_p99 = np.quantile(approx_pen_depth, 0.99, axis=1).astype(np.float32, copy=False)
 
     contact_frames = np.flatnonzero(penetration_max > 1.0e-8)
     first_contact = int(contact_frames[0]) if contact_frames.size else None
@@ -2517,6 +3017,7 @@ def _force_window_observer_rollout(
     trigger_substep_global: int,
     n_obj: int,
     device: str,
+    sim_data: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     observer_args = copy.deepcopy(args)
     observer_args.force_diagnostic = False
@@ -2582,6 +3083,16 @@ def _force_window_observer_rollout(
     gravity_vec_diag = np.asarray(gravity_vec, dtype=np.float32).reshape(3)
     force_eps = 1.0e-8
     global_substep_index = 0
+    start_frame_index = 0
+    if sim_data is not None and "particle_q_all" in sim_data and "particle_qd_all" in sim_data:
+        start_frame_index = max(0, int(trigger_substep_global) // max(1, substeps) - 1)
+        state_in.particle_q.assign(np.asarray(sim_data["particle_q_all"][start_frame_index], dtype=np.float32))
+        state_in.particle_qd.assign(np.asarray(sim_data["particle_qd_all"][start_frame_index], dtype=np.float32))
+        if state_in.body_q is not None and np.asarray(sim_data["body_q"][start_frame_index]).size:
+            state_in.body_q.assign(np.asarray(sim_data["body_q"][start_frame_index], dtype=np.float32))
+        if state_in.body_qd is not None and np.asarray(sim_data["body_qd"][start_frame_index]).size:
+            state_in.body_qd.assign(np.asarray(sim_data["body_qd"][start_frame_index], dtype=np.float32))
+        global_substep_index = start_frame_index * substeps
     use_decoupled_shape_materials = bool(observer_args.decouple_shape_materials) or (
         not np.isclose(float(ir_obj.get("weight_scale", 1.0)), 1.0)
     )
@@ -2595,11 +3106,14 @@ def _force_window_observer_rollout(
     for offset in offset_keys:
         label = "trigger" if offset == 0 else f"trigger+{int(offset)}"
         target_substeps[int(trigger_substep_global) + int(offset)] = label
-    search_end = int(trigger_substep_global) + max(
-        int(after),
-        32 if (bool(observer_args.force_include_max_penetration) or bool(observer_args.force_include_rebound)) else int(after),
-    )
-    monitor_stride = 4
+    trigger_frame_index = max(start_frame_index, int(trigger_substep_global) // max(1, substeps))
+    search_end = int(trigger_substep_global) + max(int(after), 24)
+    dense_window_end = int(trigger_substep_global) + max(int(after), 24)
+    late_target_frames = {
+        min(n_frames - 1, trigger_frame_index + 1),
+        min(n_frames - 1, trigger_frame_index + 3),
+        min(n_frames - 1, trigger_frame_index + 5),
+    }
 
     sequence_map: dict[int, dict[str, Any]] = {}
     best_pen_snapshot: dict[str, Any] | None = None
@@ -2609,7 +3123,7 @@ def _force_window_observer_rollout(
     last_snapshot: dict[str, Any] | None = None
 
     try:
-        for frame in range(n_frames):
+        for frame in range(start_frame_index, n_frames):
             for substep_index_in_frame in range(substeps):
                 state_in.clear_forces()
                 if particle_grid is not None:
@@ -2664,7 +3178,12 @@ def _force_window_observer_rollout(
                 if int(global_substep_index) >= int(trigger_substep_global) - int(before) and int(global_substep_index) <= int(search_end):
                     offset = int(global_substep_index) - int(trigger_substep_global)
                     should_capture = int(global_substep_index) in target_substeps
-                    if offset >= 0 and (offset % monitor_stride == 0 or int(global_substep_index) == int(search_end)):
+                    if int(global_substep_index) <= int(dense_window_end):
+                        should_capture = True
+                    elif (
+                        frame in late_target_frames
+                        and substep_index_in_frame == substeps - 1
+                    ) or int(global_substep_index) == int(search_end):
                         should_capture = True
                     if should_capture:
                         particle_q_np = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
@@ -2705,8 +3224,14 @@ def _force_window_observer_rollout(
                         snapshot["trigger_substep_global"] = int(trigger_substep_global)
                         last_snapshot = snapshot
                         label = target_substeps.get(int(global_substep_index))
-                        if label is not None:
-                            _store_force_window_snapshot(sequence_map, snapshot, label)
+                        if label is None:
+                            if int(global_substep_index) < int(trigger_substep_global):
+                                label = "pre-contact"
+                            elif int(global_substep_index) <= int(dense_window_end):
+                                label = f"trigger+{max(0, offset)}"
+                            else:
+                                label = "post-contact evolution"
+                        _store_force_window_snapshot(sequence_map, snapshot, label)
                         if int(global_substep_index) >= int(trigger_substep_global):
                             pen_mm = _snapshot_max_penetration_mm(snapshot)
                             if bool(observer_args.force_include_max_penetration) and pen_mm > best_pen_mm:
@@ -2759,6 +3284,8 @@ def _force_window_observer_rollout(
                 global_substep_index += 1
                 if int(global_substep_index) > int(search_end):
                     break
+            if frame == n_frames - 1 or ((frame + 1) % 2 == 0):
+                print(f"  observer frame {frame + 1}/{n_frames}", flush=True)
             if int(global_substep_index) > int(search_end):
                 break
     finally:
@@ -2778,6 +3305,190 @@ def _force_window_observer_rollout(
         }
         for _, item in sorted(sequence_map.items(), key=lambda kv: kv[0])
     ]
+
+
+def _capture_force_snapshot_from_explicit_state(
+    *,
+    model: newton.Model,
+    meta: dict[str, Any],
+    ir_obj: dict[str, Any],
+    args: argparse.Namespace,
+    device: str,
+    n_obj: int,
+    frame_index: int,
+    substep_index_in_frame: int,
+    global_substep_index: int,
+    sim_time: float,
+    particle_q: np.ndarray,
+    particle_qd: np.ndarray,
+    body_q: np.ndarray,
+    body_qd: np.ndarray,
+    explicit_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    owns_context = explicit_context is None
+    if explicit_context is None:
+        explicit_context = _make_explicit_force_snapshot_context(
+            model=model,
+            ir_obj=ir_obj,
+            args=args,
+            device=device,
+            n_obj=n_obj,
+        )
+    cfg = explicit_context["cfg"]
+    solver = explicit_context["solver"]
+    state = explicit_context["state"]
+    control = explicit_context["control"]
+    contacts = explicit_context["contacts"]
+    particle_grid = explicit_context["particle_grid"]
+    search_radius = explicit_context["search_radius"]
+    particle_mass_diag = explicit_context["particle_mass_diag"]
+    particle_radius_diag = explicit_context["particle_radius_diag"]
+    gravity_vec_diag = explicit_context["gravity_vec_diag"]
+
+    state.particle_q.assign(np.asarray(particle_q, dtype=np.float32))
+    state.particle_qd.assign(np.asarray(particle_qd, dtype=np.float32))
+    if state.body_q is not None and np.asarray(body_q).size:
+        state.body_q.assign(np.asarray(body_q, dtype=np.float32))
+    if state.body_qd is not None and np.asarray(body_qd).size:
+        state.body_qd.assign(np.asarray(body_qd, dtype=np.float32))
+    state.clear_forces()
+
+    if particle_grid is not None:
+        with wp.ScopedDevice(model.device):
+            particle_grid.build(state.particle_q, radius=search_radius)
+    if contacts is not None:
+        model.collide(state, contacts)
+
+    particle_f = state.particle_f if state.particle_count else None
+    body_f = state.body_f if state.body_count else None
+    body_f_work = body_f
+    if body_f is not None and model.joint_count and control.joint_f is not None:
+        body_f_work = wp.clone(body_f)
+    if particle_f is None:
+        raise RuntimeError("Explicit-state force snapshot requires allocated particle forces.")
+
+    eval_spring_forces(model, state, particle_f)
+    f_spring_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+    eval_triangle_forces(model, state, control, particle_f)
+    eval_bending_forces(model, state, particle_f)
+    eval_tetrahedra_forces(model, state, control, particle_f)
+    f_internal_total_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+    eval_body_joint_forces(model, state, control, body_f_work, solver.joint_attach_ke, solver.joint_attach_kd)
+    if solver.enable_tri_contact:
+        eval_triangle_contact_forces(model, state, particle_f)
+    f_before_particle_body_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+    use_decoupled_shape_materials = bool(args.decouple_shape_materials) or (
+        not np.isclose(float(ir_obj.get("weight_scale", 1.0)), 1.0)
+    )
+    if use_decoupled_shape_materials:
+        _assign_shape_material_triplet(
+            model,
+            meta["shape_material_ke_base"],
+            meta["shape_material_kd_base"],
+            meta["shape_material_kf_base"],
+        )
+    eval_body_contact_forces(
+        model, state, contacts, friction_smoothing=solver.friction_smoothing, body_f_out=body_f_work
+    )
+    if use_decoupled_shape_materials:
+        _assign_shape_material_triplet(
+            model,
+            meta["shape_material_ke_scaled"],
+            meta["shape_material_kd_scaled"],
+            meta["shape_material_kf_scaled"],
+        )
+    eval_particle_body_contact_forces(
+        model, state, contacts, particle_f, body_f_work, body_f_in_world_frame=False
+    )
+    f_after_particle_body_np = particle_f.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+    f_external_total_np = (f_after_particle_body_np - f_before_particle_body_np).astype(np.float32, copy=False)
+
+    snapshot = _capture_force_snapshot(
+        frame_index=frame_index,
+        substep_index_in_frame=substep_index_in_frame,
+        global_substep_index=global_substep_index,
+        sim_time=sim_time,
+        sim_dt=float(args.sim_dt),
+        particle_q=np.asarray(particle_q, dtype=np.float32),
+        particle_qd=np.asarray(particle_qd, dtype=np.float32),
+        body_q=np.asarray(body_q, dtype=np.float32),
+        body_qd=np.asarray(body_qd, dtype=np.float32),
+        particle_radius=particle_radius_diag,
+        mass=particle_mass_diag,
+        gravity_vec=gravity_vec_diag,
+        f_spring=f_spring_np,
+        f_internal_total=f_internal_total_np,
+        f_external_total=f_external_total_np,
+        meta=meta,
+        force_topk=int(args.force_topk),
+        force_eps=1.0e-8,
+        topk_selector_mode=str(args.force_topk_mode),
+        used_manual_force_path=True,
+    )
+    if owns_context:
+        del explicit_context
+    return snapshot
+
+
+def _make_explicit_force_snapshot_context(
+    *,
+    model: newton.Model,
+    ir_obj: dict[str, Any],
+    args: argparse.Namespace,
+    device: str,
+    n_obj: int,
+) -> dict[str, Any]:
+    shape_contacts_enabled = bool(args.shape_contacts) and bool(args.add_bunny)
+    cfg = newton_import_ir.SimConfig(
+        ir_path=args.ir.resolve(),
+        out_dir=args.out_dir.resolve(),
+        output_prefix=args.prefix,
+        spring_ke_scale=float(args.spring_ke_scale),
+        spring_kd_scale=float(args.spring_kd_scale),
+        angular_damping=float(args.angular_damping),
+        friction_smoothing=float(args.friction_smoothing),
+        enable_tri_contact=True,
+        disable_particle_contact_kernel=True,
+        shape_contacts=shape_contacts_enabled,
+        add_ground_plane=bool(args.add_ground_plane),
+        strict_physics_checks=False,
+        apply_drag=bool(args.apply_drag),
+        drag_damping_scale=float(args.drag_damping_scale),
+        gravity=-float(args.gravity_mag),
+        gravity_from_reverse_z=False,
+        up_axis="Z",
+        particle_contacts=True,
+        device=device,
+    )
+    solver = newton.solvers.SolverSemiImplicit(
+        model,
+        angular_damping=cfg.angular_damping,
+        friction_smoothing=cfg.friction_smoothing,
+        enable_tri_contact=cfg.enable_tri_contact,
+    )
+    state = model.state()
+    control = model.control()
+    contacts = model.contacts() if newton_import_ir._use_collision_pipeline(cfg, ir_obj) else None
+    particle_grid = model.particle_grid
+    search_radius = None
+    if particle_grid is not None:
+        with wp.ScopedDevice(model.device):
+            particle_grid.reserve(model.particle_count)
+        search_radius = float(model.particle_max_radius) * 2.0 + float(model.particle_cohesion)
+        search_radius = max(search_radius, float(getattr(newton_import_ir, "EPSILON", 1.0e-6)))
+    _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
+    return {
+        "cfg": cfg,
+        "solver": solver,
+        "state": state,
+        "control": control,
+        "contacts": contacts,
+        "particle_grid": particle_grid,
+        "search_radius": search_radius,
+        "particle_mass_diag": np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].copy(),
+        "particle_radius_diag": model.particle_radius.numpy().astype(np.float32)[:n_obj].copy(),
+        "gravity_vec_diag": np.asarray(gravity_vec, dtype=np.float32).reshape(3),
+    }
 
 
 def _force_diagnostic_parity_summary(
@@ -2839,6 +3550,226 @@ def _force_diagnostic_parity_summary(
         "contact_topk_jaccard": jaccard,
         "parity_consistent": bool(parity_consistent),
     }
+
+
+def _augment_force_sequence_with_rollout_keyframes(
+    *,
+    model: newton.Model,
+    meta: dict[str, Any],
+    ir_obj: dict[str, Any],
+    args: argparse.Namespace,
+    device: str,
+    sim_data: dict[str, Any],
+    n_obj: int,
+    trigger_substep_global: int,
+    sequence_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    sequence_map: dict[int, dict[str, Any]] = {
+        int(item["snapshot"]["global_substep_index"]): {
+            "snapshot": item["snapshot"],
+            "labels": [str(item["label"])],
+        }
+        for item in sequence_items
+    }
+    rigid_focus = _compute_rigid_focus_metrics(
+        np.asarray(sim_data["particle_q_object"], dtype=np.float32),
+        np.asarray(sim_data["body_q"], dtype=np.float32),
+        meta,
+        model.particle_radius.numpy()[:n_obj].astype(np.float32, copy=False),
+    )
+    candidate_frames = [
+        ("max penetration", rigid_focus["max_penetration_frame"]),
+        ("rebound / settle", rigid_focus["rebound_frame"]),
+    ]
+    explicit_context = _make_explicit_force_snapshot_context(
+        model=model,
+        ir_obj=ir_obj,
+        args=args,
+        device=device,
+        n_obj=n_obj,
+    )
+    for label, frame_idx_value in candidate_frames:
+        if frame_idx_value is None:
+            continue
+        frame_idx = int(frame_idx_value)
+        if frame_idx < 0 or frame_idx >= int(sim_data["particle_q_all"].shape[0]):
+            continue
+        substep_index_in_frame = max(0, int(sim_data["substeps"]) - 1)
+        global_substep_index = frame_idx * int(sim_data["substeps"]) + substep_index_in_frame
+        existing = sequence_map.get(global_substep_index)
+        if existing is not None:
+            if label not in existing["labels"]:
+                existing["labels"].append(label)
+            continue
+        snapshot = _capture_force_snapshot_from_explicit_state(
+            model=model,
+            meta=meta,
+            ir_obj=ir_obj,
+            args=args,
+            device=device,
+            n_obj=n_obj,
+            frame_index=frame_idx,
+            substep_index_in_frame=substep_index_in_frame,
+            global_substep_index=global_substep_index,
+            sim_time=float(global_substep_index) * float(sim_data["sim_dt"]),
+            particle_q=np.asarray(sim_data["particle_q_all"][frame_idx], dtype=np.float32),
+            particle_qd=np.asarray(sim_data["particle_qd_all"][frame_idx], dtype=np.float32),
+            body_q=np.asarray(sim_data["body_q"][frame_idx], dtype=np.float32),
+            body_qd=np.asarray(sim_data["body_qd"][frame_idx], dtype=np.float32),
+            explicit_context=explicit_context,
+        )
+        snapshot["trigger_substep_global"] = int(trigger_substep_global)
+        sequence_map[global_substep_index] = {
+            "snapshot": snapshot,
+            "labels": [label],
+        }
+
+    return [
+        {
+            "label": " | ".join(item["labels"]),
+            "snapshot": item["snapshot"],
+        }
+        for _, item in sorted(sequence_map.items(), key=lambda kv: kv[0])
+    ]
+
+
+def _build_full_process_force_sequence_from_rollout(
+    *,
+    model: newton.Model,
+    meta: dict[str, Any],
+    ir_obj: dict[str, Any],
+    args: argparse.Namespace,
+    device: str,
+    sim_data: dict[str, Any],
+    n_obj: int,
+    trigger_substep_global: int,
+    trigger_snapshot: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    particle_q_all = np.asarray(sim_data["particle_q_all"], dtype=np.float32)
+    particle_qd_all = np.asarray(sim_data["particle_qd_all"], dtype=np.float32)
+    body_q_all = np.asarray(sim_data["body_q"], dtype=np.float32)
+    body_qd_all = np.asarray(sim_data["body_qd"], dtype=np.float32)
+    substeps = max(1, int(sim_data["substeps"]))
+    sim_dt = float(sim_data["sim_dt"])
+    sim_frame_dt = sim_dt * float(substeps)
+    n_frames = int(particle_q_all.shape[0])
+    if n_frames == 0:
+        return []
+
+    first_contact_frame = int(sim_data.get("first_rigid_contact_frame", -1))
+    max_penetration_frame = int(sim_data.get("max_rigid_penetration_frame", -1))
+    rebound_frame = int(sim_data.get("rigid_rebound_frame", -1))
+    if first_contact_frame < 0:
+        first_contact_frame = None
+    if max_penetration_frame < 0:
+        max_penetration_frame = None
+    if rebound_frame < 0:
+        rebound_frame = None
+    if first_contact_frame is None and max_penetration_frame is None and rebound_frame is None:
+        rigid_focus = _compute_rigid_focus_metrics(
+            np.asarray(sim_data["particle_q_object"], dtype=np.float32),
+            body_q_all,
+            meta,
+            model.particle_radius.numpy()[:n_obj].astype(np.float32, copy=False),
+        )
+        first_contact_frame = rigid_focus["first_contact_frame"]
+        max_penetration_frame = rigid_focus["max_penetration_frame"]
+        rebound_frame = rigid_focus["rebound_frame"]
+    rigid_kind = str(meta.get("rigid_shape", "bunny"))
+    if first_contact_frame is None:
+        render_end_frame = n_frames - 1
+    elif float(args.post_contact_video_seconds) > 0.0:
+        sim_window = float(args.post_contact_video_seconds) / max(float(args.slowdown), 1.0e-6)
+        extra_frames = int(round(sim_window / max(sim_frame_dt, 1.0e-12)))
+        render_end_frame = min(n_frames - 1, int(first_contact_frame) + max(0, extra_frames))
+    else:
+        render_end_frame = n_frames - 1
+
+    selected_frames: set[int] = {0, int(render_end_frame)}
+    if first_contact_frame is None:
+        selected_frames.update({int(round(v)) for v in np.linspace(0, int(render_end_frame), num=min(4, int(render_end_frame) + 1))})
+    else:
+        fc = int(first_contact_frame)
+        mp = int(max_penetration_frame) if max_penetration_frame is not None else int(render_end_frame)
+        rb = int(rebound_frame) if rebound_frame is not None else int(render_end_frame)
+        pre = max(0, fc - max(1, min(4, fc)))
+        selected_frames.update({pre, fc, mp, rb})
+        if mp > fc:
+            mid = fc + max(1, (mp - fc) // 2)
+            selected_frames.add(mid)
+        if rigid_kind == "box":
+            selected_frames.update(
+                {int(round(v)) for v in np.linspace(0, int(render_end_frame), num=min(7, int(render_end_frame) + 1))}
+            )
+    selected_frame_list = sorted(int(v) for v in selected_frames if 0 <= int(v) <= int(render_end_frame))
+    print(
+        f"  Full-process force sequence selecting {len(selected_frame_list)} snapshots over {int(render_end_frame) + 1} frames",
+        flush=True,
+    )
+
+    sequence_map: dict[int, dict[str, Any]] = {}
+    explicit_context = _make_explicit_force_snapshot_context(
+        model=model,
+        ir_obj=ir_obj,
+        args=args,
+        device=device,
+        n_obj=n_obj,
+    )
+    for item_idx, frame_idx in enumerate(selected_frame_list):
+        snapshot = _capture_force_snapshot_from_explicit_state(
+            model=model,
+            meta=meta,
+            ir_obj=ir_obj,
+            args=args,
+            device=device,
+            n_obj=n_obj,
+            frame_index=frame_idx,
+            substep_index_in_frame=0,
+            global_substep_index=frame_idx * substeps,
+            sim_time=float(frame_idx) * sim_frame_dt,
+            particle_q=particle_q_all[frame_idx],
+            particle_qd=particle_qd_all[frame_idx],
+            body_q=body_q_all[frame_idx],
+            body_qd=body_qd_all[frame_idx],
+            explicit_context=explicit_context,
+        )
+        snapshot["trigger_substep_global"] = int(trigger_substep_global)
+        label = _stage_label_for_frame(
+            frame_idx,
+            first_contact_frame=first_contact_frame,
+            max_penetration_frame=max_penetration_frame,
+            rebound_frame=rebound_frame,
+        )
+        sequence_map[int(snapshot["global_substep_index"])] = {
+            "snapshot": snapshot,
+            "labels": [label],
+        }
+        if (item_idx + 1) % 2 == 0 or item_idx + 1 == len(selected_frame_list):
+            print(
+                f"  Full-process force snapshot {item_idx + 1}/{len(selected_frame_list)}",
+                flush=True,
+            )
+
+    if isinstance(trigger_snapshot, dict):
+        trigger_key = int(trigger_snapshot["global_substep_index"])
+        item = sequence_map.get(trigger_key)
+        if item is None:
+            sequence_map[trigger_key] = {
+                "snapshot": trigger_snapshot,
+                "labels": ["First contact | trigger substep"],
+            }
+        else:
+            item["snapshot"] = trigger_snapshot
+            if "First contact | trigger substep" not in item["labels"]:
+                item["labels"].append("First contact | trigger substep")
+
+    return [
+        {
+            "label": " | ".join(item["labels"]),
+            "snapshot": item["snapshot"],
+        }
+        for _, item in sorted(sequence_map.items(), key=lambda kv: kv[0])
+    ]
 
 
 def simulate(
@@ -2930,7 +3861,9 @@ def simulate(
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
     particle_q_object: list[np.ndarray] = []
+    particle_qd_all: list[np.ndarray] = []
     body_q: list[np.ndarray] = []
+    body_qd: list[np.ndarray] = []
     body_vel: list[np.ndarray] = []
 
     t0 = time.perf_counter()
@@ -2938,10 +3871,18 @@ def simulate(
         q = state_in.particle_q.numpy().astype(np.float32)
         particle_q_all.append(q.copy())
         particle_q_object.append(q[:n_obj].copy())
+        if state_in.particle_qd is None:
+            particle_qd_all.append(np.zeros((n_obj, 3), dtype=np.float32))
+        else:
+            particle_qd_all.append(state_in.particle_qd.numpy().astype(np.float32)[:n_obj].copy())
         if state_in.body_q is None:
             body_q.append(np.zeros((0, 7), dtype=np.float32))
         else:
             body_q.append(state_in.body_q.numpy().astype(np.float32).copy())
+        if state_in.body_qd is None:
+            body_qd.append(np.zeros((0, 6), dtype=np.float32))
+        else:
+            body_qd.append(state_in.body_qd.numpy().astype(np.float32).copy())
         if state_in.body_qd is None:
             body_vel.append(np.zeros((0, 3), dtype=np.float32))
         else:
@@ -3210,7 +4151,9 @@ def simulate(
     result = {
         "particle_q_all": np.stack(particle_q_all, axis=0),
         "particle_q_object": np.stack(particle_q_object, axis=0),
+        "particle_qd_all": np.stack(particle_qd_all, axis=0),
         "body_q": np.stack(body_q, axis=0),
+        "body_qd": np.stack(body_qd, axis=0),
         "body_vel": np.stack(body_vel, axis=0),
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
@@ -3303,20 +4246,87 @@ def render_video(
         extra_frames = int(round(sim_window / max(sim_frame_dt, 1.0e-12)))
         render_end_frame = min(n_sim_frames - 1, int(first_contact_frame) + max(0, extra_frames))
 
-    story_keyframes = _build_process_story_keyframes(
-        n_frames=render_end_frame + 1,
-        first_contact_frame=first_contact_frame,
-        max_penetration_frame=max_penetration_frame,
-        rebound_frame=rebound_frame,
+    sim_frame_sequence = _continuous_output_frame_indices(
+        n_sim_frames=n_sim_frames,
+        render_end_frame=int(render_end_frame),
+        sim_frame_dt=sim_frame_dt,
+        fps_out=fps_out,
+        slowdown=float(args.slowdown),
     )
-    hold_frames = max(1, int(round(max(float(args.process_stage_hold_seconds), 1.0e-3) * fps_out)))
-    n_out_frames = max(1, len(story_keyframes) * hold_frames)
+    n_out_frames = int(sim_frame_sequence.shape[0])
+    sim_duration_window = max(float(render_end_frame) * sim_frame_dt, 0.0)
     video_duration = float(n_out_frames) / max(fps_out, 1.0)
 
+    camera_sample_frames = np.unique(
+        np.linspace(0, max(0, int(render_end_frame)), num=min(max(6, int(render_end_frame) + 1), 14)).astype(np.int32)
+    )
+    scene_points: list[np.ndarray] = []
+    cloth_stride = max(1, int(cloth_q_object.shape[1] // 320))
+    if cloth_q_object.shape[1]:
+        scene_points.append(cloth_q_object[camera_sample_frames, ::cloth_stride].reshape(-1, 3).astype(np.float32, copy=False))
+    if body_q_all.ndim == 3 and body_q_all.shape[1] > 0:
+        if str(meta.get("rigid_shape", "bunny")) == "box":
+            hx, hy, hz = [float(v) for v in np.asarray(meta.get("box_half_extents", np.zeros(3, dtype=np.float32))).ravel()]
+            local_corners = np.asarray(
+                [
+                    [-hx, -hy, -hz],
+                    [-hx, -hy, hz],
+                    [-hx, hy, -hz],
+                    [-hx, hy, hz],
+                    [hx, -hy, -hz],
+                    [hx, -hy, hz],
+                    [hx, hy, -hz],
+                    [hx, hy, hz],
+                ],
+                dtype=np.float32,
+            )
+            box_points: list[np.ndarray] = []
+            for frame_idx in camera_sample_frames.tolist():
+                body_pos = body_q_all[frame_idx, 0, :3].astype(np.float32, copy=False)
+                quat_xyzw = body_q_all[frame_idx, 0, 3:7].astype(np.float32, copy=False)
+                rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+                box_points.append((local_corners @ rot.T + body_pos[None, :]).astype(np.float32, copy=False))
+            if box_points:
+                scene_points.append(np.concatenate(box_points, axis=0))
+        else:
+            verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            mesh_scale = float(meta.get("mesh_scale", 1.0))
+            if verts_local.size:
+                mesh_stride = max(1, int(verts_local.shape[0] // 256))
+                verts_local_sample = verts_local[::mesh_stride].astype(np.float32, copy=False)
+                bunny_points: list[np.ndarray] = []
+                for frame_idx in camera_sample_frames.tolist():
+                    body_pos = body_q_all[frame_idx, 0, :3].astype(np.float32, copy=False)
+                    quat_xyzw = body_q_all[frame_idx, 0, 3:7].astype(np.float32, copy=False)
+                    rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+                    bunny_points.append((verts_local_sample * mesh_scale) @ rot.T + body_pos[None, :])
+                if bunny_points:
+                    scene_points.append(np.concatenate(bunny_points, axis=0).astype(np.float32, copy=False))
+
+    if scene_points:
+        cam_pos, _ = _fit_camera_to_points(
+            np.concatenate(scene_points, axis=0),
+            yaw_deg=float(args.camera_yaw),
+            pitch_deg=float(args.camera_pitch),
+            fov_deg=float(args.camera_fov),
+            aspect=float(width) / max(float(height), 1.0),
+            min_distance=0.28,
+            pad=1.18,
+        )
+    else:
+        cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
+
     sim_data["first_rigid_contact_frame"] = -1 if first_contact_frame is None else int(first_contact_frame)
+    sim_data["max_rigid_penetration_frame"] = -1 if max_penetration_frame is None else int(max_penetration_frame)
+    sim_data["rigid_rebound_frame"] = -1 if rebound_frame is None else int(rebound_frame)
     sim_data["render_end_frame"] = int(render_end_frame)
+    sim_data["render_output_frame_indices"] = sim_frame_sequence.astype(np.int32, copy=True)
     sim_data["rendered_frame_count"] = int(n_out_frames)
     sim_data["video_duration_target_sec"] = float(video_duration)
+    sim_data["render_camera_pos"] = np.asarray(cam_pos, dtype=np.float32).copy()
+    sim_data["render_camera_pitch_deg"] = float(args.camera_pitch)
+    sim_data["render_camera_yaw_deg"] = float(args.camera_yaw)
+    sim_data["render_camera_fov_deg"] = float(args.camera_fov)
 
     mass_label = (
         f"CLOTH TOTAL MASS: {float(meta.get('total_object_mass', 0.0)):.3g} kg"
@@ -3395,14 +4405,19 @@ def render_video(
 
         with temporary_particle_radius_override(model, render_radii):
             ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-            out_idx = 0
-            for stage_idx, (sim_idx, stage_label) in enumerate(story_keyframes):
+            for out_idx, sim_idx in enumerate(sim_frame_sequence.tolist()):
                 sim_idx = int(sim_idx)
                 state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
                 if state.body_q is not None and sim_data["body_q"].shape[1] > 0:
                     state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
 
                 sim_t = float(sim_idx) * sim_frame_dt
+                stage_label = _stage_label_for_frame(
+                    sim_idx,
+                    first_contact_frame=first_contact_frame,
+                    max_penetration_frame=max_penetration_frame,
+                    rebound_frame=rebound_frame,
+                )
                 viewer.begin_frame(sim_t)
                 viewer.log_state(state)
                 if args.render_springs and cloth_edges.size and starts_wp is not None and ends_wp is not None:
@@ -3419,17 +4434,6 @@ def render_video(
                     )
                 viewer.end_frame()
                 frame = viewer.get_frame(render_ui=False).numpy()
-
-                focus_px = _project_world_to_screen(
-                    np.asarray(rigid_focus["focus_world"], dtype=np.float32)[sim_idx],
-                    cam_pos=cam_pos,
-                    pitch_deg=float(args.camera_pitch),
-                    yaw_deg=float(args.camera_yaw),
-                    fov_deg=float(args.camera_fov),
-                    width=width,
-                    height=height,
-                )
-                frame = _overlay_zoom_panel_rgb(frame, center_px=focus_px, label="contact zoom")
                 if args.overlay_label:
                     pmax = float(np.asarray(rigid_focus["penetration_max"], dtype=np.float32)[sim_idx]) * 1000.0
                     pp99 = float(np.asarray(rigid_focus["penetration_p99"], dtype=np.float32)[sim_idx]) * 1000.0
@@ -3448,17 +4452,11 @@ def render_video(
                 frame = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8))
 
                 if bool(args.keep_render_frames):
-                    stage_path = tmp_dir / f"stage_{stage_idx:03d}.png"
-                    Image.fromarray(frame, mode="RGB").save(stage_path)
+                    frame_path = tmp_dir / f"frame_{out_idx:05d}.png"
+                    Image.fromarray(frame, mode="RGB").save(frame_path)
 
                 assert ffmpeg_proc.stdin is not None
-                payload = frame.tobytes()
-                for _ in range(hold_frames):
-                    if bool(args.keep_render_frames):
-                        frame_path = tmp_dir / f"frame_{out_idx:05d}.png"
-                        Image.fromarray(frame, mode="RGB").save(frame_path)
-                    ffmpeg_proc.stdin.write(payload)
-                    out_idx += 1
+                ffmpeg_proc.stdin.write(frame.tobytes())
 
             assert ffmpeg_proc.stdin is not None
             ffmpeg_proc.stdin.close()
@@ -3828,14 +4826,53 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
     force_diagnostic = sim_data.get("force_diagnostic")
     if isinstance(force_diagnostic, dict) and bool(force_diagnostic.get("enabled", False)):
         diag_snapshot = force_diagnostic.pop("render_snapshot", None)
+        if bool(args.defer_force_artifacts):
+            summary = build_summary(
+                model_for_io,
+                args,
+                ir_obj,
+                render_sim_data,
+                meta_for_io,
+                n_obj_for_io,
+                out_mp4,
+                particle_contacts_enabled=False,
+                disable_particle_contact_kernel=True,
+            )
+            summary_path = save_summary_json(args, summary)
+            if isinstance(diag_snapshot, dict):
+                bundle_path = _write_force_render_bundle(
+                    args=args,
+                    device=device,
+                    ir_obj=ir_obj,
+                    diag_snapshot=diag_snapshot,
+                    render_sim_data=render_sim_data,
+                    trigger_substep_global=int(force_diagnostic.get("trigger_substep_global", -1)),
+                    summary_json_path=summary_path,
+                    video_mp4_path=out_mp4,
+                )
+                force_diagnostic["bundle_path"] = str(bundle_path)
+            print(f"  Summary: {summary_path}", flush=True)
+            print(json.dumps(summary, indent=2), flush=True)
+            return {
+                "scene_npz": scene_npz,
+                "summary_json": summary_path,
+                "video_mp4": out_mp4 if out_mp4 is not None else Path(""),
+            }
         print("Collecting force-window keyframes...", flush=True)
-        sequence_snapshots = _force_window_observer_rollout(
+        sequence_snapshots = list(force_diagnostic.get("window_sequence_items", []))
+        if not sequence_snapshots:
+            sequence_snapshots = _build_full_process_force_sequence_from_rollout(
+            model=model_for_io,
+            meta=meta_for_io,
             ir_obj=ir_obj,
             args=args,
-            trigger_substep_global=int(force_diagnostic.get("trigger_substep_global", -1)),
-            n_obj=n_obj,
             device=device,
+            sim_data=render_sim_data,
+            n_obj=n_obj_for_io,
+            trigger_substep_global=int(force_diagnostic.get("trigger_substep_global", -1)),
+            trigger_snapshot=diag_snapshot if isinstance(diag_snapshot, dict) else None,
         )
+        print(f"  Full-process force sequence captured {len(sequence_snapshots)} snapshots", flush=True)
         force_diagnostic["window_sequence"] = [
             {
                 "global_substep_index": int(item["snapshot"]["global_substep_index"]),
@@ -3845,13 +4882,17 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
             for item in sequence_snapshots
         ]
         if isinstance(diag_snapshot, dict):
+            print("Rendering force diagnostic artifacts in subprocess...", flush=True)
             snapshot_png_path, rendered_snapshot_video, rendered_sequence_video = _render_force_artifacts_subprocess(
                 args=args,
                 device=device,
                 ir_obj=ir_obj,
                 diag_snapshot=diag_snapshot,
                 sequence_snapshots=sequence_snapshots,
+                render_sim_data=render_sim_data,
+                video_mp4_path=out_mp4,
             )
+            print("  Force diagnostic artifact rendering done", flush=True)
             force_diagnostic["snapshot_png_path"] = str(snapshot_png_path)
             force_diagnostic["snapshot_video_path"] = "" if rendered_snapshot_video is None else str(rendered_snapshot_video)
             force_diagnostic["window_video_path"] = "" if rendered_sequence_video is None else str(rendered_sequence_video)
