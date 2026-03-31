@@ -33,6 +33,7 @@ def _load_core_module(name: str, path: Path):
 path_defaults = _load_core_module("strict_self_collision_path_defaults", CORE_DIR / "path_defaults.py")
 
 VALIDATE_PARITY = CORE_DIR / "validate_parity.py"
+DEFAULT_IMPORTER = BRIDGE_ROOT / "tools" / "other" / "newton_import_ir_phystwin.py"
 RENDER_COMPARISON = BRIDGE_ROOT / "tools" / "other" / "render_comparison_2x3_mp4.py"
 VIDEO_QC = SCRIPTS_DIR / "validate_bridge_video_qc.py"
 DEFAULT_IR = BRIDGE_ROOT / "ir" / "blue_cloth_double_lift_around" / "phystwin_ir_v2_bf_strict.npz"
@@ -44,8 +45,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python", default=path_defaults.default_python())
     parser.add_argument("--device", default=path_defaults.default_device())
     parser.add_argument("--ir", type=Path, default=DEFAULT_IR)
+    parser.add_argument("--importer", type=Path, default=DEFAULT_IMPORTER)
     parser.add_argument("--num-frames", type=int, default=302)
     parser.add_argument("--custom-self-contact-hops", type=int, default=0)
+    parser.add_argument(
+        "--shape-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--add-ground-plane",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--ground-restitution-mode",
+        choices=["strict-native", "approximate-native"],
+        default="approximate-native",
+    )
     parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
@@ -115,6 +132,8 @@ def main() -> int:
         validate_cmd = [
             str(args.python),
             str(VALIDATE_PARITY),
+            "--importer",
+            str(args.importer.resolve()),
             "--ir",
             str(args.ir.resolve()),
             "--out-dir",
@@ -131,8 +150,8 @@ def main() -> int:
             str(int(args.custom_self_contact_hops)),
             "--interpolate-controls",
             "--apply-drag",
-            "--no-shape-contacts",
-            "--no-add-ground-plane",
+            "--ground-restitution-mode",
+            str(args.ground_restitution_mode),
             "--disable-particle-contact-kernel",
             "--max-x0-rmse",
             str(thresholds["x0_rmse"]),
@@ -145,6 +164,8 @@ def main() -> int:
             "--max-last30-rmse",
             str(thresholds["last30_rmse"]),
         ]
+        validate_cmd.append("--shape-contacts" if args.shape_contacts else "--no-shape-contacts")
+        validate_cmd.append("--add-ground-plane" if args.add_ground_plane else "--no-add-ground-plane")
         _run_logged(
             validate_cmd,
             workdir=WORKSPACE_ROOT,
