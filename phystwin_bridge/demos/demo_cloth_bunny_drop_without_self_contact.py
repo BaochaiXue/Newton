@@ -2130,6 +2130,8 @@ def _render_force_diagnostic_video_over_base_video(
     cam_pitch = float(sim_data.get("render_camera_pitch_deg", float(args.camera_pitch)))
     cam_yaw = float(sim_data.get("render_camera_yaw_deg", float(args.camera_yaw)))
     cam_fov = float(sim_data.get("render_camera_fov_deg", float(args.camera_fov)))
+    active_interval = _force_active_interval_from_render_indices(sim_data=sim_data, render_indices=render_indices)
+    active_render_frames = set(int(v) for v in np.asarray(active_interval["active_render_frames"], dtype=np.int32).tolist())
     snapshot_map: dict[int, dict[str, Any]] = {}
     label_map: dict[int, str] = {}
     for item in sequence_items:
@@ -2137,6 +2139,7 @@ def _render_force_diagnostic_video_over_base_video(
         frame_idx = int(snapshot.get("frame_index", int(snapshot["global_substep_index"]) // max(1, int(sim_data["substeps"]))))
         snapshot_map[frame_idx] = snapshot
         label_map[frame_idx] = str(item["label"])
+    mapping_records: list[dict[str, Any]] = []
 
     decoder = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -2150,12 +2153,30 @@ def _render_force_diagnostic_video_over_base_video(
                 break
             sim_idx = int(sim_idx_raw)
             snapshot = snapshot_map.get(sim_idx)
+            exact_mapping = snapshot is not None
+            in_active_interval = sim_idx in active_render_frames
             if snapshot is None:
+                if in_active_interval:
+                    raise RuntimeError(
+                        f"missing exact force snapshot for active-interval render frame {sim_idx}"
+                    )
                 nearest = min(snapshot_map.keys(), key=lambda idx: abs(int(idx) - sim_idx))
                 snapshot = snapshot_map[nearest]
                 snapshot_label = label_map.get(nearest, "full process")
+                exact_mapping = False
             else:
                 snapshot_label = label_map.get(sim_idx, "full process")
+            mapping_records.append(
+                {
+                    "displayed_video_frame_index": int(frame_idx),
+                    "source_sim_frame_index": int(sim_idx),
+                    "source_force_snapshot_frame_index": int(snapshot.get("frame_index", sim_idx)),
+                    "source_force_snapshot_global_substep_index": int(snapshot.get("global_substep_index", sim_idx * int(sim_data["substeps"]))),
+                    "active_interval": bool(in_active_interval),
+                    "exact_mapping": bool(exact_mapping),
+                    "reused_mapping": bool(not exact_mapping),
+                }
+            )
 
             primitives = _force_frame_primitives(snapshot, render_radii, args)
             rgb = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3).copy()
@@ -2189,6 +2210,25 @@ def _render_force_diagnostic_video_over_base_video(
             decoder.stdout.close()
         if proc.stdin and not proc.stdin.closed:
             proc.stdin.close()
+    active_records = [item for item in mapping_records if bool(item["active_interval"])]
+    exact_ratio = float(np.mean([1.0 if item["exact_mapping"] else 0.0 for item in active_records])) if active_records else 1.0
+    reused_ratio = float(np.mean([1.0 if item["reused_mapping"] else 0.0 for item in active_records])) if active_records else 0.0
+    mapping_payload = {
+        "video_path": str(out_path),
+        "active_display_start": active_interval["active_display_start"],
+        "active_display_end": active_interval["active_display_end"],
+        "first_contact_frame": active_interval["first_contact_frame"],
+        "max_penetration_frame": active_interval["max_penetration_frame"],
+        "rebound_frame": active_interval["rebound_frame"],
+        "exact_mapping_ratio_active_interval": exact_ratio,
+        "reused_mapping_ratio_active_interval": reused_ratio,
+        "active_render_frame_count": int(len(active_render_frames)),
+        "records": mapping_records,
+    }
+    (out_path.parent / f"{out_path.stem}_mapping.json").write_text(
+        json.dumps(mapping_payload, indent=2),
+        encoding="utf-8",
+    )
     return out_path
 
 
@@ -2270,6 +2310,8 @@ def _render_force_diagnostic_video_over_saved_frames(
     cam_pitch = float(sim_data.get("render_camera_pitch_deg", float(args.camera_pitch)))
     cam_yaw = float(sim_data.get("render_camera_yaw_deg", float(args.camera_yaw)))
     cam_fov = float(sim_data.get("render_camera_fov_deg", float(args.camera_fov)))
+    active_interval = _force_active_interval_from_render_indices(sim_data=sim_data, render_indices=render_indices)
+    active_render_frames = set(int(v) for v in np.asarray(active_interval["active_render_frames"], dtype=np.int32).tolist())
     snapshot_map: dict[int, dict[str, Any]] = {}
     label_map: dict[int, str] = {}
     for item in sequence_items:
@@ -2277,6 +2319,7 @@ def _render_force_diagnostic_video_over_saved_frames(
         frame_idx = int(snapshot.get("frame_index", int(snapshot["global_substep_index"]) // max(1, int(sim_data["substeps"]))))
         snapshot_map[frame_idx] = snapshot
         label_map[frame_idx] = str(item["label"])
+    mapping_records: list[dict[str, Any]] = []
 
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     assert proc.stdin is not None
@@ -2285,12 +2328,30 @@ def _render_force_diagnostic_video_over_saved_frames(
         for out_idx, frame_path in enumerate(frame_paths):
             sim_idx = int(render_indices[out_idx])
             snapshot = snapshot_map.get(sim_idx)
+            exact_mapping = snapshot is not None
+            in_active_interval = sim_idx in active_render_frames
             if snapshot is None:
+                if in_active_interval:
+                    raise RuntimeError(
+                        f"missing exact force snapshot for active-interval render frame {sim_idx}"
+                    )
                 nearest = min(snapshot_map.keys(), key=lambda idx: abs(int(idx) - sim_idx))
                 snapshot = snapshot_map[nearest]
                 snapshot_label = label_map.get(nearest, "full process")
+                exact_mapping = False
             else:
                 snapshot_label = label_map.get(sim_idx, "full process")
+            mapping_records.append(
+                {
+                    "displayed_video_frame_index": int(out_idx),
+                    "source_sim_frame_index": int(sim_idx),
+                    "source_force_snapshot_frame_index": int(snapshot.get("frame_index", sim_idx)),
+                    "source_force_snapshot_global_substep_index": int(snapshot.get("global_substep_index", sim_idx * int(sim_data["substeps"]))),
+                    "active_interval": bool(in_active_interval),
+                    "exact_mapping": bool(exact_mapping),
+                    "reused_mapping": bool(not exact_mapping),
+                }
+            )
 
             primitives = _force_frame_primitives(snapshot, render_radii, args)
             with Image.open(frame_path) as handle:
@@ -2340,6 +2401,25 @@ def _render_force_diagnostic_video_over_saved_frames(
             cam_fov=cam_fov,
         )
         _save_force_diagnostic_snapshot_frame(rgb, snapshot_out_path)
+    active_records = [item for item in mapping_records if bool(item["active_interval"])]
+    exact_ratio = float(np.mean([1.0 if item["exact_mapping"] else 0.0 for item in active_records])) if active_records else 1.0
+    reused_ratio = float(np.mean([1.0 if item["reused_mapping"] else 0.0 for item in active_records])) if active_records else 0.0
+    mapping_payload = {
+        "video_path": str(out_path),
+        "active_display_start": active_interval["active_display_start"],
+        "active_display_end": active_interval["active_display_end"],
+        "first_contact_frame": active_interval["first_contact_frame"],
+        "max_penetration_frame": active_interval["max_penetration_frame"],
+        "rebound_frame": active_interval["rebound_frame"],
+        "exact_mapping_ratio_active_interval": exact_ratio,
+        "reused_mapping_ratio_active_interval": reused_ratio,
+        "active_render_frame_count": int(len(active_render_frames)),
+        "records": mapping_records,
+    }
+    (out_path.parent / f"{out_path.stem}_mapping.json").write_text(
+        json.dumps(mapping_payload, indent=2),
+        encoding="utf-8",
+    )
     return out_path
 
 
@@ -2698,25 +2778,63 @@ def _compute_rigid_focus_metrics(
             "max_penetration_frame": None,
             "rebound_frame": None,
         }
-
-    cloth_z = cloth_q[:, :, 2].astype(np.float32, copy=False)
-    n_focus = min(48, int(cloth_q.shape[1]))
-    for frame_idx in range(n_frames):
-        order = np.argsort(cloth_z[frame_idx])[:n_focus]
-        focus_world[frame_idx] = np.mean(
-            cloth_q[frame_idx, order].astype(np.float32, copy=False),
-            axis=0,
-        ).astype(np.float32, copy=False)
-
-    body_z = body_q[:, 0, 2].astype(np.float32, copy=False)
     if rigid_kind == "box":
-        rigid_top = body_z + float(np.asarray(meta.get("box_half_extents", np.zeros(3, dtype=np.float32)))[2])
+        half_extents = np.asarray(meta.get("box_half_extents", np.zeros(3, dtype=np.float32)), dtype=np.float32)
+        for frame_idx in range(n_frames):
+            pos = body_q[frame_idx, 0, :3].astype(np.float32, copy=False)
+            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32, copy=False)
+            surface = _box_surface_info(
+                cloth_q[frame_idx].astype(np.float32, copy=False),
+                pos,
+                quat_xyzw,
+                half_extents,
+                particle_radius,
+            )
+            pen = np.asarray(surface["penetration_depth_signed"], dtype=np.float32)
+            penetration_max[frame_idx] = float(np.max(pen)) if pen.size else 0.0
+            penetration_p99[frame_idx] = float(np.quantile(pen, 0.99)) if pen.size else 0.0
+            cand = np.flatnonzero(pen > 1.0e-8)
+            if cand.size == 0:
+                unsigned = np.asarray(surface["unsigned_distance_to_surface"], dtype=np.float32)
+                cand = np.argsort(unsigned)[: min(32, unsigned.size)].astype(np.int32, copy=False)
+            if cand.size:
+                pts = np.asarray(surface["closest_point_world"], dtype=np.float32)[cand]
+                focus_world[frame_idx] = np.mean(pts, axis=0).astype(np.float32, copy=False)
+            else:
+                focus_world[frame_idx] = pos.astype(np.float32, copy=False)
     else:
-        rigid_top_offset = float(meta.get("bunny_top_z", 0.0)) - float(body_z[0] if body_z.size else 0.0)
-        rigid_top = body_z + rigid_top_offset
-    approx_pen_depth = np.maximum(rigid_top[:, None] - cloth_z, 0.0).astype(np.float32, copy=False)
-    penetration_max = np.max(approx_pen_depth, axis=1).astype(np.float32, copy=False)
-    penetration_p99 = np.quantile(approx_pen_depth, 0.99, axis=1).astype(np.float32, copy=False)
+        verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+        faces = np.asarray(meta.get("mesh_tri_indices", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
+        mesh_scale = float(meta.get("mesh_scale", 1.0))
+        for frame_idx in range(n_frames):
+            pos = body_q[frame_idx, 0, :3].astype(np.float32, copy=False)
+            quat_xyzw = body_q[frame_idx, 0, 3:7].astype(np.float32, copy=False)
+            surface = _mesh_surface_info(
+                cloth_q[frame_idx].astype(np.float32, copy=False),
+                pos,
+                quat_xyzw,
+                meta,
+                particle_radius,
+            )
+            pen = np.asarray(surface["penetration_depth_signed"], dtype=np.float32)
+            penetration_max[frame_idx] = float(np.max(pen)) if pen.size else 0.0
+            penetration_p99[frame_idx] = float(np.quantile(pen, 0.99)) if pen.size else 0.0
+            cand = np.flatnonzero(pen > 1.0e-8)
+            if cand.size == 0:
+                unsigned = np.asarray(surface["unsigned_distance_to_surface"], dtype=np.float32)
+                cand = np.argsort(unsigned)[: min(32, unsigned.size)].astype(np.int32, copy=False)
+            if cand.size:
+                pts = 0.5 * (
+                    np.asarray(surface["closest_point_world"], dtype=np.float32)[cand]
+                    + cloth_q[frame_idx][cand].astype(np.float32, copy=False)
+                )
+                focus_world[frame_idx] = np.mean(pts, axis=0).astype(np.float32, copy=False)
+            elif verts_local.size and faces.size:
+                rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
+                verts = (verts_local * mesh_scale) @ rot.T + pos[None, :]
+                focus_world[frame_idx] = np.mean(verts, axis=0).astype(np.float32, copy=False)
+            else:
+                focus_world[frame_idx] = pos.astype(np.float32, copy=False)
 
     contact_frames = np.flatnonzero(penetration_max > 1.0e-8)
     first_contact = int(contact_frames[0]) if contact_frames.size else None
@@ -2762,6 +2880,28 @@ def _stage_label_for_frame(
     return "Post-contact settle"
 
 
+def _resolve_force_active_interval(
+    *,
+    sim_data: dict[str, Any],
+    n_frames: int,
+    render_end_frame: int,
+    first_contact_frame: int | None,
+    rebound_frame: int | None,
+    pre_frames: int = 3,
+) -> tuple[int, int]:
+    last_frame = max(0, min(int(render_end_frame), int(n_frames) - 1))
+    if first_contact_frame is None:
+        return 0, last_frame
+    start = max(0, int(first_contact_frame) - max(1, int(pre_frames)))
+    if rebound_frame is None:
+        end = last_frame
+    else:
+        end = min(last_frame, max(int(first_contact_frame), int(rebound_frame)))
+    if end < start:
+        end = start
+    return int(start), int(end)
+
+
 def _build_process_story_keyframes(
     *,
     n_frames: int,
@@ -2801,6 +2941,65 @@ def _build_process_story_keyframes(
         seen.add(idx)
         keyframes.append((idx, label))
     return keyframes
+
+
+def _force_active_interval_from_render_indices(
+    *,
+    sim_data: dict[str, Any],
+    render_indices: np.ndarray,
+) -> dict[str, Any]:
+    render_indices = np.asarray(render_indices, dtype=np.int32).reshape(-1)
+    if render_indices.size == 0:
+        return {
+            "first_contact_frame": None,
+            "max_penetration_frame": None,
+            "rebound_frame": None,
+            "active_display_start": None,
+            "active_display_end": None,
+            "active_render_frames": np.zeros((0,), dtype=np.int32),
+        }
+
+    first_contact_frame = int(sim_data.get("first_rigid_contact_frame", -1))
+    max_penetration_frame = int(sim_data.get("max_rigid_penetration_frame", -1))
+    rebound_frame = int(sim_data.get("rigid_rebound_frame", -1))
+    if first_contact_frame < 0:
+        first_contact_frame = None
+    if max_penetration_frame < 0:
+        max_penetration_frame = None
+    if rebound_frame < 0:
+        rebound_frame = None
+    if first_contact_frame is None:
+        return {
+            "first_contact_frame": None,
+            "max_penetration_frame": max_penetration_frame,
+            "rebound_frame": rebound_frame,
+            "active_display_start": None,
+            "active_display_end": None,
+            "active_render_frames": np.zeros((0,), dtype=np.int32),
+        }
+
+    start_candidates = np.flatnonzero(render_indices >= int(first_contact_frame))
+    if start_candidates.size:
+        active_display_start = max(0, int(start_candidates[0]) - 3)
+    else:
+        active_display_start = 0
+    active_end_ref = rebound_frame
+    if active_end_ref is None:
+        active_end_ref = max_penetration_frame
+    if active_end_ref is None:
+        active_end_ref = int(render_indices[-1])
+    end_candidates = np.flatnonzero(render_indices >= int(active_end_ref))
+    active_display_end = int(end_candidates[0]) if end_candidates.size else int(render_indices.shape[0] - 1)
+    active_display_end = max(active_display_start, active_display_end)
+    active_render_frames = np.unique(render_indices[active_display_start : active_display_end + 1]).astype(np.int32, copy=False)
+    return {
+        "first_contact_frame": first_contact_frame,
+        "max_penetration_frame": max_penetration_frame,
+        "rebound_frame": rebound_frame,
+        "active_display_start": int(active_display_start),
+        "active_display_end": int(active_display_end),
+        "active_render_frames": active_render_frames,
+    }
 
 
 def _quat_angle_deg(q0_xyzw: np.ndarray, q1_xyzw: np.ndarray) -> float:
@@ -3685,6 +3884,28 @@ def _build_full_process_force_sequence_from_rollout(
     else:
         render_end_frame = n_frames - 1
 
+    render_indices = np.asarray(
+        sim_data.get(
+            "render_output_frame_indices",
+            _continuous_output_frame_indices(
+                n_sim_frames=n_frames,
+                render_end_frame=int(render_end_frame),
+                sim_frame_dt=sim_frame_dt,
+                fps_out=float(args.render_fps),
+                slowdown=float(args.slowdown),
+            ),
+        ),
+        dtype=np.int32,
+    ).reshape(-1)
+    active_interval = _force_active_interval_from_render_indices(
+        sim_data={
+            **sim_data,
+            "first_rigid_contact_frame": -1 if first_contact_frame is None else int(first_contact_frame),
+            "max_rigid_penetration_frame": -1 if max_penetration_frame is None else int(max_penetration_frame),
+            "rigid_rebound_frame": -1 if rebound_frame is None else int(rebound_frame),
+        },
+        render_indices=render_indices,
+    )
     selected_frames: set[int] = {0, int(render_end_frame)}
     if first_contact_frame is None:
         selected_frames.update({int(round(v)) for v in np.linspace(0, int(render_end_frame), num=min(4, int(render_end_frame) + 1))})
@@ -3701,9 +3922,13 @@ def _build_full_process_force_sequence_from_rollout(
             selected_frames.update(
                 {int(round(v)) for v in np.linspace(0, int(render_end_frame), num=min(7, int(render_end_frame) + 1))}
             )
+        selected_frames.update(int(v) for v in np.asarray(active_interval["active_render_frames"], dtype=np.int32).tolist())
     selected_frame_list = sorted(int(v) for v in selected_frames if 0 <= int(v) <= int(render_end_frame))
     print(
-        f"  Full-process force sequence selecting {len(selected_frame_list)} snapshots over {int(render_end_frame) + 1} frames",
+        (
+            f"  Full-process force sequence selecting {len(selected_frame_list)} snapshots over {int(render_end_frame) + 1} frames"
+            f" (active exact frames={len(np.asarray(active_interval['active_render_frames']).reshape(-1))})"
+        ),
         flush=True,
     )
 
@@ -4197,49 +4422,18 @@ def render_video(
     sim_frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
     cloth_q_object = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
     body_q_all = np.asarray(sim_data["body_q"], dtype=np.float32)
-    cloth_z = cloth_q_object[:, :, 2]
-    cloth_z_min = np.min(cloth_z, axis=1)
-    n_focus = min(48, int(cloth_q_object.shape[1]))
-    focus_world = np.zeros((n_sim_frames, 3), dtype=np.float32)
-    for frame_idx in range(n_sim_frames):
-        order = np.argsort(cloth_z[frame_idx])[:n_focus]
-        focus_world[frame_idx] = np.mean(
-            cloth_q_object[frame_idx, order].astype(np.float32, copy=False),
-            axis=0,
-        ).astype(np.float32, copy=False)
-
-    if body_q_all.ndim == 3 and body_q_all.shape[1] > 0:
-        body_z = body_q_all[:, 0, 2].astype(np.float32, copy=False)
-    else:
-        body_z = np.zeros((n_sim_frames,), dtype=np.float32)
-    if str(meta.get("rigid_shape", "bunny")) == "box":
-        rigid_top = body_z + float(np.asarray(meta.get("box_half_extents", np.zeros(3, dtype=np.float32)))[2])
-    else:
-        rigid_top_offset = float(meta.get("bunny_top_z", 0.0)) - float(body_z[0] if body_z.size else 0.0)
-        rigid_top = body_z + rigid_top_offset
-    approx_pen_depth = np.maximum(rigid_top[:, None] - cloth_z, 0.0).astype(np.float32, copy=False)
-    penetration_max = np.max(approx_pen_depth, axis=1).astype(np.float32, copy=False)
-    penetration_p99 = np.quantile(approx_pen_depth, 0.99, axis=1).astype(np.float32, copy=False)
-    contact_frames = np.flatnonzero(penetration_max > 1.0e-8)
-    first_contact_frame = int(contact_frames[0]) if contact_frames.size else None
-    max_penetration_frame = int(np.argmax(penetration_max)) if contact_frames.size else None
-    rebound_frame = None
-    if max_penetration_frame is not None:
-        peak = float(penetration_max[max_penetration_frame])
-        for idx in range(max_penetration_frame + 1, n_sim_frames):
-            if float(penetration_max[idx]) <= 0.5 * peak:
-                rebound_frame = int(idx)
-                break
-        if rebound_frame is None:
-            rebound_frame = n_sim_frames - 1
-    rigid_focus = {
-        "focus_world": focus_world,
-        "penetration_max": penetration_max,
-        "penetration_p99": penetration_p99,
-        "first_contact_frame": first_contact_frame,
-        "max_penetration_frame": max_penetration_frame,
-        "rebound_frame": rebound_frame,
-    }
+    rigid_focus = _compute_rigid_focus_metrics(
+        cloth_q_object,
+        body_q_all,
+        meta,
+        model.particle_radius.numpy().astype(np.float32)[: int(cloth_q_object.shape[1])].copy(),
+    )
+    focus_world = np.asarray(rigid_focus["focus_world"], dtype=np.float32)
+    penetration_max = np.asarray(rigid_focus["penetration_max"], dtype=np.float32)
+    penetration_p99 = np.asarray(rigid_focus["penetration_p99"], dtype=np.float32)
+    first_contact_frame = rigid_focus["first_contact_frame"]
+    max_penetration_frame = rigid_focus["max_penetration_frame"]
+    rebound_frame = rigid_focus["rebound_frame"]
     render_end_frame = n_sim_frames - 1
     if first_contact_frame is not None and float(args.post_contact_video_seconds) > 0.0:
         sim_window = float(args.post_contact_video_seconds) / max(float(args.slowdown), 1.0e-6)
@@ -4319,6 +4513,11 @@ def render_video(
     sim_data["first_rigid_contact_frame"] = -1 if first_contact_frame is None else int(first_contact_frame)
     sim_data["max_rigid_penetration_frame"] = -1 if max_penetration_frame is None else int(max_penetration_frame)
     sim_data["rigid_rebound_frame"] = -1 if rebound_frame is None else int(rebound_frame)
+    active_start_frame = max(0, (int(first_contact_frame) - 3) if first_contact_frame is not None else 0)
+    active_end_frame = int(rebound_frame) if rebound_frame is not None else int(render_end_frame)
+    active_end_frame = max(active_start_frame, min(int(render_end_frame), active_end_frame))
+    sim_data["force_active_contact_start_frame"] = int(active_start_frame)
+    sim_data["force_active_contact_end_frame"] = int(active_end_frame)
     sim_data["render_end_frame"] = int(render_end_frame)
     sim_data["render_output_frame_indices"] = sim_frame_sequence.astype(np.int32, copy=True)
     sim_data["rendered_frame_count"] = int(n_out_frames)
@@ -4445,7 +4644,7 @@ def render_video(
                             mass_label,
                             f"stage = {stage_label}",
                             f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
-                            f"approx_pen = {pmax:.3f} mm  p99_pen = {pp99:.3f} mm",
+                            f"proxy_pen(top-z) = {pmax:.3f} mm  proxy_p99(top-z) = {pp99:.3f} mm",
                         ],
                         font_size=int(args.label_font_size),
                     )
