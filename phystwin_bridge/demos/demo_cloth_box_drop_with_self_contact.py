@@ -55,6 +55,7 @@ from self_contact_bridge_kernels import (
     compute_nonexcluded_overlap_curve,
     eval_filtered_self_contact_forces,
     eval_filtered_self_contact_phystwin_velocity,
+    reference_filtered_self_contact_phystwin_velocity,
 )
 from semiimplicit_bridge_kernels import (
     eval_body_contact_forces,
@@ -264,7 +265,8 @@ def parse_args() -> argparse.Namespace:
             "off: disable particle self-contact; "
             "native: use Newton's built-in particle kernel; "
             "custom: disable native kernel and use bridge-side penalty self-contact with filtered pairs; "
-            "phystwin: disable native kernel and use bridge-side PhysTwin-style velocity correction."
+            "phystwin: disable native kernel and use bridge-side PhysTwin-style velocity correction "
+            "with zero excluded pairs."
         ),
     )
     p.add_argument(
@@ -273,7 +275,8 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help=(
             "Graph-hop exclusion radius for custom self-contact filtering. "
-            "1 excludes direct spring neighbors; 2 excludes neighbors-of-neighbors as well."
+            "1 excludes direct spring neighbors; 2 excludes neighbors-of-neighbors as well. "
+            "The exact `phystwin` path ignores this knob and always uses 0-hop exclusions."
         ),
     )
     p.add_argument(
@@ -294,6 +297,16 @@ def parse_args() -> argparse.Namespace:
             "Compatibility knob for older ON experiments. The current SemiImplicit ON path "
             "does not use it directly because particle contact coefficients are loaded from "
             "the PhysTwin bridge mapping, but we keep it in the summary for bookkeeping."
+        ),
+    )
+    p.add_argument(
+        "--phystwin-backend",
+        choices=["warp", "numpy"],
+        default="warp",
+        help=(
+            "Backend used only when --self-contact-mode phystwin. "
+            "'warp' is the fast bridge operator. "
+            "'numpy' is a literal bridge-side reference implementation of the same PhysTwin law."
         ),
     )
     return p.parse_args()
@@ -329,6 +342,22 @@ def _self_contact_case_tag(mode: str) -> str:
     if mode == "off":
         return "self_off"
     raise ValueError(f"Unsupported self_contact_mode: {mode}")
+
+
+def _effective_self_contact_filter_hops(args: argparse.Namespace) -> int:
+    """Return the active graph-hop exclusion radius for the selected mode.
+
+    `phystwin` must match the verifier's all-non-self-pairs semantics, so it
+    uses no topological exclusions. The filtered-hop table remains a
+    custom-mode-only compatibility path.
+    """
+
+    mode = str(args.self_contact_mode)
+    if mode == "custom":
+        return int(args.custom_self_contact_hops)
+    if mode == "phystwin":
+        return 0
+    return int(args.custom_self_contact_hops)
 
 
 def _assign_shape_material_triplet(model, ke: np.ndarray, kd: np.ndarray, kf: np.ndarray) -> None:
@@ -465,12 +494,13 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "excluded_neighbor_max": 0.0,
         "excluded_pair_count": 0.0,
     }
+    effective_filter_hops = _effective_self_contact_filter_hops(args)
     if True:
         custom_neighbor_table, custom_neighbor_count, excluded_pairs_cpu, exclusion_summary = (
             build_filtered_self_contact_tables(
                 edges,
                 n_particles=n_obj,
-                hops=int(args.custom_self_contact_hops),
+                hops=effective_filter_hops,
                 device=device,
             )
         )
@@ -489,6 +519,7 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "self_contact_mode": self_contact_mode,
         "particle_contacts_enabled": self_contact_mode != "off",
         "custom_self_contact_hops": int(args.custom_self_contact_hops),
+        "effective_self_contact_filter_hops": int(effective_filter_hops),
         "custom_self_contact_grid": custom_self_contact_grid,
         "custom_neighbor_table": custom_neighbor_table,
         "custom_neighbor_count": custom_neighbor_count,
@@ -521,6 +552,7 @@ def simulate(
     use_native_self_contact = self_contact_mode == "native"
     use_custom_self_contact = self_contact_mode == "custom"
     use_phystwin_self_contact = self_contact_mode == "phystwin"
+    use_phystwin_numpy_backend = use_phystwin_self_contact and str(args.phystwin_backend) == "numpy"
     shape_contacts_enabled = bool(args.shape_contacts) and _box_enabled(args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
@@ -637,20 +669,39 @@ def simulate(
                 if use_phystwin_self_contact:
                     apply_velocity_update_from_force(model, state_in, dt=sim_dt)
                     particle_f.zero_()
-                    if phystwin_qd_tmp is None:
-                        raise RuntimeError("PhysTwin self-contact path requires a temporary velocity buffer.")
-                    eval_filtered_self_contact_phystwin_velocity(
-                        model,
-                        state_in,
-                        particle_grid,
-                        meta["custom_neighbor_table"],
-                        meta["custom_neighbor_count"],
-                        collision_dist=phystwin_collision_dist,
-                        collide_elas=phystwin_collide_elas,
-                        collide_fric=phystwin_collide_fric,
-                        particle_qd_out=phystwin_qd_tmp,
-                    )
-                    state_in.particle_qd.assign(phystwin_qd_tmp)
+                    if use_phystwin_numpy_backend:
+                        qd_reference = reference_filtered_self_contact_phystwin_velocity(
+                            state_in.particle_q.numpy().astype(np.float32, copy=False),
+                            state_in.particle_qd.numpy().astype(np.float32, copy=False),
+                            model.particle_mass.numpy().astype(np.float32, copy=False),
+                            collision_dist=phystwin_collision_dist,
+                            collide_elas=phystwin_collide_elas,
+                            collide_fric=phystwin_collide_fric,
+                            excluded_pairs=set(meta.get("excluded_pairs_cpu", set())),
+                            active_mask=(
+                                model.particle_flags.numpy().astype(np.int32, copy=False)
+                                & int(newton.ParticleFlags.ACTIVE)
+                            )
+                            != 0,
+                        )
+                        state_in.particle_qd.assign(
+                            wp.array(qd_reference.astype(np.float32, copy=False), dtype=wp.vec3, device=model.device)
+                        )
+                    else:
+                        if phystwin_qd_tmp is None:
+                            raise RuntimeError("PhysTwin self-contact path requires a temporary velocity buffer.")
+                        eval_filtered_self_contact_phystwin_velocity(
+                            model,
+                            state_in,
+                            particle_grid,
+                            meta["custom_neighbor_table"],
+                            meta["custom_neighbor_count"],
+                            collision_dist=phystwin_collision_dist,
+                            collide_elas=phystwin_collide_elas,
+                            collide_fric=phystwin_collide_fric,
+                            particle_qd_out=phystwin_qd_tmp,
+                        )
+                        state_in.particle_qd.assign(phystwin_qd_tmp)
                 elif use_native_self_contact:
                     eval_particle_contact_forces(model, state_in, particle_f)
                 elif use_custom_self_contact:
@@ -882,7 +933,11 @@ def render_video(
                         frame,
                         [
                             "CLOTH BOX DROP",
-                            f"SELF COLLISION: {str(args.self_contact_mode).upper()}",
+                            (
+                                f"SELF COLLISION: PHYSTWIN [{str(args.phystwin_backend).upper()}]"
+                                if str(args.self_contact_mode) == "phystwin"
+                                else f"SELF COLLISION: {str(args.self_contact_mode).upper()}"
+                            ),
                             mass_label,
                             f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
                         ],
@@ -1072,6 +1127,11 @@ def build_summary(
         "spring_ke_scale": float(spring_ke_scale),
         "spring_kd_scale": float(spring_kd_scale),
         "custom_self_contact_hops": int(args.custom_self_contact_hops),
+        "effective_self_contact_filter_hops": int(meta.get("effective_self_contact_filter_hops", 0)),
+        "phystwin_exact_pair_semantics": bool(
+            str(args.self_contact_mode) == "phystwin"
+            and int(meta.get("effective_self_contact_filter_hops", 0)) == 0
+        ),
         "excluded_pair_count": int(meta.get("excluded_pair_count", 0)),
         "excluded_neighbor_min": float(meta.get("excluded_neighbor_min", 0.0)),
         "excluded_neighbor_mean": float(meta.get("excluded_neighbor_mean", 0.0)),
@@ -1091,6 +1151,9 @@ def build_summary(
         "particle_contact_kd_final": float(model.particle_kd),
         "particle_contact_kf_final": float(model.particle_kf),
         "particle_self_contact_scale": float(args.particle_self_contact_scale),
+        "phystwin_backend": (
+            str(args.phystwin_backend) if str(args.self_contact_mode) == "phystwin" else None
+        ),
         "particle_contacts_enabled": bool(particle_contacts_enabled),
         "disable_particle_contact_kernel": bool(disable_particle_contact_kernel),
         "final_nonexcluded_self_contact_pair_count": float(self_contact_stats["pair_count"]),

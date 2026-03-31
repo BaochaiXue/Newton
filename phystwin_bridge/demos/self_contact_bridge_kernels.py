@@ -337,6 +337,111 @@ def eval_filtered_self_contact_phystwin_velocity(
     )
 
 
+def reference_filtered_self_contact_phystwin_velocity(
+    particle_x: np.ndarray,
+    particle_qd: np.ndarray,
+    particle_mass: np.ndarray,
+    *,
+    collision_dist: float,
+    collide_elas: float,
+    collide_fric: float,
+    excluded_pairs: set[tuple[int, int]] | None = None,
+    active_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Literal NumPy reference for the PhysTwin-style self-collision operator.
+
+    This is intentionally bridge-side and semantically mirrors the Warp kernel
+    above so rollout-level parity can be checked in-scope without touching
+    `Newton/newton/`.
+    """
+
+    x = np.asarray(particle_x, dtype=np.float32)
+    qd = np.asarray(particle_qd, dtype=np.float32)
+    mass = np.asarray(particle_mass, dtype=np.float32).reshape(-1)
+    n_particles = int(x.shape[0])
+    out = qd.copy()
+    if n_particles <= 1:
+        return out
+
+    active = np.ones((n_particles,), dtype=bool) if active_mask is None else np.asarray(active_mask, dtype=bool).reshape(-1)
+    valid_particles = active & np.isfinite(mass) & (mass > 0.0)
+    valid_idx = np.flatnonzero(valid_particles)
+    if valid_idx.size <= 1:
+        return out
+
+    tree = cKDTree(x[valid_idx].astype(np.float64, copy=False))
+    pair_local = tree.query_pairs(r=float(collision_dist) * 5.0, output_type="ndarray")
+    if pair_local.size == 0:
+        return out
+
+    pair_idx = valid_idx[np.asarray(pair_local, dtype=np.int64)]
+    if excluded_pairs:
+        keep_mask = np.fromiter(
+            (
+                (int(i), int(j)) not in excluded_pairs
+                for i, j in pair_idx
+            ),
+            dtype=bool,
+            count=pair_idx.shape[0],
+        )
+        pair_idx = pair_idx[keep_mask]
+        if pair_idx.size == 0:
+            return out
+
+    i_idx = pair_idx[:, 0]
+    j_idx = pair_idx[:, 1]
+    dis = x[j_idx] - x[i_idx]
+    dis_len = np.linalg.norm(dis, axis=1)
+    relative_v = qd[j_idx] - qd[i_idx]
+    approaching = np.sum(dis * relative_v, axis=1) < -1.0e-4
+    close = dis_len < float(collision_dist)
+    valid_pairs = approaching & close & np.isfinite(dis_len)
+    if not np.any(valid_pairs):
+        return out
+
+    i_idx = i_idx[valid_pairs]
+    j_idx = j_idx[valid_pairs]
+    dis = dis[valid_pairs]
+    dis_len = np.maximum(dis_len[valid_pairs], 1.0e-6).astype(np.float32, copy=False)
+    relative_v = relative_v[valid_pairs].astype(np.float32, copy=False)
+
+    collision_normal = dis / dis_len[:, None]
+    v_rel_n_scalar = np.sum(relative_v * collision_normal, axis=1)
+    v_rel_n = v_rel_n_scalar[:, None] * collision_normal
+    denom = (1.0 / mass[i_idx] + 1.0 / mass[j_idx]).astype(np.float32, copy=False)
+
+    elas = np.float32(np.clip(collide_elas, 0.0, 1.0))
+    fric = np.float32(np.clip(collide_fric, 0.0, 2.0))
+    impulse_n = (-(1.0 + elas) * v_rel_n) / denom[:, None]
+
+    v_rel_n_length = np.linalg.norm(v_rel_n, axis=1)
+    v_rel_t = relative_v - v_rel_n
+    v_rel_t_length = np.maximum(np.linalg.norm(v_rel_t, axis=1), 1.0e-6).astype(np.float32, copy=False)
+    a = np.maximum(
+        0.0,
+        1.0 - fric * (1.0 + elas) * v_rel_n_length / v_rel_t_length,
+    ).astype(np.float32, copy=False)
+    impulse_t = (a[:, None] - 1.0) * v_rel_t / denom[:, None]
+    pair_impulse = (impulse_n + impulse_t).astype(np.float32, copy=False)
+
+    impulse_sum = np.zeros_like(out, dtype=np.float32)
+    valid_count = np.zeros((n_particles,), dtype=np.float32)
+    np.add.at(impulse_sum, i_idx, pair_impulse)
+    np.add.at(impulse_sum, j_idx, -pair_impulse)
+    np.add.at(valid_count, i_idx, 1.0)
+    np.add.at(valid_count, j_idx, 1.0)
+
+    contact_mask = valid_count > 0.0
+    if np.any(contact_mask):
+        out[contact_mask] = (
+            qd[contact_mask]
+            - impulse_sum[contact_mask]
+            / valid_count[contact_mask, None]
+            / mass[contact_mask, None]
+        )
+    return out.astype(np.float32, copy=False)
+
+
 def compute_nonexcluded_overlap_stats(
     points: np.ndarray,
     radii: np.ndarray,

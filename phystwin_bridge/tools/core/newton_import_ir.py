@@ -27,13 +27,19 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import warp as wp
+
+DEMOS_DIR = Path(__file__).resolve().parents[2] / "demos"
+if str(DEMOS_DIR) not in sys.path:
+    sys.path.insert(0, str(DEMOS_DIR))
 
 import newton
 from path_defaults import bridge_root, default_device
@@ -59,6 +65,52 @@ RESTITUTION_MAX = 1.0
 # Ground restitution mapping modes
 GROUND_RESTITUTION_MODE_STRICT_NATIVE = "strict-native"
 GROUND_RESTITUTION_MODE_APPROXIMATE_NATIVE = "approximate-native"
+
+# Bridge self-contact modes
+SELF_CONTACT_MODE_OFF = "off"
+SELF_CONTACT_MODE_NATIVE = "native"
+SELF_CONTACT_MODE_CUSTOM = "custom"
+SELF_CONTACT_MODE_PHYSTWIN = "phystwin"
+SELF_CONTACT_MODES = (
+    SELF_CONTACT_MODE_OFF,
+    SELF_CONTACT_MODE_NATIVE,
+    SELF_CONTACT_MODE_CUSTOM,
+    SELF_CONTACT_MODE_PHYSTWIN,
+)
+
+
+def _load_self_contact_kernels():
+    from self_contact_bridge_kernels import (
+        apply_velocity_update_from_force,
+        build_filtered_self_contact_tables,
+        eval_filtered_self_contact_forces,
+        eval_filtered_self_contact_phystwin_velocity,
+    )
+
+    return {
+        "apply_velocity_update_from_force": apply_velocity_update_from_force,
+        "build_filtered_self_contact_tables": build_filtered_self_contact_tables,
+        "eval_filtered_self_contact_forces": eval_filtered_self_contact_forces,
+        "eval_filtered_self_contact_phystwin_velocity": eval_filtered_self_contact_phystwin_velocity,
+    }
+
+
+def _load_semiimplicit_bridge_kernels():
+    from semiimplicit_bridge_kernels import (
+        eval_bending_forces,
+        eval_spring_forces,
+        eval_tetrahedra_forces,
+        eval_triangle_contact_forces,
+        eval_triangle_forces,
+    )
+
+    return {
+        "eval_bending_forces": eval_bending_forces,
+        "eval_spring_forces": eval_spring_forces,
+        "eval_tetrahedra_forces": eval_tetrahedra_forces,
+        "eval_triangle_contact_forces": eval_triangle_contact_forces,
+        "eval_triangle_forces": eval_triangle_forces,
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -107,6 +159,8 @@ class SimConfig:
     # Contacts
     shape_contacts: bool = False
     add_ground_plane: bool = True
+    self_contact_mode: str | None = None
+    custom_self_contact_hops: int = 0
     # Override for IR `self_collision` (which we treat as the PhysTwin collision enable).
     # Note: enabling particle self-collision in SemiImplicit also requires enabling the
     # particle contact kernel (see `disable_particle_contact_kernel`).
@@ -183,6 +237,8 @@ class SimConfig:
             device=args.device,
             shape_contacts=args.shape_contacts,
             add_ground_plane=args.add_ground_plane,
+            self_contact_mode=args.self_contact_mode,
+            custom_self_contact_hops=args.custom_self_contact_hops,
             particle_contacts=args.particle_contacts,
             particle_contact_radius=args.particle_contact_radius,
             object_contact_radius=args.object_contact_radius,
@@ -230,6 +286,10 @@ class ModelResult:
     model: newton.Model
     radius: np.ndarray
     ir_version: int
+    self_contact_mode: str = SELF_CONTACT_MODE_OFF
+    bridge_self_contact_grid: Any = None
+    bridge_neighbor_table: Any = None
+    bridge_neighbor_count: Any = None
     checks: dict = field(default_factory=dict)
 
 
@@ -313,6 +373,27 @@ def parse_args() -> argparse.Namespace:
             "Add a ground plane shape to the model. Particle-vs-plane forces require running the "
             "collision pipeline; this importer enables that pipeline automatically when a ground "
             "plane is present (or when --shape-contacts / IR self_collision is enabled)."
+        ),
+    )
+    p.add_argument(
+        "--self-contact-mode",
+        choices=list(SELF_CONTACT_MODES),
+        default=None,
+        help=(
+            "Optional explicit self-contact mode. "
+            "`off` disables particle self-contact, "
+            "`native` uses Newton's built-in particle kernel, "
+            "`custom` uses bridge-side filtered penalty self-contact, "
+            "`phystwin` uses bridge-side PhysTwin-style velocity correction."
+        ),
+    )
+    p.add_argument(
+        "--custom-self-contact-hops",
+        type=int,
+        default=0,
+        help=(
+            "Graph-hop exclusion radius for bridge-side self-contact tables. "
+            "0 keeps all non-self pairs eligible; 1 excludes direct spring neighbors."
         ),
     )
     p.add_argument(
@@ -848,9 +929,25 @@ def resolve_collision_radius(ir: dict, n: int) -> tuple[np.ndarray, int, str]:
 
 
 def _resolve_particle_contacts(cfg: SimConfig, ir: dict) -> bool:
+    if cfg.self_contact_mode is not None:
+        return str(cfg.self_contact_mode).lower() != SELF_CONTACT_MODE_OFF
     if cfg.particle_contacts is not None:
         return cfg.particle_contacts
     return ir_bool(ir, "self_collision")
+
+
+def _resolve_self_contact_mode(cfg: SimConfig, ir: dict) -> str:
+    if cfg.self_contact_mode is not None:
+        mode = str(cfg.self_contact_mode).lower()
+        if mode not in SELF_CONTACT_MODES:
+            raise ValueError(f"Unsupported self_contact_mode={cfg.self_contact_mode!r}")
+        return mode
+
+    if not _resolve_particle_contacts(cfg, ir):
+        return SELF_CONTACT_MODE_OFF
+    if not cfg.disable_particle_contact_kernel:
+        return SELF_CONTACT_MODE_NATIVE
+    return SELF_CONTACT_MODE_OFF
 
 
 def _use_collision_pipeline(cfg: SimConfig, ir: dict) -> bool:
@@ -860,7 +957,7 @@ def _use_collision_pipeline(cfg: SimConfig, ir: dict) -> bool:
     of `self_collision`. To preserve parity, we must run the collision pipeline
     whenever a ground plane is present, not only when self-collision is enabled.
     """
-    return bool(cfg.shape_contacts or cfg.add_ground_plane or ir_bool(ir, "self_collision"))
+    return bool(cfg.shape_contacts or cfg.add_ground_plane or _resolve_particle_contacts(cfg, ir))
 
 
 def _add_particles(
@@ -1195,6 +1292,7 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     """
     checks = validate_ir_physics(ir, cfg)
     particle_contacts = _resolve_particle_contacts(cfg, ir)
+    self_contact_mode = _resolve_self_contact_mode(cfg, ir)
 
     builder = newton.ModelBuilder(
         up_axis=newton.Axis.from_any(cfg.up_axis),
@@ -1212,10 +1310,38 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     model = builder.finalize(device=device)
 
     # Particle contact kernel in SemiImplicit relies on a HashGrid being built each substep.
-    # We disable it unless explicitly requested, since it is expensive and can complicate
-    # gradient-based workflows.
-    particle_contact_kernel = particle_contacts and (not cfg.disable_particle_contact_kernel)
-    if not particle_contact_kernel:
+    # An explicit bridge self-contact mode overrides the legacy particle-contact flags.
+    particle_contact_kernel = self_contact_mode == SELF_CONTACT_MODE_NATIVE
+    bridge_self_contact_grid = None
+    bridge_neighbor_table = None
+    bridge_neighbor_count = None
+    if self_contact_mode in {SELF_CONTACT_MODE_CUSTOM, SELF_CONTACT_MODE_PHYSTWIN}:
+        self_contact_kernels = _load_self_contact_kernels()
+        bridge_self_contact_grid = model.particle_grid
+        model.particle_grid = None
+        edges = np.asarray(ir.get("spring_edges", np.zeros((0, 2), dtype=np.int32)), dtype=np.int32)
+        (
+            bridge_neighbor_table,
+            bridge_neighbor_count,
+            _,
+            exclusion_summary,
+        ) = self_contact_kernels["build_filtered_self_contact_tables"](
+            edges,
+            n_particles=int(np.asarray(ir["x0"]).shape[0]),
+            hops=int(cfg.custom_self_contact_hops),
+            device=device,
+        )
+        checks.update(
+            {
+                "custom_self_contact_hops": int(cfg.custom_self_contact_hops),
+                "excluded_neighbor_min": float(exclusion_summary["excluded_neighbor_min"]),
+                "excluded_neighbor_mean": float(exclusion_summary["excluded_neighbor_mean"]),
+                "excluded_neighbor_median": float(exclusion_summary["excluded_neighbor_median"]),
+                "excluded_neighbor_max": float(exclusion_summary["excluded_neighbor_max"]),
+                "excluded_pair_count": float(exclusion_summary["excluded_pair_count"]),
+            }
+        )
+    elif not particle_contact_kernel:
         model.particle_grid = None
 
     # Gravity
@@ -1240,9 +1366,19 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     checks["particle_contact_final_kf"] = float(model.particle_kf)
     checks["particle_contact_final_mu"] = float(model.particle_mu)
     checks["particle_contacts_enabled"] = particle_contact_kernel
+    checks["self_contact_mode"] = self_contact_mode
     checks["collision_radius_source"] = radius_src
 
-    return ModelResult(model=model, radius=radius, ir_version=ver, checks=checks)
+    return ModelResult(
+        model=model,
+        radius=radius,
+        ir_version=ver,
+        self_contact_mode=self_contact_mode,
+        bridge_self_contact_grid=bridge_self_contact_grid,
+        bridge_neighbor_table=bridge_neighbor_table,
+        bridge_neighbor_count=bridge_neighbor_count,
+        checks=checks,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1267,7 +1403,14 @@ def interpolate_controller(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimResult:
+def simulate(
+    model: newton.Model,
+    ir: dict,
+    cfg: SimConfig,
+    device: str,
+    *,
+    model_result: ModelResult | None = None,
+) -> SimResult:
     """Run the semi-implicit simulation loop.  Returns per-frame positions."""
     solver = newton.solvers.SolverSemiImplicit(
         model,
@@ -1319,16 +1462,40 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
     if cfg.apply_drag and "drag_damping" in ir:
         drag = ir_scalar(ir, "drag_damping") * cfg.drag_damping_scale
 
-    # Particle self-collision (SemiImplicit): requires building the HashGrid each substep.
-    particle_contacts = _resolve_particle_contacts(cfg, ir)
-    particle_contact_kernel = particle_contacts and (not cfg.disable_particle_contact_kernel)
-    particle_grid = model.particle_grid if particle_contact_kernel else None
+    self_contact_mode = (
+        model_result.self_contact_mode if model_result is not None else _resolve_self_contact_mode(cfg, ir)
+    )
+    use_native_self_contact = self_contact_mode == SELF_CONTACT_MODE_NATIVE
+    use_custom_self_contact = self_contact_mode == SELF_CONTACT_MODE_CUSTOM
+    use_phystwin_self_contact = self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN
+    use_manual_force_path = use_custom_self_contact or use_phystwin_self_contact
+    self_contact_kernels = _load_self_contact_kernels() if use_manual_force_path else {}
+    semiimplicit_kernels = _load_semiimplicit_bridge_kernels() if use_manual_force_path else {}
+
+    particle_grid = (
+        model.particle_grid
+        if use_native_self_contact
+        else (model_result.bridge_self_contact_grid if model_result is not None else None)
+    )
     if particle_grid is not None:
         with wp.ScopedDevice(model.device):
             particle_grid.reserve(model.particle_count)
         search_radius = float(model.particle_max_radius) * 2.0 + float(model.particle_cohesion)
         # Prevent build errors for degenerate radii.
         search_radius = max(search_radius, float(EPSILON))
+    else:
+        search_radius = 0.0
+
+    if use_phystwin_self_contact and (cfg.shape_contacts or cfg.add_ground_plane):
+        raise ValueError(
+            "Importer phystwin self-contact currently supports self-collision-only scenes. "
+            "Use the dedicated cloth+box demo for particle-vs-shape contact scenes."
+        )
+
+    phystwin_collision_dist = float(np.asarray(ir["contact_collision_dist"]).ravel()[0])
+    phystwin_collide_elas = float(np.asarray(ir["contact_collide_object_elas"]).ravel()[0])
+    phystwin_collide_fric = float(np.asarray(ir["contact_collide_object_fric"]).ravel()[0])
+    phystwin_qd_tmp = wp.empty_like(state_in.particle_qd) if use_phystwin_self_contact else None
 
     # Collect rollout
     rollout_all: list[np.ndarray] = []
@@ -1378,7 +1545,48 @@ def simulate(model: newton.Model, ir: dict, cfg: SimConfig, device: str) -> SimR
                 assert contacts is not None
                 model.collide(state_in, contacts)
 
-            solver.step(state_in, state_out, control, contacts, sim_dt)
+            if not use_manual_force_path:
+                solver.step(state_in, state_out, control, contacts, sim_dt)
+            else:
+                particle_f = state_in.particle_f if state_in.particle_count else None
+                semiimplicit_kernels["eval_spring_forces"](model, state_in, particle_f)
+                semiimplicit_kernels["eval_triangle_forces"](model, state_in, control, particle_f)
+                semiimplicit_kernels["eval_bending_forces"](model, state_in, particle_f)
+                semiimplicit_kernels["eval_tetrahedra_forces"](model, state_in, control, particle_f)
+
+                if use_phystwin_self_contact:
+                    self_contact_kernels["apply_velocity_update_from_force"](model, state_in, dt=sim_dt)
+                    particle_f.zero_()
+                    if phystwin_qd_tmp is None or model_result is None:
+                        raise RuntimeError("PhysTwin self-contact path requires bridge-side model metadata.")
+                    self_contact_kernels["eval_filtered_self_contact_phystwin_velocity"](
+                        model,
+                        state_in,
+                        particle_grid,
+                        model_result.bridge_neighbor_table,
+                        model_result.bridge_neighbor_count,
+                        collision_dist=phystwin_collision_dist,
+                        collide_elas=phystwin_collide_elas,
+                        collide_fric=phystwin_collide_fric,
+                        particle_qd_out=phystwin_qd_tmp,
+                    )
+                    state_in.particle_qd.assign(phystwin_qd_tmp)
+                elif use_custom_self_contact:
+                    if model_result is None:
+                        raise RuntimeError("Custom self-contact path requires bridge-side model metadata.")
+                    self_contact_kernels["eval_filtered_self_contact_forces"](
+                        model,
+                        state_in,
+                        particle_f,
+                        particle_grid,
+                        model_result.bridge_neighbor_table,
+                        model_result.bridge_neighbor_count,
+                    )
+
+                if solver.enable_tri_contact:
+                    semiimplicit_kernels["eval_triangle_contact_forces"](model, state_in, particle_f)
+                solver.integrate_particles(model, state_in, state_out, sim_dt)
+
             state_in, state_out = state_out, state_in
 
             if drag > 0.0:
@@ -1491,6 +1699,8 @@ def save_results(
             "drag_damping_scale": cfg.drag_damping_scale,
             "shape_contacts": cfg.shape_contacts,
             "add_ground_plane": cfg.add_ground_plane,
+            "self_contact_mode": cfg.self_contact_mode,
+            "custom_self_contact_hops": cfg.custom_self_contact_hops,
             "particle_contacts_override": cfg.particle_contacts,
             "disable_particle_contact_kernel": cfg.disable_particle_contact_kernel,
             "particle_contact_radius": cfg.particle_contact_radius,
@@ -1524,6 +1734,7 @@ def save_results(
             "particle_contacts": model_result.checks.get(
                 "particle_contacts_enabled", False
             ),
+            "self_contact_mode": model_result.checks.get("self_contact_mode", SELF_CONTACT_MODE_OFF),
         },
         "validation": model_result.checks,
         "baseline": {
@@ -2072,7 +2283,7 @@ def main() -> int:
         summary = run_rigid_probe(cfg, ir, device)
     else:
         model_result = build_model(ir, cfg, device)
-        sim_result = simulate(model_result.model, ir, cfg, device)
+        sim_result = simulate(model_result.model, ir, cfg, device, model_result=model_result)
         summary = save_results(cfg, ir, model_result, sim_result)
 
     print(json.dumps(summary, indent=2))

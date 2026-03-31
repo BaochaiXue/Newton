@@ -56,7 +56,7 @@ MODE_SPECS = [
     ModeSpec(alias="native", self_contact_mode="native"),
     ModeSpec(alias="custom_h1", self_contact_mode="custom", custom_hops=1),
     ModeSpec(alias="custom_h2", self_contact_mode="custom", custom_hops=2),
-    ModeSpec(alias="phystwin", self_contact_mode="phystwin"),
+    ModeSpec(alias="phystwin", self_contact_mode="phystwin", custom_hops=0),
 ]
 
 
@@ -115,6 +115,19 @@ def _quote_cmd(cmd: list[str]) -> str:
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def _write_case_readme(case_dir: Path, *, alias: str, summary_path: Path, mp4_path: Path | None) -> None:
+    lines = [
+        f"# Self-Collision Matrix Case: {alias}",
+        "",
+        f"- summary: `{summary_path}`",
+        f"- command: `{case_dir / 'command.sh'}`",
+        f"- log: `{case_dir / 'run.log'}`",
+        f"- video: `{mp4_path}`" if mp4_path is not None else "- video: none",
+        "",
+    ]
+    _write_text(case_dir / "README.md", "\n".join(lines))
 
 
 def _build_case_command(args: argparse.Namespace, mode: ModeSpec, case_base_dir: Path) -> list[str]:
@@ -228,9 +241,17 @@ def _evaluate_candidate(summary: dict[str, Any], off_wall_time: float | None) ->
         and float(summary.get("peak_nonexcluded_self_contact_max_overlap_m_over_time", float("inf"))) <= 1.0 * radius,
         "persistent_overlap": int(summary.get("persistent_overlap_frames", frames + 1) or 0) <= int(0.05 * frames),
         "box_p99": radius > 0.0
-        and float(summary.get("final_penetration_p99_box_m", float("inf")) or float("inf")) <= 0.5 * radius,
+        and float(
+            summary["final_penetration_p99_box_m"]
+            if summary.get("final_penetration_p99_box_m") is not None
+            else float("inf")
+        ) <= 0.5 * radius,
         "box_max": radius > 0.0
-        and float(summary.get("max_penetration_depth_box_m", float("inf")) or float("inf")) <= 1.0 * radius,
+        and float(
+            summary["max_penetration_depth_box_m"]
+            if summary.get("max_penetration_depth_box_m") is not None
+            else float("inf")
+        ) <= 1.0 * radius,
         "wall_ratio": (
             off_wall_time is not None
             and off_wall_time > 1.0e-12
@@ -495,6 +516,12 @@ def main() -> int:
         }
         if spec.alias == "off":
             off_wall_time = float(summary.get("wall_time_sec", 0.0) or 0.0)
+        _write_case_readme(
+            case_base_dir,
+            alias=spec.alias,
+            summary_path=summary_path,
+            mp4_path=mp4_path,
+        )
 
     for spec in MODE_SPECS:
         payload = case_outputs[spec.alias]

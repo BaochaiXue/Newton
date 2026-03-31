@@ -20,18 +20,111 @@ import json
 import shutil
 import subprocess
 import time
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import warp as wp
 
-from bridge_bootstrap import newton, newton_import_ir, path_defaults
+from bridge_shared import (
+    BRIDGE_ROOT,
+    CORE_DIR,
+    apply_viewer_shape_colors,
+    camera_position,
+    compute_visual_particle_radii,
+    load_core_module,
+    ground_grid,
+    overlay_text_lines_rgb,
+    temporary_particle_radius_override,
+)
+from rollout_storage import RolloutStorage
 
-import newton.ik as ik
-import newton.utils
+WORKSPACE_ROOT = BRIDGE_ROOT.parents[1]
+NEWTON_PY_ROOT = WORKSPACE_ROOT / "Newton" / "newton"
+for _path in (CORE_DIR, NEWTON_PY_ROOT):
+    _path_str = str(_path)
+    if _path_str not in sys.path:
+        sys.path.insert(0, _path_str)
 
-from bridge_deformable_common import (
+if not hasattr(wp, "quat_twist"):
+    @wp.func
+    def _quat_twist_compat(axis: wp.vec3, q: wp.quat) -> wp.quat:
+        ax = wp.normalize(axis)
+        imag = wp.vec3(q[0], q[1], q[2])
+        proj = ax * wp.dot(imag, ax)
+        return wp.normalize(wp.quat(proj[0], proj[1], proj[2], q[3]))
+
+    wp.quat_twist = _quat_twist_compat
+
+if not hasattr(wp, "quat_to_euler"):
+    @wp.func
+    def _quat_to_euler_compat(q: wp.quat, i: int, j: int, k: int) -> wp.vec3:
+        x = q[0]
+        y = q[1]
+        z = q[2]
+        w = q[3]
+
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = wp.atan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (w * y - z * x)
+        pitch = wp.asin(wp.clamp(sinp, -1.0, 1.0))
+
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = wp.atan2(siny_cosp, cosy_cosp)
+        return wp.vec3(roll, pitch, yaw)
+
+    wp.quat_to_euler = _quat_to_euler_compat
+
+if not hasattr(wp, "transform_twist"):
+    @wp.func
+    def _transform_twist_compat(t: wp.transform, x: wp.spatial_vector) -> wp.spatial_vector:
+        p = wp.transform_get_translation(t)
+        v = wp.spatial_top(x)
+        w = wp.spatial_bottom(x)
+        w_out = wp.transform_vector(t, w)
+        v_out = wp.transform_vector(t, v) + wp.cross(p, w_out)
+        return wp.spatial_vector(v_out, w_out)
+
+    wp.transform_twist = _transform_twist_compat
+
+if not hasattr(wp, "transform_wrench"):
+    @wp.func
+    def _transform_wrench_compat(t: wp.transform, x: wp.spatial_vector) -> wp.spatial_vector:
+        p = wp.transform_get_translation(t)
+        f = wp.spatial_top(x)
+        tau = wp.spatial_bottom(x)
+        f_out = wp.transform_vector(t, f)
+        tau_out = wp.transform_vector(t, tau) + wp.cross(p, f_out)
+        return wp.spatial_vector(f_out, tau_out)
+
+    wp.transform_wrench = _transform_wrench_compat
+
+import newton  # noqa: E402
+
+_bridge_bootstrap_stub = types.ModuleType("bridge_bootstrap")
+_bridge_bootstrap_stub.newton = newton
+_bridge_bootstrap_stub.newton_import_ir = None
+_bridge_bootstrap_stub.path_defaults = None
+def _ensure_bridge_runtime_paths() -> None:
+    return None
+
+_bridge_bootstrap_stub.ensure_bridge_runtime_paths = _ensure_bridge_runtime_paths
+sys.modules["bridge_bootstrap"] = _bridge_bootstrap_stub
+
+path_defaults = load_core_module("phystwin_bridge_path_defaults", CORE_DIR / "path_defaults.py")
+newton_import_ir = load_core_module("phystwin_bridge_newton_import_ir", CORE_DIR / "newton_import_ir.py")
+_bridge_bootstrap_stub.newton_import_ir = newton_import_ir
+_bridge_bootstrap_stub.path_defaults = path_defaults
+
+import newton.ik as ik  # noqa: E402
+import newton.utils  # noqa: E402
+
+from bridge_deformable_common import (  # noqa: E402
     _apply_drag_correction_ignore_axis,
     _copy_object_only_ir,
     _effective_spring_scales,
@@ -39,18 +132,17 @@ from bridge_deformable_common import (
     _validate_scaling_args,
     load_ir,
 )
-from rope_demo_common import (
+from rope_demo_common import (  # noqa: E402
     anchor_particle_indices as _anchor_particle_indices,
     quat_conjugate as _quat_conjugate,
     quat_multiply as _quat_multiply,
     resolve_particle_contact_settings as _resolve_particle_contact_settings,
     rope_endpoints as _rope_endpoints,
 )
-from bridge_shared import camera_position, compute_visual_particle_radii, ground_grid, overlay_text_lines_rgb, temporary_particle_radius_override
-from rollout_storage import RolloutStorage
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 MID_SEGMENT_WINDOW_SIZE = 24
+DROP_RELEASE_TASK = "drop_release_baseline"
 
 FRANKA_INIT_Q = np.asarray(
     [
@@ -82,9 +174,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=path_defaults.default_device())
     p.add_argument(
         "--task",
-        choices=["lift_release", "push_probe"],
+        choices=["lift_release", "push_probe", "drop_release_baseline"],
         default="lift_release",
-        help="Task preset. `lift_release` is the meeting-ready default; `push_probe` keeps the older contact-probe behavior.",
+        help=(
+            "Task preset. `lift_release` is the meeting-ready default; "
+            "`push_probe` keeps the older contact-probe behavior; "
+            "`drop_release_baseline` is the stage-0 gravity drop sanity case."
+        ),
     )
     p.add_argument(
         "--render-mode",
@@ -243,6 +339,36 @@ def parse_args() -> argparse.Namespace:
         default=0.80,
         help="Release/retract phase time for `lift_release` [s].",
     )
+    p.add_argument(
+        "--drop-approach-seconds",
+        type=float,
+        default=0.45,
+        help="Approach-to-support phase time for `drop_release_baseline` [s].",
+    )
+    p.add_argument(
+        "--drop-support-seconds",
+        type=float,
+        default=0.30,
+        help="Static support phase before release for `drop_release_baseline` [s].",
+    )
+    p.add_argument(
+        "--drop-release-seconds",
+        type=float,
+        default=0.12,
+        help="Finger-open release phase for `drop_release_baseline` [s].",
+    )
+    p.add_argument(
+        "--drop-freefall-seconds",
+        type=float,
+        default=1.60,
+        help="Free-fall and settling phase after release for `drop_release_baseline` [s].",
+    )
+    p.add_argument(
+        "--gripper-hold",
+        type=float,
+        default=0.014,
+        help="Finger target position while the rope is supported.",
+    )
 
     p.add_argument("--render-fps", type=float, default=30.0)
     p.add_argument("--slowdown", type=float, default=None)
@@ -280,6 +406,13 @@ def _total_task_duration(args: argparse.Namespace) -> float:
             + float(args.lift_seconds)
             + float(args.lift_hold_seconds)
             + float(args.lift_release_seconds)
+        )
+    if str(args.task) == DROP_RELEASE_TASK:
+        return float(
+            float(args.drop_approach_seconds)
+            + float(args.drop_support_seconds)
+            + float(args.drop_release_seconds)
+            + float(args.drop_freefall_seconds)
         )
     return float(
         float(args.settle_seconds)
@@ -451,11 +584,85 @@ def _min_gripper_proxy_clearance(
     return best_clearance, best_name, per_proxy_min
 
 
+def _fit_quadratic_acceleration(times: np.ndarray, values: np.ndarray) -> float | None:
+    times = np.asarray(times, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    if times.size < 3 or values.size < 3:
+        return None
+    if not np.all(np.isfinite(times)) or not np.all(np.isfinite(values)):
+        return None
+    try:
+        coeff = np.polyfit(times, values, deg=2)
+    except Exception:
+        return None
+    return float(2.0 * coeff[0])
+
+
+def _phase_start_time(phases: list[dict[str, Any]], phase_name: str) -> float | None:
+    elapsed = 0.0
+    for phase in phases:
+        if str(phase.get("name")) == str(phase_name):
+            return float(elapsed)
+        elapsed += float(phase.get("duration", 0.0))
+    return None
+
+
+def _activate_particle_indices(model: newton.Model, particle_indices: np.ndarray, *, device: str) -> None:
+    particle_indices = np.asarray(particle_indices, dtype=np.int32).reshape(-1)
+    if particle_indices.size == 0:
+        return
+    active_mask = int(newton.ParticleFlags.ACTIVE)
+    flags = model.particle_flags.numpy().astype(np.int32, copy=True)
+    flags[particle_indices] = flags[particle_indices] | active_mask
+    model.particle_flags = wp.array(flags, dtype=wp.int32, device=device)
+
+
 def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
     rope_center = np.asarray(meta["rope_center"], dtype=np.float32)
     stage_center = np.asarray(meta["stage_center"], dtype=np.float32)
     stage_scale = np.asarray(meta["stage_scale"], dtype=np.float32)
     anchor_bar_center = np.asarray(meta["anchor_bar_center"], dtype=np.float32)
+    task = str(meta.get("task", ""))
+    floor_z = float(meta.get("floor_z", 0.0))
+    support_point = np.asarray(meta.get("support_point", anchor_bar_center), dtype=np.float32)
+
+    if task == DROP_RELEASE_TASK:
+        hero_target = np.asarray(
+            [
+                float(0.62 * rope_center[0] + 0.38 * support_point[0]),
+                float(0.62 * rope_center[1] + 0.38 * support_point[1] - 0.02),
+                float(max(support_point[2] + 0.05, floor_z + 0.20)),
+            ],
+            dtype=np.float32,
+        )
+        hero_pos = camera_position(hero_target, yaw_deg=-36.0, pitch_deg=-18.0, distance=1.62)
+
+        validation_target = np.asarray(
+            [
+                float(support_point[0]),
+                float(support_point[1]),
+                float(max(floor_z + 0.16, support_point[2] - 0.02)),
+            ],
+            dtype=np.float32,
+        )
+        validation_pos = camera_position(validation_target, yaw_deg=-42.0, pitch_deg=-12.0, distance=1.95)
+
+        return {
+            "hero": {
+                "pos": hero_pos.astype(np.float32, copy=False).tolist(),
+                "pitch": -18.0,
+                "yaw": -36.0,
+                "fov": 35.0,
+                "target": hero_target.astype(np.float32, copy=False).tolist(),
+            },
+            "validation": {
+                "pos": validation_pos.astype(np.float32, copy=False).tolist(),
+                "pitch": -12.0,
+                "yaw": -42.0,
+                "fov": 46.0,
+                "target": validation_target.astype(np.float32, copy=False).tolist(),
+            },
+        }
 
     hero_target = np.asarray(
         [
@@ -581,6 +788,40 @@ def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -
             },
         ]
 
+    if str(args.task) == DROP_RELEASE_TASK:
+        approach = rope_center + np.asarray([-0.18, 0.00, 0.14], dtype=np.float32)
+        support = rope_center + np.asarray([-0.04, 0.00, 0.08], dtype=np.float32)
+        return [
+            {
+                "name": "approach_support",
+                "duration": float(args.drop_approach_seconds),
+                "start": approach,
+                "end": support,
+                "quat": target_quat,
+            },
+            {
+                "name": "support_hold",
+                "duration": float(args.drop_support_seconds),
+                "start": support,
+                "end": support,
+                "quat": target_quat,
+            },
+            {
+                "name": "release",
+                "duration": float(args.drop_release_seconds),
+                "start": support,
+                "end": support,
+                "quat": target_quat,
+            },
+            {
+                "name": "free_fall",
+                "duration": float(args.drop_freefall_seconds),
+                "start": support,
+                "end": support,
+                "quat": target_quat,
+            },
+        ]
+
     start = rope_center + np.asarray([float(args.ee_start_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32)
     end = rope_center + np.asarray([float(args.ee_end_x_offset), 0.0, float(args.ee_z_offset)], dtype=np.float32)
     retract = start.copy()
@@ -624,6 +865,7 @@ def _find_index_by_suffix(labels: list[str], suffix: str) -> int:
 
 def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, dict[str, Any], dict[str, Any], int]:
     raw_ir = load_ir(args.ir)
+    drop_release_task = str(args.task) == DROP_RELEASE_TASK
     _validate_scaling_args(args)
     _maybe_autoset_mass_spring_scale(args, raw_ir)
     ir_obj = _copy_object_only_ir(raw_ir, args)
@@ -643,10 +885,17 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         dtype=np.float32,
     )
     shifted_q = x0 + shift
-    anchor_indices = _anchor_particle_indices(
-        shifted_q, endpoint_indices=endpoint_indices, count_per_end=int(args.anchor_count_per_end)
-    )
     rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
+    if drop_release_task:
+        anchor_indices = _anchor_particle_indices(
+            shifted_q, endpoint_indices=endpoint_indices, count_per_end=int(args.anchor_count_per_end)
+        )
+        anchor_positions = shifted_q[anchor_indices].astype(np.float32, copy=False)
+    else:
+        anchor_indices = _anchor_particle_indices(
+            shifted_q, endpoint_indices=endpoint_indices, count_per_end=int(args.anchor_count_per_end)
+        )
+        anchor_positions = shifted_q[anchor_indices].astype(np.float32, copy=False)
 
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
@@ -661,7 +910,6 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         enable_tri_contact=False,
         disable_particle_contact_kernel=not bool(particle_contact_kernel),
         shape_contacts=True,
-        add_ground_plane=False,
         strict_physics_checks=False,
         apply_drag=bool(args.apply_drag),
         drag_damping_scale=float(args.drag_damping_scale),
@@ -670,6 +918,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         up_axis="Z",
         particle_contacts=bool(particle_contacts),
         device=device,
+        add_ground_plane=False,
     )
 
     checks = newton_import_ir.validate_ir_physics(ir_obj, cfg)
@@ -679,7 +928,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
     for idx in anchor_indices.tolist():
         builder.particle_flags[idx] = int(builder.particle_flags[idx]) & ~int(newton.ParticleFlags.ACTIVE)
-        if str(args.anchor_mass_mode) == "zero":
+        if (not drop_release_task) and str(args.anchor_mass_mode) == "zero":
             builder.particle_mass[idx] = 0.0
 
     robot_base_pos = rope_center + np.asarray(args.robot_base_offset, dtype=np.float32)
@@ -699,7 +948,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     builder.joint_target_kd[:7] = [float(args.joint_target_kd)] * 7
     builder.joint_target_ke[7:9] = [float(args.finger_target_ke)] * 2
     builder.joint_target_kd[7:9] = [float(args.finger_target_kd)] * 2
-    builder.joint_target_pos[7:9] = [float(args.gripper_open)] * 2
+    builder.joint_target_pos[7:9] = [float(args.gripper_hold if drop_release_task else args.gripper_open)] * 2
     builder.joint_armature[:7] = [0.3] * 4 + [0.11] * 3
     builder.joint_armature[7:9] = [0.15] * 2
     builder.joint_effort_limit[:7] = [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
@@ -709,29 +958,65 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
     right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
     ee_offset_local = np.asarray([0.0, 0.0, 0.22], dtype=np.float32)
+    floor_z = 0.0
+    if drop_release_task:
+        support_anchor_center = np.asarray(rope_center, dtype=np.float32)
+        support_point = np.asarray(
+            [
+                float(support_anchor_center[0] + 0.045),
+                float(support_anchor_center[1]),
+                float(support_anchor_center[2] + 0.10),
+            ],
+            dtype=np.float32,
+        )
+        anchor_bar_center = np.asarray(
+            [
+                float(support_anchor_center[0]),
+                float(support_anchor_center[1]),
+                float(max(support_anchor_center[2] + 0.14, floor_z + 0.18)),
+            ],
+            dtype=np.float32,
+        )
+        anchor_bar_scale = np.asarray(
+            [
+                0.028,
+                0.12,
+                0.020,
+            ],
+            dtype=np.float32,
+        )
+    else:
+        anchor_bar_center = np.asarray(
+            [
+                float(np.mean(anchor_positions, axis=0)[0]),
+                float(np.mean(anchor_positions, axis=0)[1]),
+                float(np.max(anchor_positions[:, 2]) + 0.04),
+            ],
+            dtype=np.float32,
+        )
+        anchor_bar_scale = np.asarray(
+            [
+                0.028,
+                max(0.11, 0.5 * float(np.max(anchor_positions[:, 1]) - np.min(anchor_positions[:, 1])) + 0.05),
+                0.020,
+            ],
+            dtype=np.float32,
+        )
+        support_point = anchor_bar_center
     task_phases = _task_phase_definitions(rope_center, args)
+    if drop_release_task:
+        task_phases[0]["end"] = support_point.astype(np.float32, copy=False)
+        task_phases[1]["start"] = support_point.astype(np.float32, copy=False)
+        task_phases[1]["end"] = support_point.astype(np.float32, copy=False)
+        task_phases[2]["start"] = support_point.astype(np.float32, copy=False)
+        task_phases[2]["end"] = support_point.astype(np.float32, copy=False)
+        task_phases[3]["start"] = support_point.astype(np.float32, copy=False)
+        task_phases[3]["end"] = support_point.astype(np.float32, copy=False)
     ee_target_end = np.asarray(task_phases[-1]["end"], dtype=np.float32)
     ee_target_quat = np.asarray(task_phases[0]["quat"], dtype=np.float32)
     mid_segment_indices = _mid_segment_indices(shifted_q[:n_obj], rope_center)
-    anchor_bar_center = np.asarray(
-        [
-            float(np.mean(anchor_positions := shifted_q[anchor_indices], axis=0)[0]),
-            float(np.mean(anchor_positions, axis=0)[1]),
-            float(np.max(anchor_positions[:, 2]) + 0.04),
-        ],
-        dtype=np.float32,
-    )
-    anchor_bar_scale = np.asarray(
-        [
-            0.028,
-            max(0.11, 0.5 * float(np.max(anchor_positions[:, 1]) - np.min(anchor_positions[:, 1])) + 0.05),
-            0.020,
-        ],
-        dtype=np.float32,
-    )
-    floor_z = 0.0
     stage_center = np.asarray(
-        [float(rope_center[0]), float(rope_center[1]), float(floor_z + 0.18)],
+        [float(rope_center[0]), float(rope_center[1]), float(floor_z + (0.16 if drop_release_task else 0.18))],
         dtype=np.float32,
     )
     stage_scale = np.asarray([0.28, 0.18, 0.05], dtype=np.float32)
@@ -744,35 +1029,63 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         ],
         dtype=np.float32,
     )
-    anchor_post_height = max(0.18, float(anchor_bar_center[2] - floor_z))
-    anchor_post_scale = np.asarray([0.024, 0.024, anchor_post_height], dtype=np.float32)
-    anchor_left_center = np.asarray(
-        [
-            float(anchor_positions[0, 0]),
-            float(anchor_positions[0, 1]),
-            float(floor_z + anchor_post_height),
-        ],
-        dtype=np.float32,
-    )
-    anchor_right_center = np.asarray(
-        [
-            float(anchor_positions[-1, 0]),
-            float(anchor_positions[-1, 1]),
-            float(floor_z + anchor_post_height),
-        ],
-        dtype=np.float32,
-    )
-    floor_center = np.asarray([0.0, 0.0, float(floor_z - 0.01)], dtype=np.float32)
-    floor_scale = np.asarray([1.45, 1.10, 0.012], dtype=np.float32)
+    if drop_release_task:
+        anchor_left_center = np.zeros((3,), dtype=np.float32)
+        anchor_right_center = np.zeros((3,), dtype=np.float32)
+        floor_scale = np.asarray([1.45, 1.10, 0.012], dtype=np.float32)
+        floor_center = np.asarray([0.0, 0.0, float(floor_z - floor_scale[2])], dtype=np.float32)
+        anchor_post_scale = np.asarray([0.024, 0.024, 0.024], dtype=np.float32)
+    else:
+        anchor_post_height = max(0.18, float(anchor_bar_center[2] - floor_z))
+        anchor_post_scale = np.asarray([0.024, 0.024, anchor_post_height], dtype=np.float32)
+        anchor_left_center = np.asarray(
+            [
+                float(anchor_positions[0, 0]),
+                float(anchor_positions[0, 1]),
+                float(floor_z + anchor_post_height),
+            ],
+            dtype=np.float32,
+        )
+        anchor_right_center = np.asarray(
+            [
+                float(anchor_positions[-1, 0]),
+                float(anchor_positions[-1, 1]),
+                float(floor_z + anchor_post_height),
+            ],
+            dtype=np.float32,
+        )
+        floor_center = np.asarray([0.0, 0.0, float(floor_z - 0.01)], dtype=np.float32)
+        floor_scale = np.asarray([1.45, 1.10, 0.012], dtype=np.float32)
     camera_presets = _camera_presets(
         {
             "rope_center": rope_center,
             "stage_center": stage_center,
             "stage_scale": stage_scale,
             "anchor_bar_center": anchor_bar_center,
+            "task": str(args.task),
+            "support_point": support_point,
+            "floor_z": float(floor_z),
         }
     )
 
+    if drop_release_task:
+        ground_cfg = builder.default_shape_cfg.copy()
+        newton_import_ir._configure_ground_contact_material(
+            ground_cfg,
+            ir_obj,
+            cfg,
+            checks,
+            context="ground_floor_box",
+        )
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform(wp.vec3(*floor_center.tolist()), wp.quat_identity()),
+            hx=float(floor_scale[0]),
+            hy=float(floor_scale[1]),
+            hz=float(floor_scale[2]),
+            cfg=ground_cfg,
+            label="ground_floor_box",
+        )
     model = builder.finalize(device=device)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
     if not bool(particle_contact_kernel):
@@ -786,8 +1099,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     init_body_q = init_state.body_q.numpy().astype(np.float32)
     ee_target_start = _ee_world_position(init_body_q[int(ee_body_index)], ee_offset_local)
     task_phases[0]["start"] = ee_target_start.astype(np.float32, copy=False)
-    task_phases[0]["end"] = ee_target_start.astype(np.float32, copy=False)
-    if len(task_phases) > 1:
+    if not drop_release_task:
+        task_phases[0]["end"] = ee_target_start.astype(np.float32, copy=False)
         task_phases[1]["start"] = ee_target_start.astype(np.float32, copy=False)
 
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
@@ -827,6 +1140,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "particle_contacts": bool(particle_contacts),
         "particle_contact_kernel": bool(particle_contact_kernel),
         "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
+        "release_phase_start_s": _phase_start_time(task_phases, "release" if drop_release_task else "release_retract"),
     }
     return model, ir_obj, meta, n_obj
 
@@ -839,6 +1153,7 @@ def simulate(
     n_obj: int,
     device: str,
 ) -> dict[str, Any]:
+    drop_release_task = str(args.task) == DROP_RELEASE_TASK
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
@@ -914,6 +1229,8 @@ def simulate(
 
     n_frames = max(2, int(args.frames))
     frame_dt = sim_dt * float(substeps)
+    release_triggered = False
+    anchor_indices = np.asarray(meta.get("anchor_indices", np.empty((0,), dtype=np.int32)), dtype=np.int32)
     replay = None
     if str(args.robot_motion_mode) == "replay":
         if args.replay_source is None:
@@ -950,6 +1267,17 @@ def simulate(
             state_in.clear_forces()
             sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
             phase_name, _, _ = _task_phase_state(sim_t, meta)
+            if drop_release_task and (not release_triggered) and phase_name in {"release", "free_fall"}:
+                _activate_particle_indices(model, anchor_indices, device=device)
+                if anchor_indices.size and state_in.particle_qd is not None:
+                    qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=True)
+                    qd_np[anchor_indices] = 0.0
+                    state_in.particle_qd.assign(qd_np)
+                if anchor_indices.size and state_out.particle_qd is not None:
+                    qd_np = state_out.particle_qd.numpy().astype(np.float32, copy=True)
+                    qd_np[anchor_indices] = 0.0
+                    state_out.particle_qd.assign(qd_np)
+                release_triggered = True
             if replay is not None:
                 body_q_frame = replay["body_q"][frame]
                 body_qd_frame = replay["body_qd"][frame]
@@ -965,7 +1293,10 @@ def simulate(
                 blend = float(np.clip(float(args.ik_target_blend), 0.0, 1.0))
                 if blend < 1.0:
                     joint_target_np = prev_joint_q + blend * (joint_target_np - prev_joint_q)
-                joint_target_np[7:9] = float(args.gripper_open)
+                if drop_release_task and phase_name in {"approach_support", "support_hold"}:
+                    joint_target_np[7:9] = float(args.gripper_hold)
+                else:
+                    joint_target_np[7:9] = float(args.gripper_open)
                 joint_target_qd = (joint_target_np - prev_joint_q) / sim_dt
                 prev_joint_q = joint_target_np.copy()
 
@@ -1036,6 +1367,7 @@ def render_video(
     args: argparse.Namespace,
     device: str,
 ) -> Path:
+    drop_release_task = str(args.task) == DROP_RELEASE_TASK
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found in PATH")
@@ -1077,6 +1409,10 @@ def render_video(
     ffmpeg_proc = None
     try:
         viewer.set_model(model)
+        try:
+            apply_viewer_shape_colors(viewer, model)
+        except Exception:
+            pass
         viewer.show_particles = True
         viewer.show_triangles = False
         viewer.show_visual = True
@@ -1104,19 +1440,22 @@ def render_video(
         rope_line_ends_wp = wp.empty(len(rope_edges), dtype=wp.vec3, device=device) if rope_edges.size else None
 
         anchor_positions = np.asarray(meta["anchor_positions"], dtype=np.float32)
-        anchor_xforms_wp = wp.array(
-            [wp.transform(wp.vec3(*row.tolist()), wp.quat_identity()) for row in anchor_positions],
-            dtype=wp.transform,
-            device=device,
+        anchor_xforms_wp = (
+            wp.array(
+                [wp.transform(wp.vec3(*row.tolist()), wp.quat_identity()) for row in anchor_positions],
+                dtype=wp.transform,
+                device=device,
+            )
+            if anchor_positions.size
+            else None
         )
-        anchor_colors_wp = wp.array([wp.vec3(0.34, 0.90, 0.52) for _ in range(anchor_positions.shape[0])], dtype=wp.vec3, device=device)
+        anchor_colors_wp = (
+            wp.array([wp.vec3(0.34, 0.90, 0.52) for _ in range(anchor_positions.shape[0])], dtype=wp.vec3, device=device)
+            if anchor_positions.size
+            else None
+        )
         left_finger_idx = int(meta["left_finger_index"])
         right_finger_idx = int(meta["right_finger_index"])
-        anchor_bar_center = np.asarray(meta["anchor_bar_center"], dtype=np.float32)
-        anchor_bar_scale = np.asarray(meta["anchor_bar_scale"], dtype=np.float32)
-        anchor_left_center = np.asarray(meta["anchor_left_center"], dtype=np.float32)
-        anchor_right_center = np.asarray(meta["anchor_right_center"], dtype=np.float32)
-        anchor_post_scale = np.asarray(meta["anchor_post_scale"], dtype=np.float32)
         stage_center = np.asarray(meta["stage_center"], dtype=np.float32)
         stage_scale = np.asarray(meta["stage_scale"], dtype=np.float32)
         robot_base_center = np.asarray(meta["robot_base_center"], dtype=np.float32)
@@ -1135,6 +1474,14 @@ def render_video(
         ground_starts_wp = wp.array(ground_starts_np, dtype=wp.vec3, device=device)
         ground_ends_wp = wp.array(ground_ends_np, dtype=wp.vec3, device=device)
         ground_colors_wp = wp.array(ground_colors_np, dtype=wp.vec3, device=device)
+        release_time_s = None
+        elapsed = 0.0
+        for phase in meta["task_phases"]:
+            phase_name = str(phase["name"])
+            if phase_name in {"release", "release_retract"}:
+                release_time_s = float(elapsed)
+                break
+            elapsed += max(float(phase["duration"]), 1.0e-8)
 
         state = model.state()
         if state.body_qd is not None:
@@ -1188,72 +1535,116 @@ def render_video(
                         ),
                         wp.array([wp.vec3(0.22, 0.90, 0.96)], dtype=wp.vec3, device=device),
                     )
-                viewer.log_shapes(
-                    "/demo/anchors",
-                    newton.GeoType.SPHERE,
-                    0.018,
-                    anchor_xforms_wp,
-                    anchor_colors_wp,
-                )
+                    if anchor_xforms_wp is not None and anchor_colors_wp is not None:
+                        viewer.log_shapes(
+                            "/demo/anchors",
+                            newton.GeoType.SPHERE,
+                            0.018,
+                            anchor_xforms_wp,
+                            anchor_colors_wp,
+                        )
                 if str(args.render_mode) == "presentation":
-                    viewer.log_shapes(
-                        "/demo/floor",
-                        newton.GeoType.BOX,
-                        tuple(float(v) for v in floor_scale.tolist()),
-                        wp.array(
-                            [wp.transform(wp.vec3(*floor_center.tolist()), wp.quat_identity())],
-                            dtype=wp.transform,
-                            device=device,
-                        ),
-                        wp.array([wp.vec3(0.30, 0.28, 0.24)], dtype=wp.vec3, device=device),
-                    )
-                    viewer.log_shapes(
-                        "/demo/robot_pedestal",
-                        newton.GeoType.BOX,
-                        tuple(float(v) for v in robot_base_scale.tolist()),
-                        wp.array(
-                            [wp.transform(wp.vec3(*robot_base_center.tolist()), wp.quat_identity())],
-                            dtype=wp.transform,
-                            device=device,
-                        ),
-                        wp.array([wp.vec3(0.45, 0.39, 0.31)], dtype=wp.vec3, device=device),
-                    )
-                    viewer.log_shapes(
-                        "/demo/anchor_posts",
-                        newton.GeoType.BOX,
-                        tuple(float(v) for v in anchor_post_scale.tolist()),
-                        wp.array(
-                            [
-                                wp.transform(wp.vec3(*anchor_left_center.tolist()), wp.quat_identity()),
-                                wp.transform(wp.vec3(*anchor_right_center.tolist()), wp.quat_identity()),
-                            ],
-                            dtype=wp.transform,
-                            device=device,
-                        ),
-                        wp.array([wp.vec3(0.48, 0.41, 0.32), wp.vec3(0.48, 0.41, 0.32)], dtype=wp.vec3, device=device),
-                    )
-                    viewer.log_shapes(
-                        "/demo/anchor_bar",
-                        newton.GeoType.BOX,
-                        tuple(float(v) for v in anchor_bar_scale.tolist()),
-                        wp.array(
-                            [wp.transform(wp.vec3(*anchor_bar_center.tolist()), wp.quat_identity())],
-                            dtype=wp.transform,
-                            device=device,
-                        ),
-                        wp.array([wp.vec3(0.52, 0.44, 0.34)], dtype=wp.vec3, device=device),
-                    )
-                    viewer.log_shapes(
-                        "/demo/stage_reference",
-                        newton.GeoType.BOX,
-                        tuple(float(v) for v in stage_scale.tolist()),
-                        wp.array(
-                            [wp.transform(wp.vec3(*stage_center.tolist()), wp.quat_identity())],
-                            dtype=wp.transform,
-                            device=device,
-                        ),
-                        wp.array([wp.vec3(0.31, 0.28, 0.22)], dtype=wp.vec3, device=device),
-                    )
+                    if drop_release_task:
+                        viewer.log_shapes(
+                            "/demo/floor",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in floor_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*floor_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.30, 0.28, 0.24)], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/robot_pedestal",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in robot_base_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*robot_base_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.45, 0.39, 0.31)], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/anchor_bar",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in np.asarray(meta["anchor_bar_scale"], dtype=np.float32).tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*np.asarray(meta["anchor_bar_center"], dtype=np.float32).tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.52, 0.44, 0.34)], dtype=wp.vec3, device=device),
+                        )
+                        if anchor_xforms_wp is not None and anchor_colors_wp is not None:
+                            viewer.log_shapes(
+                                "/demo/anchors",
+                                newton.GeoType.SPHERE,
+                                0.015,
+                                anchor_xforms_wp,
+                                anchor_colors_wp,
+                            )
+                    else:
+                        viewer.log_shapes(
+                            "/demo/floor",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in floor_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*floor_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.30, 0.28, 0.24)], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/robot_pedestal",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in robot_base_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*robot_base_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.45, 0.39, 0.31)], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/anchor_posts",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in np.asarray(meta["anchor_post_scale"], dtype=np.float32).tolist()),
+                            wp.array(
+                                [
+                                    wp.transform(wp.vec3(*np.asarray(meta["anchor_left_center"], dtype=np.float32).tolist()), wp.quat_identity()),
+                                    wp.transform(wp.vec3(*np.asarray(meta["anchor_right_center"], dtype=np.float32).tolist()), wp.quat_identity()),
+                                ],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.48, 0.41, 0.32), wp.vec3(0.48, 0.41, 0.32)], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/anchor_bar",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in np.asarray(meta["anchor_bar_scale"], dtype=np.float32).tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*np.asarray(meta["anchor_bar_center"], dtype=np.float32).tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.52, 0.44, 0.34)], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/stage_reference",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in stage_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*stage_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.31, 0.28, 0.22)], dtype=wp.vec3, device=device),
+                        )
                     viewer.log_lines(
                         "/demo/ground_grid",
                         ground_starts_wp,
@@ -1297,12 +1688,15 @@ def render_video(
                         float(args.ee_contact_radius),
                     )
                     contact_state = "ON" if min_clearance <= 0.0 else "OFF"
+                    tracking_line = f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s"
+                    if release_time_s is not None:
+                        tracking_line += f" | t_release: {float(release_time_s):.3f}s"
                     frame = overlay_text_lines_rgb(
                         frame,
                         [
                             f"task: {args.task} | phase: {phase_name}",
-                            "Native Newton Franka Panda + hanging rope | yellow=target, cyan=gripper center",
-                            f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s",
+                            "Native Newton Franka Panda + rope drop baseline | yellow=target, cyan=gripper center",
+                            tracking_line,
                             f"contact: {contact_state} via {min_proxy_name} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm",
                         ],
                         font_size=int(args.label_font_size),
@@ -1330,6 +1724,7 @@ def build_summary(
     args: argparse.Namespace,
     out_mp4: Path,
 ) -> dict[str, Any]:
+    drop_release_task = str(args.task) == DROP_RELEASE_TASK
     particle_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
     body_q = np.asarray(sim_data["body_q"], dtype=np.float32)
     body_vel = np.asarray(sim_data["body_vel"], dtype=np.float32)
@@ -1350,6 +1745,11 @@ def build_summary(
     gripper_path_length = float(np.sum(np.linalg.norm(np.diff(gripper_center, axis=0), axis=1)))
 
     rope_com = particle_q.mean(axis=1)
+    rope_min_z = np.min(particle_q[:, :, 2], axis=1)
+    ground_z = float(meta.get("floor_z", 0.0))
+    rope_surface_clearance_to_ground = np.min(
+        particle_q[:, :, 2] - particle_radius[None, :], axis=1
+    ) - ground_z
     rope_com_disp = float(np.linalg.norm(rope_com[-1] - rope_com[0]))
     mid_segment_indices = np.asarray(meta["mid_segment_indices"], dtype=np.int32)
     mid_segment_z = particle_q[:, mid_segment_indices, 2].mean(axis=1)
@@ -1388,23 +1788,39 @@ def build_summary(
         if min_d <= 0.0:
             contact_frames.append(frame_idx)
 
+    support_contact_frames = list(contact_frames)
+    support_contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
+    support_contact_duration_s = float(np.count_nonzero(support_contact_mask) * frame_dt)
+    support_first_contact_frame = int(support_contact_frames[0]) if support_contact_frames else None
+    support_last_contact_frame = int(support_contact_frames[-1]) if support_contact_frames else None
+    support_contact_peak_frame = (
+        int(np.argmin(np.asarray(min_clearance, dtype=np.float32))) if min_clearance else None
+    )
+
+    ground_contact_mask = np.asarray(rope_surface_clearance_to_ground <= 0.0, dtype=bool)
+    ground_contact_frames = np.flatnonzero(ground_contact_mask).tolist()
+    contact_mask = ground_contact_mask if drop_release_task else support_contact_mask
+    contact_frames = ground_contact_frames if drop_release_task else support_contact_frames
+    primary_clearance = rope_surface_clearance_to_ground if drop_release_task else np.asarray(min_clearance, dtype=np.float32)
+
     first_contact_frame = int(contact_frames[0]) if contact_frames else None
     last_contact_frame = int(contact_frames[-1]) if contact_frames else None
-    contact_peak_frame = int(np.argmin(np.asarray(min_clearance, dtype=np.float32))) if min_clearance else None
-    release_candidates = [i for i, name in enumerate(phase_names) if name == "release_retract"]
+    contact_peak_frame = int(np.argmin(primary_clearance)) if primary_clearance.size else None
+    release_candidates = [i for i, name in enumerate(phase_names) if name in {"release", "release_retract"}]
     release_frame = None
     if release_candidates:
         release_start = int(release_candidates[0])
-        contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
-        for idx in range(release_start, len(contact_mask)):
-            window = contact_mask[idx : min(len(contact_mask), idx + 3)]
-            if window.size and not np.any(window):
-                release_frame = int(idx)
-                break
+        if drop_release_task:
+            release_frame = release_start
+        else:
+            for idx in range(release_start, len(contact_mask)):
+                window = contact_mask[idx : min(len(contact_mask), idx + 3)]
+                if window.size and not np.any(window):
+                    release_frame = int(idx)
+                    break
 
     pre_contact_mask = np.asarray([name == "pre_approach" for name in phase_names], dtype=bool)
-    contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
-    release_mask = np.asarray([name == "release_retract" for name in phase_names], dtype=bool)
+    release_mask = np.asarray([name in {"release", "release_retract"} for name in phase_names], dtype=bool)
     contact_duration_s = float(np.count_nonzero(contact_mask) * frame_dt)
     first_contact_phase = None if first_contact_frame is None else str(phase_names[first_contact_frame])
 
@@ -1430,11 +1846,11 @@ def build_summary(
         if not unique_phase_sequence or unique_phase_sequence[-1] != name:
             unique_phase_sequence.append(name)
 
-    source_counts: dict[str, int] = {}
-    for name, active in zip(min_clearance_source, contact_mask.tolist(), strict=False):
+    support_source_counts: dict[str, int] = {}
+    for name, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False):
         if not active:
             continue
-        source_counts[name] = int(source_counts.get(name, 0) + 1)
+        support_source_counts[name] = int(support_source_counts.get(name, 0) + 1)
 
     min_clearance_np = np.asarray(min_clearance, dtype=np.float32)
     gripper_center_clearance_np = np.asarray(gripper_center_clearance, dtype=np.float32)
@@ -1444,6 +1860,23 @@ def build_summary(
     contact_peak_source = (
         None if contact_peak_frame is None else str(min_clearance_source[int(contact_peak_frame)])
     )
+    if drop_release_task:
+        contact_peak_source = "ground_plane"
+
+    if first_contact_frame is not None and first_contact_frame > 0 and release_frame is not None:
+        fit_start = int(release_frame)
+        fit_stop = int(first_contact_frame)
+        fit_times = np.arange(fit_start, fit_stop, dtype=np.float64) * frame_dt
+        fit_values = rope_com[fit_start:fit_stop, 2]
+    else:
+        fit_times = np.asarray([], dtype=np.float64)
+        fit_values = np.asarray([], dtype=np.float64)
+    early_fall_accel_estimate = _fit_quadratic_acceleration(fit_times, fit_values)
+    impact_speed_estimate = None
+    if first_contact_frame is not None and first_contact_frame > 0:
+        impact_speed_estimate = float(
+            max(0.0, (rope_com[first_contact_frame - 1, 2] - rope_com[first_contact_frame, 2]) / max(frame_dt, 1.0e-12))
+        )
 
     return {
         "ir_path": str(args.ir.resolve()),
@@ -1457,7 +1890,9 @@ def build_summary(
         "wall_time_sec": float(sim_data["wall_time"]),
         "rope_total_mass": float(meta["total_object_mass"]),
         "anchor_count": int(meta["anchor_indices"].shape[0]),
-        "anchor_constraint_mode": "inactive_fixed_particles",
+        "anchor_constraint_mode": (
+            "inactive_fixed_particles_until_release" if drop_release_task else "inactive_fixed_particles"
+        ),
         "anchor_mass_mode": str(args.anchor_mass_mode),
         "task": str(args.task),
         "render_mode": str(args.render_mode),
@@ -1470,6 +1905,9 @@ def build_summary(
         "replay_source": sim_data.get("replay_source"),
         "history_storage_mode": str(sim_data["history_storage_mode"]),
         "history_storage_files": sim_data["history_storage_files"],
+        "apply_drag": bool(args.apply_drag),
+        "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
+        "gravity_mag_m_s2": float(args.gravity_mag),
         "robot_geometry": "native_franka",
         "ee_body_index": int(meta["ee_body_index"]),
         "ik_target_blend": float(args.ik_target_blend),
@@ -1483,9 +1921,27 @@ def build_summary(
         "gripper_center_speed_during_contact_mean_m_s": contact_speed_mean,
         "gripper_center_speed_release_mean_m_s": release_speed_mean,
         "gripper_center_path_length_m": gripper_path_length,
-        "contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
-        "contact_proxy_radius_m": float(_gripper_contact_proxy_radii(float(args.ee_contact_radius))["gripper_center"]),
-        "contact_proxy_radii_m": _gripper_contact_proxy_radii(float(args.ee_contact_radius)),
+        "ground_z_m": float(ground_z),
+        "rope_min_z_m": float(np.min(rope_min_z)),
+        "rope_surface_clearance_min_m": float(np.min(rope_surface_clearance_to_ground)),
+        "support_contact_active_frames": int(len(support_contact_frames)),
+        "support_contact_duration_s": float(support_contact_duration_s),
+        "support_first_contact_frame": support_first_contact_frame,
+        "support_last_contact_frame": support_last_contact_frame,
+        "support_contact_peak_frame": support_contact_peak_frame,
+        "support_contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
+        "support_contact_proxy_counts": support_source_counts,
+        "contact_proxy_mode": (
+            "rope_surface_vs_ground_plane" if drop_release_task else "min(gripper_center,left_finger,right_finger,finger_span)"
+        ),
+        "contact_proxy_radius_m": (
+            0.0 if drop_release_task else float(_gripper_contact_proxy_radii(float(args.ee_contact_radius))["gripper_center"])
+        ),
+        "contact_proxy_radii_m": (
+            {"ground_plane": 0.0}
+            if drop_release_task
+            else _gripper_contact_proxy_radii(float(args.ee_contact_radius))
+        ),
         "rope_com_displacement_m": rope_com_disp,
         "rope_com_z_min_m": float(np.min(rope_com[:, 2])),
         "rope_mid_segment_peak_z_delta_m": rope_mid_peak_z_delta,
@@ -1494,23 +1950,32 @@ def build_summary(
         "contact_started": bool(first_contact_frame is not None),
         "first_contact_frame": first_contact_frame,
         "first_contact_time_s": (None if first_contact_frame is None else float(first_contact_frame * frame_dt)),
+        "first_ground_contact_frame": first_contact_frame,
+        "first_ground_contact_time_s": (None if first_contact_frame is None else float(first_contact_frame * frame_dt)),
         "last_contact_frame": last_contact_frame,
         "last_contact_time_s": (None if last_contact_frame is None else float(last_contact_frame * frame_dt)),
         "first_contact_phase": first_contact_phase,
         "contact_peak_frame": contact_peak_frame,
         "release_frame": release_frame,
         "release_time_s": (None if release_frame is None else float(release_frame * frame_dt)),
+        "t_release_s": (None if release_frame is None else float(release_frame * frame_dt)),
+        "impact_speed_before_first_contact_m_s": impact_speed_estimate,
+        "early_fall_acceleration_estimate_m_s2": early_fall_accel_estimate,
         "contact_duration_s": contact_duration_s,
         "contact_active_frames": int(len(contact_frames)),
         "contact_phase_count": int(np.count_nonzero(contact_mask)),
         "task_phase_sequence": unique_phase_sequence,
-        "min_clearance_min_m": float(np.min(min_clearance_np)),
-        "min_clearance_final_m": float(min_clearance[-1]),
+        "min_clearance_min_m": float(np.min(primary_clearance)),
+        "min_clearance_final_m": float(primary_clearance[-1]),
         "gripper_center_clearance_min_m": float(np.min(gripper_center_clearance_np)),
         "left_finger_clearance_min_m": float(np.min(left_finger_clearance_np)),
         "right_finger_clearance_min_m": float(np.min(right_finger_clearance_np)),
         "finger_span_clearance_min_m": float(np.min(finger_span_clearance_np)),
-        "contact_proxy_counts": source_counts,
+        "contact_proxy_counts": (
+            {"ground_plane": int(np.count_nonzero(contact_mask))}
+            if drop_release_task
+            else support_source_counts
+        ),
         "contact_peak_proxy": contact_peak_source,
         "drag_phase_gating": (
             "pre_approach + release_retract"
@@ -1518,6 +1983,103 @@ def build_summary(
             else "always_on"
         ),
     }
+
+
+def build_physics_validation(
+    model: newton.Model,
+    sim_data: dict[str, Any],
+    meta: dict[str, Any],
+    args: argparse.Namespace,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    particle_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
+    particle_radius = model.particle_radius.numpy().astype(np.float32)[: particle_q.shape[1]]
+    rope_com = particle_q.mean(axis=1)
+    rope_min_z = np.min(particle_q[:, :, 2], axis=1)
+    ground_z = float(meta.get("floor_z", 0.0))
+    ground_surface_clearance = np.min(particle_q[:, :, 2] - particle_radius[None, :], axis=1) - ground_z
+    ground_contact_mask = np.asarray(ground_surface_clearance <= 0.0, dtype=bool)
+    ground_contact_frames = np.flatnonzero(ground_contact_mask).astype(np.int32)
+    release_frame = summary.get("release_frame")
+    frame_dt = float(summary.get("frame_dt") or (float(sim_data["sim_dt"]) * float(sim_data["substeps"])))
+
+    if ground_contact_frames.size:
+        first_ground_contact_frame = int(ground_contact_frames[0])
+    else:
+        first_ground_contact_frame = None
+
+    if first_ground_contact_frame is not None:
+        first_ground_contact_time_s = float(first_ground_contact_frame * frame_dt)
+    else:
+        first_ground_contact_time_s = None
+
+    impact_speed_estimate = summary.get("impact_speed_before_first_contact_m_s")
+    if impact_speed_estimate is None and first_ground_contact_frame is not None and first_ground_contact_frame > 0:
+        impact_speed_estimate = float(
+            max(
+                0.0,
+                (
+                    rope_com[first_ground_contact_frame - 1, 2]
+                    - rope_com[first_ground_contact_frame, 2]
+                )
+                / max(frame_dt, 1.0e-12),
+            )
+        )
+
+    if first_ground_contact_frame is not None and release_frame is not None and first_ground_contact_frame > release_frame + 2:
+        fit_start = int(release_frame)
+        fit_stop = int(first_ground_contact_frame)
+        fit_times = np.arange(fit_start, fit_stop, dtype=np.float64) * frame_dt
+        fit_values = rope_com[fit_start:fit_stop, 2]
+    else:
+        fit_times = np.asarray([], dtype=np.float64)
+        fit_values = np.asarray([], dtype=np.float64)
+
+    early_fall_accel_estimate = _fit_quadratic_acceleration(fit_times, fit_values)
+    penetration_mask = np.asarray(rope_min_z < ground_z - 1.0e-5, dtype=bool)
+
+    return {
+        "task": str(args.task),
+        "apply_drag": bool(args.apply_drag),
+        "drag_damping_scale": float(args.drag_damping_scale),
+        "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
+        "ground_z_m": float(ground_z),
+        "release_frame": summary.get("release_frame"),
+        "release_time_s": summary.get("release_time_s"),
+        "first_ground_contact_frame": first_ground_contact_frame,
+        "first_ground_contact_time_s": first_ground_contact_time_s,
+        "impact_speed_before_first_contact_m_s": impact_speed_estimate,
+        "rope_com_z_m": rope_com[:, 2].astype(float).tolist(),
+        "rope_min_z_m": rope_min_z.astype(float).tolist(),
+        "ground_surface_clearance_m": ground_surface_clearance.astype(float).tolist(),
+        "any_rope_point_below_ground_threshold": bool(np.any(penetration_mask)),
+        "penetration_frame_count": int(np.count_nonzero(penetration_mask)),
+        "penetration_min_z_m": float(np.min(rope_min_z)),
+        "early_fall_acceleration_estimate_m_s2": early_fall_accel_estimate,
+        "gravity_mag_target_m_s2": float(args.gravity_mag),
+        "gravity_like_fraction": (
+            None
+            if early_fall_accel_estimate is None
+            else float(abs(abs(early_fall_accel_estimate) - float(args.gravity_mag)) / max(float(args.gravity_mag), 1.0e-12))
+        ),
+        "ground_contact_frames": ground_contact_frames.astype(int).tolist(),
+        "summary_first_contact_frame": summary.get("first_contact_frame"),
+        "summary_contact_duration_s": summary.get("contact_duration_s"),
+        "summary_contact_active_frames": summary.get("contact_active_frames"),
+        "support_contact_active_frames": summary.get("support_contact_active_frames"),
+        "support_contact_duration_s": summary.get("support_contact_duration_s"),
+        "summary_contact_proxy_mode": summary.get("contact_proxy_mode"),
+        "support_contact_proxy_mode": summary.get("support_contact_proxy_mode"),
+        "summary_contact_peak_proxy": summary.get("contact_peak_proxy"),
+        "support_contact_proxy_counts": summary.get("support_contact_proxy_counts"),
+    }
+
+
+def save_physics_validation_json(args: argparse.Namespace, payload: dict[str, Any]) -> Path:
+    run_root = args.out_dir.parent if args.out_dir.name == "work" else args.out_dir
+    out_path = run_root / "physics_validation.json"
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
 
 
 def make_gif(args: argparse.Namespace, out_mp4: Path) -> Path | None:
@@ -1593,6 +2155,9 @@ def main() -> int:
     out_mp4 = render_video(model, sim_data, meta, args, device)
     out_gif = make_gif(args, out_mp4)
     summary = build_summary(model, sim_data, meta, args, out_mp4)
+    physics_validation = build_physics_validation(model, sim_data, meta, args, summary)
+    physics_validation_path = save_physics_validation_json(args, physics_validation)
+    summary["physics_validation_path"] = str(physics_validation_path)
     if out_gif is not None:
         summary["output_gif"] = str(out_gif)
     summary_path = save_summary_json(args, summary)

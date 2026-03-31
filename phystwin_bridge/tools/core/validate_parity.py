@@ -118,6 +118,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--self-contact-mode",
+        choices=["off", "native", "custom", "phystwin"],
+        default=None,
+        help=(
+            "Optional pass-through to importer. "
+            "Use this to force bridge-side self-contact semantics instead of the legacy "
+            "particle-contact + native-kernel flags."
+        ),
+    )
+    parser.add_argument(
+        "--custom-self-contact-hops",
+        type=int,
+        default=0,
+        help=(
+            "Optional pass-through to importer for bridge-side self-contact tables. "
+            "0 keeps all non-self pairs eligible."
+        ),
+    )
+    parser.add_argument(
         "--particle-contacts",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -495,6 +514,9 @@ def _build_importer_cmd(
         "--drag-damping-scale", str(args.drag_damping_scale),
         "--shape-contact-damping-multiplier", str(args.shape_contact_damping_multiplier),
     ]
+    if args.self_contact_mode is not None:
+        cmd.extend(["--self-contact-mode", str(args.self_contact_mode)])
+        cmd.extend(["--custom-self-contact-hops", str(int(args.custom_self_contact_hops))])
     if args.particle_contact_ke is not None:
         cmd.extend(["--particle-contact-ke", str(args.particle_contact_ke)])
     if args.object_contact_radius is not None:
