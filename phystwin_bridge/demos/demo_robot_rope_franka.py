@@ -411,6 +411,12 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Maximum hidden settle time before the recorded support/release sequence starts [s].",
     )
+    p.add_argument(
+        "--pre-release-settle-damping-scale",
+        type=float,
+        default=8.0,
+        help="Extra pre-release orthogonal-to-gravity damping scale used only while the support patch is still constrained.",
+    )
 
     p.add_argument("--render-fps", type=float, default=30.0)
     p.add_argument("--slowdown", type=float, default=None)
@@ -1294,6 +1300,9 @@ def simulate(
     drag = 0.0
     if args.apply_drag and "drag_damping" in ir_obj:
         drag = float(newton_import_ir.ir_scalar(ir_obj, "drag_damping")) * float(args.drag_damping_scale)
+    settle_drag = 0.0
+    if drop_release_task and "drag_damping" in ir_obj:
+        settle_drag = float(newton_import_ir.ir_scalar(ir_obj, "drag_damping")) * float(args.pre_release_settle_damping_scale)
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     gravity_axis = None
     gravity_norm = float(np.linalg.norm(gravity_vec))
@@ -1412,7 +1421,7 @@ def simulate(
                 state_out.joint_qd.zero_()
                 newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
                 state_in, state_out = state_out, state_in
-                if drag > 0.0:
+                if settle_drag > 0.0:
                     if gravity_axis is not None:
                         wp.launch(
                             _apply_drag_correction_ignore_axis,
@@ -1422,7 +1431,7 @@ def simulate(
                                 state_in.particle_qd,
                                 n_obj,
                                 sim_dt,
-                                drag,
+                                settle_drag,
                                 wp.vec3(*gravity_axis.tolist()),
                             ],
                             device=device,
@@ -1431,7 +1440,7 @@ def simulate(
                         wp.launch(
                             newton_import_ir._apply_drag_correction,
                             dim=n_obj,
-                            inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, drag],
+                            inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, settle_drag],
                             device=device,
                         )
         if preroll_settle_pass is None:
@@ -1544,9 +1553,15 @@ def simulate(
                 newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
             state_in, state_out = state_out, state_in
 
-            if drag > 0.0:
+            active_drag = 0.0
+            if drop_release_task and not release_triggered:
+                active_drag = settle_drag
+            elif drag > 0.0:
                 if str(args.task) == "lift_release" and phase_name in {"approach_under", "lift", "hold"}:
-                    continue
+                    active_drag = 0.0
+                else:
+                    active_drag = drag
+            if active_drag > 0.0:
                 if gravity_axis is not None:
                     wp.launch(
                         _apply_drag_correction_ignore_axis,
@@ -1556,7 +1571,7 @@ def simulate(
                             state_in.particle_qd,
                             n_obj,
                             sim_dt,
-                            drag,
+                            active_drag,
                             wp.vec3(*gravity_axis.tolist()),
                         ],
                         device=device,
@@ -1565,7 +1580,7 @@ def simulate(
                     wp.launch(
                         newton_import_ir._apply_drag_correction,
                         dim=n_obj,
-                        inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, drag],
+                        inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, active_drag],
                         device=device,
                     )
 
@@ -1599,6 +1614,7 @@ def simulate(
         "replay_source": (None if replay is None else str(replay["source_dir"])),
         "sim_dt": float(sim_dt),
         "substeps": int(substeps),
+        "pre_release_settle_damping_scale": float(args.pre_release_settle_damping_scale),
         "wall_time": float(wall_time),
         **store.summary_dict(),
     }
@@ -2188,6 +2204,7 @@ def build_summary(
         "apply_drag": bool(args.apply_drag),
         "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
         "gravity_mag_m_s2": float(args.gravity_mag),
+        "pre_release_settle_damping_scale": float(sim_data.get("pre_release_settle_damping_scale", args.pre_release_settle_damping_scale)),
         "robot_geometry": "native_franka",
         "ee_body_index": int(meta["ee_body_index"]),
         "ik_target_blend": float(args.ik_target_blend),
