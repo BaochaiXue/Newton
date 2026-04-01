@@ -1,12 +1,29 @@
-# BEST RUN
+> status: local_only_secondary
+> canonical_replacement: `results_meta/tasks/robot_rope_franka_tabletop_push_hero.json`
+> owner_surface: `robot_rope_franka_tabletop_push_hero`
+> last_reviewed: `2026-04-01`
+> review_interval: `30d`
+> update_rule: `Update only when the local BEST_RUN mirror target changes. Do not use this file as committed authority.`
+> notes: Local convenience mirror only. Do not use this file as the committed source of truth for current/promoted run meaning.
 
-Promoted run: `20260401_093102_fixeddt_c10_contactfix_cam`
+# BEST_RUN Mirror (Local-Only)
 
-Source candidate:
+Local-only convenience mirror for the currently promoted tabletop-push hero
+bundle.
 
-- `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam`
+Committed authority for current/promoted run meaning lives in:
 
-Why this run won:
+- `results_meta/tasks/robot_rope_franka_tabletop_push_hero.json`
+
+Current committed promoted run id:
+
+- `20260401_093102_fixeddt_c10_contactfix_cam`
+
+Local source candidate:
+
+- `../candidates/20260401_093102_fixeddt_c10_contactfix_cam`
+
+Why this local mirror points here:
 
 - native Newton Franka remains visible in all three views
 - rope is visibly resting on a native Newton tabletop before the push
