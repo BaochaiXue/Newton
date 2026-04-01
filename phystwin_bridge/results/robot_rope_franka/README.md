@@ -63,11 +63,11 @@ scripts/run_robot_rope_franka_tabletop_hero.sh --tag <short_tag> [extra demo arg
 
 Current committed promoted run id:
 
-- `20260401_081639_fixeddt_c08_gatepass`
+- `20260401_093102_fixeddt_c10_contactfix_cam`
 
 Local candidate directory:
 
-- `candidates/20260401_081639_fixeddt_c08_gatepass/`
+- `candidates/20260401_093102_fixeddt_c10_contactfix_cam/`
 
 Local convenience mirror:
 
@@ -88,3 +88,5 @@ Implementation note kept for reruns:
   inside `demo_robot_rope_franka.py` because the earlier tabletop IK path did
   not reliably reach the contact line under fixed `sim_dt = 5e-5`,
   `substeps = 667`
+- the promoted contact-fix update starts contact earlier in the visible push,
+  improving the finger-to-rope causal readability
