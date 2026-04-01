@@ -474,3 +474,42 @@ Module newton._src.utils.render 145677d load on device 'cuda:0' took 0.48 ms  (c
   "drag_phase_gating": "always_on_quasi_static",
   "physics_validation_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_074926_fixeddt_c05_rotfix_reach/debug/physics_validation.json"
 }
+Warp 1.12.0.dev20260218 initialized:
+   Git commit: 3d888595a61128dd17de0dbb9eb8d80391e81424
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4090" (23 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/xinjie/.cache/warp/1.12.0.dev20260218
+Module newton._src.geometry.inertia 2bd8c78 load on device 'cuda:0' took 0.73 ms  (cached)
+Module newton._src.utils.mesh bced167 load on device 'cpu' took 0.66 ms  (cached)
+Module validate_and_correct_inertia_kernel_0c7bfa66 0c7bfa6 load on device 'cuda:0' took 0.33 ms  (cached)
+Module newton._src.sim.articulation 2109b59 load on device 'cuda:0' took 2.90 ms  (cached)
+Module newton._src.sim.ik.ik_objectives efb687b load on device 'cuda:0' took 1.00 ms  (cached)
+Module newton._src.sim.ik.ik_solver 6670029 load on device 'cuda:0' took 0.84 ms  (cached)
+Module IKOptimizerLM___build_specialized__locals___fk_local_4065db04 4065db0 load on device 'cuda:0' took 0.80 ms  (cached)
+Module newton._src.sim.ik.ik_common bc7903e load on device 'cuda:0' took 1.44 ms  (cached)
+Module IKOptimizerLM___build_specialized__locals___compute_motion_subspace_2d_15acbefb 15acbef load on device 'cuda:0' took 5.02 ms  (cached)
+Module _lm_solve_tiled_9_15_cda9ff77 12f1e6b load on device 'cuda:0' took 92.15 ms  (cached)
+Module newton._src.sim.ik.ik_lm_optimizer bdde777 load on device 'cuda:0' took 0.85 ms  (cached)
+Module newton._src.sim.collide 452004c load on device 'cuda:0' took 0.76 ms  (cached)
+Module newton._src.geometry.broad_phase_nxn dcff895 load on device 'cuda:0' took 0.51 ms  (cached)
+Module create_narrow_phase_primitive_kernel__locals__narrow_phase_primitive_kernel_ac59d7a0 640833f load on device 'cuda:0' took 0.69 ms  (cached)
+Module create_narrow_phase_kernel_gjk_mpr__locals__narrow_phase_kernel_gjk_mpr_46eb548d 1d6e16f load on device 'cuda:0' took 1.07 ms  (cached)
+Module newton._src.geometry.narrow_phase 0593107 load on device 'cuda:0' took 0.92 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 3a7a18f load on device 'cuda:0' took 0.62 ms  (cached)
+Module newton._src.geometry.narrow_phase 931370b load on device 'cuda:0' took 0.78 ms  (cached)
+Module create_narrow_phase_process_mesh_plane_contacts_kernel__locals__narrow_phase_process_mesh_plane_contacts_reduce_kernel_930923b3 4c09d6b load on device 'cuda:0' took 0.45 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_8060ca9c d5135d2 load on device 'cuda:0' took 1.30 ms  (cached)
+Module newton._src.geometry.contact_reduction_global d2f9fc3 load on device 'cuda:0' took 0.49 ms  (cached)
+Module newton._src.geometry.sdf_contact e671631 load on device 'cuda:0' took 0.22 ms  (cached)
+Module create_narrow_phase_process_mesh_mesh_contacts_kernel__locals__mesh_sdf_collision_global_reduce_kernel_f46f3252 f46f325 load on device 'cuda:0' took 1.31 ms  (cached)
+Module create_export_reduced_contacts_kernel__locals__export_reduced_contacts_kernel_ef09b9a0 6e4cf74 load on device 'cuda:0' took 0.40 ms  (cached)
+Module newton._src.geometry.kernels 55ed1b0 load on device 'cuda:0' took 1.78 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_particle 0e0d871 load on device 'cuda:0' took 0.91 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 483b8fe load on device 'cuda:0' took 1.74 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_contact d558900 load on device 'cuda:0' took 0.88 ms  (cached)
+Module newton._src.solvers.solver 16aecb3 load on device 'cuda:0' took 0.55 ms  (cached)
+Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.23 ms  (cached)
+  frame 25/181 phase=approach target_err=0.3230m min_clearance=0.2970m
