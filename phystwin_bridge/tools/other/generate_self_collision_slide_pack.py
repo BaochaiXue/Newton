@@ -146,14 +146,46 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate the six-slide self-collision update pack.")
     parser.add_argument("--campaign-root", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--exactness-json", type=Path, default=None)
+    parser.add_argument("--strict-parity-report", type=Path, default=None)
+    parser.add_argument("--off-parity-report", type=Path, default=None)
+    parser.add_argument("--compare-summary-json", type=Path, default=None)
     args = parser.parse_args()
 
     root = args.campaign_root.resolve()
     out_dir = args.out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    exactness = json.loads((root / "equivalence" / "verify_phystwin_self_collision_equivalence.json").read_text())
-    parity = json.loads((root / "parity" / "strict_self_collision_parity_summary.json").read_text())
+    exactness_path = (
+        args.exactness_json.resolve()
+        if args.exactness_json is not None
+        else (root / "equivalence" / "verify_phystwin_self_collision_equivalence.json").resolve()
+    )
+    exactness = json.loads(exactness_path.read_text())
+
+    strict_report_path = (
+        args.strict_parity_report.resolve()
+        if args.strict_parity_report is not None
+        else (root / "parity" / "strict_self_collision_parity_summary.json").resolve()
+    )
+    strict_report = json.loads(strict_report_path.read_text())
+
+    off_report_path = args.off_parity_report.resolve() if args.off_parity_report is not None else None
+    compare_summary_path = (
+        args.compare_summary_json.resolve() if args.compare_summary_json is not None else None
+    )
+    compare_summary = (
+        json.loads(compare_summary_path.read_text()) if compare_summary_path is not None else None
+    )
+
+    if compare_summary is None and off_report_path is not None:
+        off_report = json.loads(off_report_path.read_text())
+        compare_summary = {
+            "case": "blue_cloth_double_lift_around",
+            "frames": int(strict_report["rollout_summary"]["simulation"]["frames_run"]),
+            "off": {k: float(off_report["checks"][k]["value"]) for k in ("x0_rmse", "rmse_mean", "rmse_max", "first30_rmse", "last30_rmse")},
+            "strict_phystwin": {k: float(strict_report["checks"][k]["value"]) for k in ("x0_rmse", "rmse_mean", "rmse_max", "first30_rmse", "last30_rmse")},
+        }
 
     slide1_md = """# Problem, Claim, And Constraint
 
@@ -162,7 +194,7 @@ def main() -> int:
 - Chinese clarification: 我们不能把 Newton 自带的 self-collision 当最终方案。
 - No Newton core change.
 - Final self-collision mode for the demo: `phystwin`.
-- Current campaign state: exactness PASS, demo QC PASS, strict parity BLOCKED by rollout mismatch.
+- Current campaign state: exactness PASS, demo QC PASS, full-rollout A/B FAIL.
 """
     slide2_md = """# Source-Code Evidence
 
@@ -201,14 +233,26 @@ def main() -> int:
 - Pair semantics: zero excluded pairs
 - This slide is scene-level demo evidence, not the strict parity scope.
 """
-    slide6_md = f"""# Strict Self-Collision Parity
+    if compare_summary is not None:
+        slide6_md = f"""# Strict Self-Collision Parity
+
+- Case: `{compare_summary['case']}`
+- Full-rollout A/B gate: require `rmse_mean(phystwin) < rmse_mean(off)`
+- OFF `rmse_mean = {compare_summary['off']['rmse_mean']}`
+- strict `phystwin` `rmse_mean = {compare_summary['strict_phystwin']['rmse_mean']}`
+- OFF `last30_rmse = {compare_summary['off']['last30_rmse']}`
+- strict `phystwin` `last30_rmse = {compare_summary['strict_phystwin']['last30_rmse']}`
+- strict `phystwin` only improves the early window: `first30_rmse = {compare_summary['strict_phystwin']['first30_rmse']}` vs OFF `{compare_summary['off']['first30_rmse']}`
+- Conclusion: full-rollout A/B currently fails; rollout mismatch remains.
+"""
+    else:
+        slide6_md = f"""# Strict Self-Collision Parity
 
 - Case: `blue_cloth_double_lift_around`
-- Status: `{parity['status']}`
-- `rmse_mean = {parity['rmse_mean']}`
-- `rmse_max = {parity['rmse_max']}`
-- `first30_rmse = {parity['first30_rmse']}`
-- `last30_rmse = {parity['last30_rmse']}`
+- `rmse_mean = {strict_report['rmse_mean']}`
+- `rmse_max = {strict_report['rmse_max']}`
+- `first30_rmse = {strict_report['first30_rmse']}`
+- `last30_rmse = {strict_report['last30_rmse']}`
 - Strict parity scope: PhysTwin-native cloth contact only (`object_collision` + implicit `z=0` ground plane).
 - Conclusion: the current bridge rollout semantics do not satisfy the requested `1e-5` gate on the in-scope cloth self-collision case.
 """
@@ -232,22 +276,22 @@ def main() -> int:
 
     blocks = [
         (
-            "newton_import_ir.py:973-980",
-            _read_lines(root.parents[1] / "tools" / "core" / "newton_import_ir.py", 973, 980),
+            "newton_import_ir.py:1020-1028",
+            _read_lines(root.parents[1] / "tools" / "core" / "newton_import_ir.py", 1020, 1028),
         ),
         (
-            "demo_cloth_box_drop_with_self_contact.py:260-298",
-            _read_lines(root.parents[1] / "demos" / "demo_cloth_box_drop_with_self_contact.py", 260, 298),
+            "demo_cloth_box_drop_with_self_contact.py:260-307",
+            _read_lines(root.parents[1] / "demos" / "demo_cloth_box_drop_with_self_contact.py", 260, 307),
         ),
         (
-            "self_contact_bridge_kernels.py:235-304",
-            _read_lines(root.parents[1] / "demos" / "self_contact_bridge_kernels.py", 235, 304),
+            "self_contact_bridge_kernels.py:491-558",
+            _read_lines(root.parents[1] / "demos" / "self_contact_bridge_kernels.py", 491, 558),
         ),
     ]
     slide2_bullets = [
         "The importer maps PhysTwin pairwise collision distance into Newton particle-radius semantics.",
         "The cloth-box driver explicitly separates off/native/custom/phystwin.",
-        "The exact PhysTwin-style operator is introduced bridge-side, not in Newton core.",
+        "The strict bridge path now uses a frame-frozen explicit collision table and a bridge-side PhysTwin-style operator.",
         "PhysTwin cloth parity source only defines object_collision plus implicit z=0 ground.",
     ]
     _render_code_slide("Source-Code Evidence", blocks, slide2_bullets, out_dir / "02_native_source_code_evidence.png")
@@ -291,16 +335,30 @@ def main() -> int:
         out_dir / "05_final_demo_frames.png",
     )
 
-    slide6_bullets = [
-        "Case: blue_cloth_double_lift_around",
-        f"Status: {parity['status']}",
-        f"rmse_mean = {parity['rmse_mean']}",
-        f"rmse_max = {parity['rmse_max']}",
-        f"first30_rmse = {parity['first30_rmse']}",
-        f"last30_rmse = {parity['last30_rmse']}",
-        "Strict scope: object_collision + implicit z=0 ground plane.",
-        "Conclusion: the current bridge rollout semantics do not satisfy the requested 1e-5 gate on the in-scope cloth self-collision case.",
-    ]
+    if compare_summary is not None:
+        slide6_bullets = [
+            f"Case: {compare_summary['case']}",
+            "Full-rollout A/B gate: require rmse_mean(phystwin) < rmse_mean(off).",
+            f"OFF rmse_mean = {compare_summary['off']['rmse_mean']}",
+            f"strict phystwin rmse_mean = {compare_summary['strict_phystwin']['rmse_mean']}",
+            f"OFF last30_rmse = {compare_summary['off']['last30_rmse']}",
+            f"strict phystwin last30_rmse = {compare_summary['strict_phystwin']['last30_rmse']}",
+            (
+                "strict phystwin only improves first30_rmse: "
+                f"{compare_summary['strict_phystwin']['first30_rmse']} vs OFF {compare_summary['off']['first30_rmse']}"
+            ),
+            "Conclusion: full-rollout A/B currently fails; rollout mismatch remains.",
+        ]
+    else:
+        slide6_bullets = [
+            "Case: blue_cloth_double_lift_around",
+            f"rmse_mean = {strict_report['rmse_mean']}",
+            f"rmse_max = {strict_report['rmse_max']}",
+            f"first30_rmse = {strict_report['first30_rmse']}",
+            f"last30_rmse = {strict_report['last30_rmse']}",
+            "Strict scope: object_collision + implicit z=0 ground plane.",
+            "Conclusion: the current bridge rollout semantics do not satisfy the requested 1e-5 gate on the in-scope cloth self-collision case.",
+        ]
     _render_image_slide(
         "Strict Self-Collision Parity",
         root / "video_qc" / "parity_support_v1" / "contact_sheet.png",
@@ -322,7 +380,10 @@ Use this pack for the April 1 deck self-collision block.
 Campaign root: `{root}`
 Demo A: `{root / 'selected' / 'self_collision_on_cloth_box_phystwin.mp4'}`
 Demo A QC: `{root / 'video_qc' / 'phystwin_topdown_v3' / 'video_qc.json'}`
-Parity summary: `{root / 'parity' / 'strict_self_collision_parity_summary.json'}`
+Exactness JSON: `{exactness_path}`
+Strict parity report: `{strict_report_path}`
+OFF parity report: `{off_report_path if off_report_path is not None else 'N/A'}`
+Compare summary: `{compare_summary_path if compare_summary_path is not None else 'N/A'}`
 Parity blocker: `{root / 'BLOCKER_strict_self_collision_parity_bridge_rollout_mismatch.md'}`
 """
     (out_dir / "SLIDES_UPDATE.md").write_text(update_md, encoding="utf-8")
