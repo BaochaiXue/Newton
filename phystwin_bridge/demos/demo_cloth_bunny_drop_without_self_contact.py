@@ -490,6 +490,7 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
     mesh_tri_indices = np.zeros((0, 3), dtype=np.int32)
     mesh_render_edges = np.zeros((0, 2), dtype=np.int32)
     mesh_asset_path = ""
+    mesh_query_trimesh_local = None
     rigid_pos = np.zeros((3,), dtype=np.float32)
     rigid_top_z = 0.0
     rigid_quat_xyzw = [1.0, 0.0, 0.0, 0.0]
@@ -501,6 +502,12 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
             args.bunny_asset, args.bunny_prim
         )
         verts_rotated = (mesh_verts_local * float(args.bunny_scale)) @ quat_to_rotmat(bunny_quat_xyzw).T
+        if mesh_tri_indices.size and mesh_verts_local.size:
+            mesh_query_trimesh_local = trimesh.Trimesh(
+                vertices=(mesh_verts_local * float(args.bunny_scale)).astype(np.float32, copy=False),
+                faces=mesh_tri_indices.astype(np.int32, copy=False),
+                process=False,
+            )
         bunny_z_min = float(verts_rotated[:, 2].min())
         bunny_z_max = float(verts_rotated[:, 2].max())
         rigid_pos = np.array([0.0, 0.0, -bunny_z_min], dtype=np.float32)
@@ -582,6 +589,7 @@ def build_model(ir_obj: dict[str, Any], args: argparse.Namespace, device: str):
         "mesh_scale": float(args.bunny_scale),
         "mesh_render_edges": mesh_render_edges.astype(np.int32, copy=False),
         "mesh_asset_path": mesh_asset_path,
+        "mesh_query_trimesh_local": mesh_query_trimesh_local,
         "rigid_shape": rigid_shape,
         "bunny_quat_xyzw": rigid_quat_xyzw,
         "bunny_pos": rigid_pos.astype(np.float32, copy=False),
@@ -952,15 +960,26 @@ def _mesh_surface_info(
     if not faces.size or not verts_local.size:
         raise ValueError("Mesh surface info requested, but no bunny mesh data is available in meta.")
 
-    scale = float(meta["mesh_scale"])
     rot = quat_to_rotmat([float(v) for v in quat_xyzw]).astype(np.float32)
-    verts = (verts_local * scale) @ rot.T + body_pos[None, :]
-    tri = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    closest_point, dist, triangle_id = trimesh.proximity.closest_point(tri, points_world.astype(np.float64))
-    signed_distance_trimesh = trimesh.proximity.signed_distance(tri, points_world.astype(np.float64))
+    points_local = ((points_world - body_pos[None, :]) @ rot).astype(np.float32, copy=False)
+    tri_local = meta.get("mesh_query_trimesh_local")
+    if tri_local is None:
+        scale = float(meta["mesh_scale"])
+        tri_local = trimesh.Trimesh(
+            vertices=(verts_local * scale).astype(np.float32, copy=False),
+            faces=faces,
+            process=False,
+        )
+    closest_point_local, dist, triangle_id = trimesh.proximity.closest_point(
+        tri_local, points_local.astype(np.float64)
+    )
+    signed_distance_trimesh = trimesh.proximity.signed_distance(
+        tri_local, points_local.astype(np.float64)
+    )
     triangle_id = np.asarray(triangle_id, dtype=np.int32)
-    face_normal_world = tri.face_normals[triangle_id].astype(np.float32, copy=False)
-    closest_world = np.asarray(closest_point, dtype=np.float32)
+    face_normal_local = tri_local.face_normals[triangle_id].astype(np.float32, copy=False)
+    face_normal_world = (face_normal_local @ rot.T).astype(np.float32, copy=False)
+    closest_world = np.asarray(closest_point_local, dtype=np.float32) @ rot.T + body_pos[None, :]
     outward_normal = face_normal_world.copy()
     flip_mask = np.sum((points_world - closest_world) * outward_normal, axis=1) < 0.0
     outward_normal[flip_mask] *= -1.0
