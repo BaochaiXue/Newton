@@ -509,3 +509,4 @@ Module newton._src.solvers.solver 16aecb3 load on device 'cuda:0' took 0.41 ms  
 Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.22 ms  (cached)
   frame 25/187 phase=approach target_err=0.0000m min_clearance=0.0738m
   frame 50/187 phase=approach target_err=0.0000m min_clearance=0.0185m
+  frame 75/187 phase=push target_err=0.0000m min_clearance=0.0030m
