@@ -2,7 +2,9 @@
 phystwin_bridge/inputs/cases/
 phystwin_bridge/ir/
 phystwin_bridge/outputs/
-phystwin_bridge/results/
+phystwin_bridge/results/*
+!phystwin_bridge/results/robot_rope_franka/
+!phystwin_bridge/results/robot_rope_franka/**
 
 # Temporary render artifacts
 phystwin_bridge/**/._tmp_cmp2x3_*/

@@ -1,0 +1,21 @@
+{
+  "task_slug": "robot_rope_franka_tabletop_push",
+  "status": "planned",
+  "bundle_root": "Newton/phystwin_bridge/results/robot_rope_franka",
+  "entrypoint": "Newton/phystwin_bridge/demos/demo_robot_rope_franka.py",
+  "canonical_wrapper": "scripts/run_robot_rope_franka.sh",
+  "expected_outputs": [
+    "hero_presentation.mp4",
+    "hero_debug.mp4",
+    "validation_camera.mp4",
+    "metrics.json",
+    "validation.md",
+    "contact_sheet.png",
+    "keyframes/"
+  ],
+  "tree": {
+    "best_run": "BEST_RUN/",
+    "candidates": "candidates/"
+  },
+  "notes": "Placeholder metadata for the tabletop-push hero demo. No promoted run exists yet."
+}
