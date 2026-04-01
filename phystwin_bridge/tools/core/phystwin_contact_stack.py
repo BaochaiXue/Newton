@@ -85,7 +85,11 @@ def validate_strict_phystwin_mode(
     if not is_strict_phystwin_mode(cfg):
         return
 
-    if not particle_contacts_enabled:
+    ir_self_collision = bool(np.asarray(ir.get("self_collision", np.asarray(False))).reshape(-1)[0])
+    particle_contacts_override = getattr(cfg, "particle_contacts", None)
+    strict_self_collision_enabled = ir_self_collision if particle_contacts_override is None else bool(particle_contacts_override)
+
+    if not particle_contacts_enabled or not strict_self_collision_enabled:
         raise ValueError(
             "Strict bridge `phystwin` mode requires PhysTwin self-collision to be enabled. "
             "Set the IR/self-collision flag ON and then explicitly select "
