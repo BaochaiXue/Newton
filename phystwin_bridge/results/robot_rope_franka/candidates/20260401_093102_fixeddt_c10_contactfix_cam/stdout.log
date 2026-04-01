@@ -1,0 +1,42 @@
+[run_robot_rope_franka_tabletop_hero] run_dir=/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam
+[run_robot_rope_franka_tabletop_hero] presentation=python /home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py --out-dir /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/work --prefix robot_rope_tabletop_hero --render-mode presentation --camera-profile hero --task tabletop_push_hero --sim-dt 5.0e-5 --substeps 667 --slowdown 1.0 --render-fps 30 --screen-width 1280 --screen-height 720 --viewer-headless --no-make-gif --anchor-count-per-end 2 --tabletop-control-mode joint_trajectory --ik-target-blend 0.20 --auto-set-weight 3.0 --tabletop-initial-pose tabletop_curve --tabletop-hero-hide-pedestal --tabletop-preroll-settle-seconds 2.0 --tabletop-preroll-damping-scale 6.0 --tabletop-settle-seconds 0.8 --tabletop-approach-seconds 1.4 --tabletop-push-seconds 2.4 --tabletop-hold-seconds 0.4 --tabletop-retract-seconds 1.2 --tabletop-rope-height 0.156 --tabletop-table-top-z 0.200 --tabletop-table-hx 0.42 --tabletop-table-hy 0.24 --tabletop-table-hz 0.020 --tabletop-robot-base-offset -0.56 -0.22 0.10 --tabletop-push-start-offset -0.09 -0.01 0.0 --tabletop-push-contact-offset -0.04 -0.03 0.0 --tabletop-push-end-offset 0.03 -0.04 0.0 --tabletop-retract-offset -0.02 -0.02 0.0 --tabletop-approach-clearance-z 0.10 --tabletop-contact-clearance-z 0.010 --tabletop-push-clearance-z 0.008 --tabletop-retract-clearance-z 0.05 --tabletop-ee-offset-z 0.22 --rope-line-width 0.024
+[run_robot_rope_franka_tabletop_hero] debug=python /home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py --out-dir /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/debug/work --prefix robot_rope_tabletop_hero_debug --render-mode debug --camera-profile hero --overlay-label --task tabletop_push_hero --sim-dt 5.0e-5 --substeps 667 --slowdown 1.0 --render-fps 30 --screen-width 1280 --screen-height 720 --viewer-headless --no-make-gif --anchor-count-per-end 2 --tabletop-control-mode joint_trajectory --ik-target-blend 0.20 --auto-set-weight 3.0 --tabletop-initial-pose tabletop_curve --tabletop-hero-hide-pedestal --tabletop-preroll-settle-seconds 2.0 --tabletop-preroll-damping-scale 6.0 --tabletop-settle-seconds 0.8 --tabletop-approach-seconds 1.4 --tabletop-push-seconds 2.4 --tabletop-hold-seconds 0.4 --tabletop-retract-seconds 1.2 --tabletop-rope-height 0.156 --tabletop-table-top-z 0.200 --tabletop-table-hx 0.42 --tabletop-table-hy 0.24 --tabletop-table-hz 0.020 --tabletop-robot-base-offset -0.56 -0.22 0.10 --tabletop-push-start-offset -0.09 -0.01 0.0 --tabletop-push-contact-offset -0.04 -0.03 0.0 --tabletop-push-end-offset 0.03 -0.04 0.0 --tabletop-retract-offset -0.02 -0.02 0.0 --tabletop-approach-clearance-z 0.10 --tabletop-contact-clearance-z 0.010 --tabletop-push-clearance-z 0.008 --tabletop-retract-clearance-z 0.05 --tabletop-ee-offset-z 0.22 --rope-line-width 0.024
+[run_robot_rope_franka_tabletop_hero] validation=python /home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py --out-dir /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/validation/work --prefix robot_rope_tabletop_hero_validation --render-mode presentation --camera-profile validation --task tabletop_push_hero --sim-dt 5.0e-5 --substeps 667 --slowdown 1.0 --render-fps 30 --screen-width 1280 --screen-height 720 --viewer-headless --no-make-gif --anchor-count-per-end 2 --tabletop-control-mode joint_trajectory --ik-target-blend 0.20 --auto-set-weight 3.0 --tabletop-initial-pose tabletop_curve --tabletop-hero-hide-pedestal --tabletop-preroll-settle-seconds 2.0 --tabletop-preroll-damping-scale 6.0 --tabletop-settle-seconds 0.8 --tabletop-approach-seconds 1.4 --tabletop-push-seconds 2.4 --tabletop-hold-seconds 0.4 --tabletop-retract-seconds 1.2 --tabletop-rope-height 0.156 --tabletop-table-top-z 0.200 --tabletop-table-hx 0.42 --tabletop-table-hy 0.24 --tabletop-table-hz 0.020 --tabletop-robot-base-offset -0.56 -0.22 0.10 --tabletop-push-start-offset -0.09 -0.01 0.0 --tabletop-push-contact-offset -0.04 -0.03 0.0 --tabletop-push-end-offset 0.03 -0.04 0.0 --tabletop-retract-offset -0.02 -0.02 0.0 --tabletop-approach-clearance-z 0.10 --tabletop-contact-clearance-z 0.010 --tabletop-push-clearance-z 0.008 --tabletop-retract-clearance-z 0.05 --tabletop-ee-offset-z 0.22 --rope-line-width 0.024
+Warp 1.12.0.dev20260218 initialized:
+   Git commit: 3d888595a61128dd17de0dbb9eb8d80391e81424
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4090" (23 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/xinjie/.cache/warp/1.12.0.dev20260218
+Module newton._src.geometry.inertia 2bd8c78 load on device 'cuda:0' took 0.77 ms  (cached)
+Module newton._src.utils.mesh bced167 load on device 'cpu' took 0.70 ms  (cached)
+Module validate_and_correct_inertia_kernel_0c7bfa66 0c7bfa6 load on device 'cuda:0' took 0.42 ms  (cached)
+Module newton._src.sim.articulation 2109b59 load on device 'cuda:0' took 2.95 ms  (cached)
+Module newton._src.sim.collide 452004c load on device 'cuda:0' took 0.99 ms  (cached)
+Module newton._src.geometry.broad_phase_nxn dcff895 load on device 'cuda:0' took 0.69 ms  (cached)
+Module create_narrow_phase_primitive_kernel__locals__narrow_phase_primitive_kernel_ac59d7a0 640833f load on device 'cuda:0' took 1.04 ms  (cached)
+Module create_narrow_phase_kernel_gjk_mpr__locals__narrow_phase_kernel_gjk_mpr_46eb548d 1d6e16f load on device 'cuda:0' took 1.75 ms  (cached)
+Module newton._src.geometry.narrow_phase 0593107 load on device 'cuda:0' took 7.01 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 3a7a18f load on device 'cuda:0' took 0.73 ms  (cached)
+Module newton._src.geometry.narrow_phase 931370b load on device 'cuda:0' took 1.20 ms  (cached)
+Module create_narrow_phase_process_mesh_plane_contacts_kernel__locals__narrow_phase_process_mesh_plane_contacts_reduce_kernel_930923b3 4c09d6b load on device 'cuda:0' took 0.55 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_8060ca9c d5135d2 load on device 'cuda:0' took 2.13 ms  (cached)
+Module newton._src.geometry.contact_reduction_global d2f9fc3 load on device 'cuda:0' took 1.16 ms  (cached)
+Module newton._src.geometry.sdf_contact e671631 load on device 'cuda:0' took 0.44 ms  (cached)
+Module create_narrow_phase_process_mesh_mesh_contacts_kernel__locals__mesh_sdf_collision_global_reduce_kernel_f46f3252 f46f325 load on device 'cuda:0' took 1.50 ms  (cached)
+Module create_export_reduced_contacts_kernel__locals__export_reduced_contacts_kernel_ef09b9a0 6e4cf74 load on device 'cuda:0' took 0.61 ms  (cached)
+Module newton._src.geometry.kernels 55ed1b0 load on device 'cuda:0' took 2.73 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_particle 0e0d871 load on device 'cuda:0' took 1.32 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 483b8fe load on device 'cuda:0' took 2.41 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_contact d558900 load on device 'cuda:0' took 2.20 ms  (cached)
+Module newton._src.solvers.solver 16aecb3 load on device 'cuda:0' took 1.01 ms  (cached)
+Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.47 ms  (cached)
+  frame 25/187 phase=approach target_err=0.0000m min_clearance=0.0788m
+  frame 50/187 phase=approach target_err=0.0000m min_clearance=0.0215m
+  frame 75/187 phase=push target_err=0.0000m min_clearance=-0.0029m
+  frame 100/187 phase=push target_err=0.0000m min_clearance=-0.0098m
+  frame 125/187 phase=push target_err=0.0000m min_clearance=-0.0096m
+  frame 150/187 phase=hold target_err=0.0000m min_clearance=-0.0055m
+  frame 175/187 phase=retract target_err=0.0000m min_clearance=0.0506m

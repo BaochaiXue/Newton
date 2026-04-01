@@ -987,7 +987,7 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
             ],
             dtype=np.float32,
         )
-        validation_pos = camera_position(validation_target, yaw_deg=156.0, pitch_deg=-23.0, distance=1.84)
+        validation_pos = camera_position(validation_target, yaw_deg=156.0, pitch_deg=-23.0, distance=1.68)
 
         return {
             "hero": {
@@ -1001,7 +1001,7 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "pos": validation_pos.astype(np.float32, copy=False).tolist(),
                 "pitch": -23.0,
                 "yaw": 156.0,
-                "fov": 42.0,
+                "fov": 38.0,
                 "target": validation_target.astype(np.float32, copy=False).tolist(),
             },
         }
