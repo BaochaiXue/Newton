@@ -966,27 +966,22 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
 
     endpoint_indices = _rope_endpoints(edges, n_obj, x0)
     endpoint_mid = 0.5 * (x0[int(endpoint_indices[0])] + x0[int(endpoint_indices[1])])
-    if drop_release_task:
-        support_patch_indices = _select_drop_support_patch_indices(
-            x0[:n_obj],
-            count=int(args.drop_support_patch_count),
-        )
-        support_patch_center = np.mean(x0[support_patch_indices], axis=0).astype(np.float32, copy=False)
-    else:
-        support_patch_indices = np.empty((0,), dtype=np.int32)
-        support_patch_center = endpoint_mid.astype(np.float32, copy=False)
+    support_patch_indices = np.empty((0,), dtype=np.int32)
+    support_patch_center = endpoint_mid.astype(np.float32, copy=False)
     shift = np.array(
         [
-            -float(support_patch_center[0] if drop_release_task else endpoint_mid[0]),
-            -float(support_patch_center[1] if drop_release_task else endpoint_mid[1]),
-            float(args.anchor_height) - float(support_patch_center[2] if drop_release_task else endpoint_mid[2]),
+            -float(endpoint_mid[0]),
+            -float(endpoint_mid[1]),
+            float(args.anchor_height) - float(endpoint_mid[2]),
         ],
         dtype=np.float32,
     )
     shifted_q = x0 + shift
     rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
     if drop_release_task:
-        anchor_indices = support_patch_indices.astype(np.int32, copy=False)
+        anchor_indices = _anchor_particle_indices(
+            shifted_q, endpoint_indices=endpoint_indices, count_per_end=int(args.anchor_count_per_end)
+        )
         anchor_positions = shifted_q[anchor_indices].astype(np.float32, copy=False)
     else:
         anchor_indices = _anchor_particle_indices(
