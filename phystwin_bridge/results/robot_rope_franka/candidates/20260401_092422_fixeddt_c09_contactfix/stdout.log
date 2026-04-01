@@ -37,3 +37,5 @@ Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.25 ms  (c
   frame 50/187 phase=approach target_err=0.0000m min_clearance=0.0251m
   frame 75/187 phase=push target_err=0.0000m min_clearance=-0.0019m
   frame 100/187 phase=push target_err=0.0000m min_clearance=-0.0061m
+  frame 125/187 phase=push target_err=0.0000m min_clearance=-0.0070m
+  frame 150/187 phase=hold target_err=0.0000m min_clearance=-0.0036m
