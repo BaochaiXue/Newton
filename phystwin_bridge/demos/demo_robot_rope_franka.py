@@ -416,31 +416,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tabletop-settle-seconds",
         type=float,
-        default=0.9,
+        default=0.8,
         help="Initial stillness window before the tabletop push starts [s].",
     )
     p.add_argument(
         "--tabletop-approach-seconds",
         type=float,
-        default=1.2,
+        default=1.4,
         help="Approach-to-contact phase for the tabletop push hero [s].",
     )
     p.add_argument(
         "--tabletop-push-seconds",
         type=float,
-        default=2.6,
+        default=2.4,
         help="Slow lateral push phase for the tabletop push hero [s].",
     )
     p.add_argument(
         "--tabletop-hold-seconds",
         type=float,
-        default=0.8,
+        default=0.4,
         help="Short hold phase after the tabletop push reaches the target [s].",
     )
     p.add_argument(
         "--tabletop-retract-seconds",
         type=float,
-        default=1.1,
+        default=1.0,
         help="Retract-and-settle phase after the tabletop push [s].",
     )
     p.add_argument(
@@ -485,44 +485,74 @@ def parse_args() -> argparse.Namespace:
         "--tabletop-push-start-offset",
         type=float,
         nargs=3,
-        default=(-0.28, -0.12, 0.11),
+        default=(-0.18, -0.02, 0.0),
         metavar=("X", "Y", "Z"),
-        help="Approach start offset relative to the rope/table center for the tabletop hero [m].",
+        help="Approach start offset relative to the rope/table center for the tabletop hero [m]. XY are used directly; Z is ignored when explicit tabletop clearances are enabled.",
     )
     p.add_argument(
         "--tabletop-push-contact-offset",
         type=float,
         nargs=3,
-        default=(-0.10, -0.06, 0.02),
+        default=(-0.06, -0.02, 0.0),
         metavar=("X", "Y", "Z"),
-        help="Contact-ready offset relative to the rope/table center for the tabletop hero [m].",
+        help="Contact-ready offset relative to the rope/table center for the tabletop hero [m]. XY are used directly; Z is ignored when explicit tabletop clearances are enabled.",
     )
     p.add_argument(
         "--tabletop-push-end-offset",
         type=float,
         nargs=3,
-        default=(0.18, -0.06, 0.02),
+        default=(0.14, -0.02, 0.0),
         metavar=("X", "Y", "Z"),
-        help="Push end offset relative to the rope/table center for the tabletop hero [m].",
+        help="Push end offset relative to the rope/table center for the tabletop hero [m]. XY are used directly; Z is ignored when explicit tabletop clearances are enabled.",
     )
     p.add_argument(
         "--tabletop-retract-offset",
         type=float,
         nargs=3,
-        default=(0.24, -0.20, 0.18),
+        default=(0.18, -0.16, 0.0),
         metavar=("X", "Y", "Z"),
-        help="Retract offset relative to the rope/table center for the tabletop hero [m].",
+        help="Retract offset relative to the rope/table center for the tabletop hero [m]. XY are used directly; Z is ignored when explicit tabletop clearances are enabled.",
+    )
+    p.add_argument(
+        "--tabletop-approach-clearance-z",
+        type=float,
+        default=0.08,
+        help="World-space clearance above the tabletop rope-top reference used for the settle/approach phases [m].",
+    )
+    p.add_argument(
+        "--tabletop-contact-clearance-z",
+        type=float,
+        default=0.012,
+        help="World-space clearance above the tabletop rope-top reference used for contact-ready [m].",
+    )
+    p.add_argument(
+        "--tabletop-push-clearance-z",
+        type=float,
+        default=0.008,
+        help="World-space clearance above the tabletop rope-top reference used during the lateral push [m].",
+    )
+    p.add_argument(
+        "--tabletop-retract-clearance-z",
+        type=float,
+        default=0.10,
+        help="World-space clearance above the tabletop rope-top reference used for retract [m].",
+    )
+    p.add_argument(
+        "--tabletop-ee-offset-z",
+        type=float,
+        default=0.165,
+        help="Local +Z offset on /fr3_link7 used to target the tabletop gripper-center contact point [m].",
     )
     p.add_argument(
         "--tabletop-initial-pose",
         choices=["ir_shifted", "tabletop_curve"],
-        default="ir_shifted",
+        default="tabletop_curve",
         help="Initial rope pose for the tabletop hero: preserve the shifted IR shape or apply a hand-shaped tabletop curve.",
     )
     p.add_argument(
         "--tabletop-preroll-settle-seconds",
         type=float,
-        default=2.4,
+        default=2.0,
         help="Hidden preroll time used to settle the rope on the tabletop before the recorded hero clip [s].",
     )
     p.add_argument(
@@ -560,6 +590,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
     p.add_argument("--particle-radius-vis-min", type=float, default=0.004)
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument(
+        "--tabletop-hero-hide-pedestal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Hide the visual-only robot pedestal in the tabletop hero presentation camera. Debug and validation remain unchanged.",
+    )
     p.add_argument("--label-font-size", type=int, default=24)
     p.add_argument("--rope-line-width", type=float, default=0.02)
     p.add_argument("--spring-stride", type=int, default=20)
@@ -603,6 +639,14 @@ def _quat_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     v = np.asarray(v, dtype=np.float32)
     vec_quat = np.asarray([v[0], v[1], v[2], 0.0], dtype=np.float32)
     rotated = _quat_multiply(_quat_multiply(q, vec_quat), _quat_conjugate(q))
+    return rotated[:3]
+
+
+def _quat_inverse_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32)
+    v = np.asarray(v, dtype=np.float32)
+    vec_quat = np.asarray([v[0], v[1], v[2], 0.0], dtype=np.float32)
+    rotated = _quat_multiply(_quat_multiply(_quat_conjugate(q), vec_quat), q)
     return rotated[:3]
 
 
@@ -893,37 +937,37 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
         push_focus = np.asarray(meta.get("tabletop_push_focus", rope_center), dtype=np.float32)
         hero_target = np.asarray(
             [
-                float(0.42 * table_center[0] + 0.58 * push_focus[0] - 0.08),
-                float(0.42 * table_center[1] + 0.58 * push_focus[1] - 0.16),
-                float(max(table_center[2] + 0.20, rope_center[2] + 0.08)),
+                float(0.20 * table_center[0] + 0.80 * push_focus[0] + 0.02),
+                float(0.25 * table_center[1] + 0.75 * push_focus[1] + 0.04),
+                float(max(table_center[2] + 0.10, rope_center[2] + 0.03)),
             ],
             dtype=np.float32,
         )
-        hero_pos = camera_position(hero_target, yaw_deg=-28.0, pitch_deg=-22.0, distance=1.70)
+        hero_pos = camera_position(hero_target, yaw_deg=138.0, pitch_deg=-18.0, distance=1.42)
 
         validation_target = np.asarray(
             [
                 float(push_focus[0]),
                 float(push_focus[1]),
-                float(max(table_center[2] + 0.14, rope_center[2] + 0.04)),
+                float(max(table_center[2] + 0.10, rope_center[2] + 0.03)),
             ],
             dtype=np.float32,
         )
-        validation_pos = camera_position(validation_target, yaw_deg=142.0, pitch_deg=-20.0, distance=1.85)
+        validation_pos = camera_position(validation_target, yaw_deg=150.0, pitch_deg=-17.0, distance=1.72)
 
         return {
             "hero": {
                 "pos": hero_pos.astype(np.float32, copy=False).tolist(),
-                "pitch": -22.0,
-                "yaw": -28.0,
-                "fov": 34.0,
+                "pitch": -18.0,
+                "yaw": 138.0,
+                "fov": 33.0,
                 "target": hero_target.astype(np.float32, copy=False).tolist(),
             },
             "validation": {
                 "pos": validation_pos.astype(np.float32, copy=False).tolist(),
-                "pitch": -20.0,
-                "yaw": 142.0,
-                "fov": 46.0,
+                "pitch": -17.0,
+                "yaw": 150.0,
+                "fov": 42.0,
                 "target": validation_target.astype(np.float32, copy=False).tolist(),
             },
         }
@@ -1024,7 +1068,12 @@ def _reshape_rope_for_tabletop(
     return points
 
 
-def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -> list[dict[str, Any]]:
+def _task_phase_definitions(
+    rope_center: np.ndarray,
+    args: argparse.Namespace,
+    *,
+    tabletop_target_z: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
     rope_center = np.asarray(rope_center, dtype=np.float32)
     target_quat = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -1110,6 +1159,11 @@ def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -
         contact_ready = rope_center + np.asarray(args.tabletop_push_contact_offset, dtype=np.float32)
         push_end = rope_center + np.asarray(args.tabletop_push_end_offset, dtype=np.float32)
         retract = rope_center + np.asarray(args.tabletop_retract_offset, dtype=np.float32)
+        if tabletop_target_z is not None:
+            settle[2] = float(tabletop_target_z["settle"])
+            contact_ready[2] = float(tabletop_target_z["contact_ready"])
+            push_end[2] = float(tabletop_target_z["push"])
+            retract[2] = float(tabletop_target_z["retract"])
         return [
             {
                 "name": "settle",
@@ -1200,6 +1254,14 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
     x0 = np.asarray(ir_obj["x0"], dtype=np.float32).copy()
     edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
+    collision_radius_arr = np.asarray(
+        ir_obj.get(
+            "collision_radius",
+            ir_obj.get("contact_collision_dist", np.full((n_obj,), 0.026, dtype=np.float32)),
+        ),
+        dtype=np.float32,
+    ).reshape(-1)
+    particle_radius_ref = float(collision_radius_arr[0]) if collision_radius_arr.size else 0.026
 
     endpoint_indices = _rope_endpoints(edges, n_obj, x0)
     endpoint_mid = 0.5 * (x0[int(endpoint_indices[0])] + x0[int(endpoint_indices[1])])
@@ -1216,14 +1278,6 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     )
     shifted_q = x0 + shift
     if tabletop_task and str(args.tabletop_initial_pose) == "tabletop_curve":
-        collision_radius_arr = np.asarray(
-            ir_obj.get(
-                "collision_radius",
-                ir_obj.get("contact_collision_dist", np.full((n_obj,), 0.026, dtype=np.float32)),
-            ),
-            dtype=np.float32,
-        ).reshape(-1)
-        particle_radius_ref = float(collision_radius_arr[0]) if collision_radius_arr.size else 0.026
         shifted_q[:n_obj] = _reshape_rope_for_tabletop(
             shifted_q[:n_obj],
             table_top_z=float(args.tabletop_table_top_z),
@@ -1308,10 +1362,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     ee_body_index = _find_index_by_suffix(builder.body_label, "/fr3_link7")
     left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
     right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
-    if tabletop_task:
-        ee_body_index = int(left_finger_index)
     ee_offset_local = np.asarray(
-        [0.0, 0.0, 0.0] if tabletop_task else [0.0, 0.0, 0.22],
+        [0.0, 0.0, float(args.tabletop_ee_offset_z)] if tabletop_task else [0.0, 0.0, 0.22],
         dtype=np.float32,
     )
     floor_z = 0.0
@@ -1385,7 +1437,16 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             dtype=np.float32,
         )
         support_point = anchor_bar_center
-    task_phases = _task_phase_definitions(rope_center, args)
+    tabletop_target_z = None
+    if tabletop_task:
+        tabletop_rope_top_z = float(table_top_z) + 2.0 * float(particle_radius_ref) + 0.004
+        tabletop_target_z = {
+            "settle": float(tabletop_rope_top_z + float(args.tabletop_approach_clearance_z)),
+            "contact_ready": float(tabletop_rope_top_z + float(args.tabletop_contact_clearance_z)),
+            "push": float(tabletop_rope_top_z + float(args.tabletop_push_clearance_z)),
+            "retract": float(tabletop_rope_top_z + float(args.tabletop_retract_clearance_z)),
+        }
+    task_phases = _task_phase_definitions(rope_center, args, tabletop_target_z=tabletop_target_z)
     if drop_release_task:
         task_phases[0]["end"] = support_point.astype(np.float32, copy=False)
         task_phases[1]["start"] = support_point.astype(np.float32, copy=False)
@@ -1397,7 +1458,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     elif tabletop_task:
         task_phases[0]["end"] = task_phases[0]["start"].astype(np.float32, copy=False)
         task_phases[1]["start"] = task_phases[0]["end"].astype(np.float32, copy=False)
-        task_phases[2]["start"] = np.asarray(rope_center + np.asarray(args.tabletop_push_contact_offset, dtype=np.float32), dtype=np.float32)
+        task_phases[2]["start"] = np.asarray(task_phases[1]["end"], dtype=np.float32)
         task_phases[3]["start"] = task_phases[2]["end"].astype(np.float32, copy=False)
         task_phases[4]["start"] = task_phases[3]["end"].astype(np.float32, copy=False)
     ee_target_end = np.asarray(task_phases[-1]["end"], dtype=np.float32)
@@ -1524,6 +1585,10 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     init_state.joint_qd.zero_()
     newton.eval_fk(model, init_state.joint_q, init_state.joint_qd, init_state)
     init_body_q = init_state.body_q.numpy().astype(np.float32)
+    if tabletop_task:
+        ee_target_quat = init_body_q[int(ee_body_index), 3:7].astype(np.float32, copy=False)
+        for phase in task_phases:
+            phase["quat"] = ee_target_quat.astype(np.float32, copy=False)
     ee_world_start = _ee_world_position(init_body_q[int(ee_body_index)], ee_offset_local)
     if tabletop_task:
         ee_target_start = np.asarray(task_phases[0]["start"], dtype=np.float32)
@@ -1579,6 +1644,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "rope_center": rope_center.astype(np.float32),
         "table_center": stage_center.astype(np.float32),
         "table_top_z": (None if table_top_z is None else float(table_top_z)),
+        "tabletop_rope_top_z": (None if tabletop_target_z is None else float(tabletop_rope_top_z)),
+        "tabletop_target_z": tabletop_target_z,
         "tabletop_push_focus": (
             tabletop_push_focus.astype(np.float32) if tabletop_task else rope_center.astype(np.float32)
         ),
@@ -2030,6 +2097,7 @@ def render_video(
     width = int(args.screen_width)
     height = int(args.screen_height)
     fps_out = float(args.render_fps)
+    profile = str(getattr(args, "camera_profile", "hero"))
     out_mp4 = args.out_dir / f"{args.prefix}.mp4"
     cmd = [
         ffmpeg,
@@ -2254,6 +2322,8 @@ def render_video(
                             ),
                             wp.array([wp.vec3(0.24, 0.22, 0.19)], dtype=wp.vec3, device=device),
                         )
+                        # Presentation hides the oversized pedestal block so the contact patch stays readable.
+                        # Debug and validation still render the full geometry honestly.
                         viewer.log_shapes(
                             "/demo/table_top",
                             newton.GeoType.BOX,
@@ -2288,17 +2358,18 @@ def render_video(
                             ),
                             wp.array([wp.vec3(0.39, 0.31, 0.24) for _ in leg_centers], dtype=wp.vec3, device=device),
                         )
-                        viewer.log_shapes(
-                            "/demo/robot_pedestal",
-                            newton.GeoType.BOX,
-                            tuple(float(v) for v in robot_base_scale.tolist()),
-                            wp.array(
-                                [wp.transform(wp.vec3(*robot_base_center.tolist()), wp.quat_identity())],
-                                dtype=wp.transform,
-                                device=device,
-                            ),
-                            wp.array([wp.vec3(0.44, 0.38, 0.31)], dtype=wp.vec3, device=device),
-                        )
+                        if not (profile == "hero" and bool(args.tabletop_hero_hide_pedestal)):
+                            viewer.log_shapes(
+                                "/demo/robot_pedestal",
+                                newton.GeoType.BOX,
+                                tuple(float(v) for v in robot_base_scale.tolist()),
+                                wp.array(
+                                    [wp.transform(wp.vec3(*robot_base_center.tolist()), wp.quat_identity())],
+                                    dtype=wp.transform,
+                                    device=device,
+                                ),
+                                wp.array([wp.vec3(0.44, 0.38, 0.31)], dtype=wp.vec3, device=device),
+                            )
                     else:
                         viewer.log_shapes(
                             "/demo/floor",
