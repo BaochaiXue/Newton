@@ -46,10 +46,26 @@ scripts/run_robot_rope_franka_hero.sh --slug <short_tag> [extra demo args...]
 
 ## Status
 
-This bundle is still a workflow scaffold. No accepted hero run has been
-selected yet.
+Accepted hero run:
 
-Current blocker:
+- `candidates/20260401_081639_fixeddt_c08_gatepass/`
 
-- stable tabletop-smoke runs can now preroll-settle the rope, but the robot
-  still does not make credible contact with the rope under the stable timestep
+Promoted mirror:
+
+- `BEST_RUN/`
+
+Accepted claim:
+
+- native Newton Franka
+- native Newton tabletop support
+- PhysTwin rope resting on the tabletop
+- readable slow lateral push
+- readable robot-caused rope deformation / sliding
+- strict validator + truthful manual review both pass
+
+Implementation note:
+
+- the accepted run uses a tabletop-only native joint-space waypoint controller
+  inside `demo_robot_rope_franka.py` because the earlier tabletop IK path did
+  not reliably reach the contact line under fixed `sim_dt = 5e-5`,
+  `substeps = 667`
