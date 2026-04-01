@@ -56,7 +56,6 @@ MODE_SPECS = [
     ModeSpec(alias="native", self_contact_mode="native"),
     ModeSpec(alias="custom_h1", self_contact_mode="custom", custom_hops=1),
     ModeSpec(alias="custom_h2", self_contact_mode="custom", custom_hops=2),
-    ModeSpec(alias="phystwin", self_contact_mode="phystwin", custom_hops=0),
 ]
 
 
@@ -298,7 +297,7 @@ def _evaluate_candidate(summary: dict[str, Any], off_wall_time: float | None) ->
 
 
 def _select_provisional_mode(rows: list[dict[str, Any]]) -> tuple[str | None, str]:
-    preference = ["native", "custom_h1", "custom_h2", "phystwin"]
+    preference = ["native", "custom_h1", "custom_h2"]
     by_alias = {str(row["case_alias"]): row for row in rows}
     for alias in preference:
         row = by_alias.get(alias)
@@ -324,7 +323,7 @@ def _render_comparison_figure(rows: list[dict[str, Any]], out_path: Path) -> Pat
     small_font = _load_font(17, bold=False)
 
     draw.text((40, 28), "Self-Collision Decision Matrix", font=title_font, fill=(24, 58, 96))
-    draw.text((40, 80), "Candidate modes only: native vs custom_h1 vs custom_h2 vs phystwin", font=body_font, fill=(71, 85, 105))
+    draw.text((40, 80), "Candidate modes only: native vs custom_h1 vs custom_h2", font=body_font, fill=(71, 85, 105))
 
     for idx, row in enumerate(candidates[:4]):
         thumb = row.get("thumbnail_png")

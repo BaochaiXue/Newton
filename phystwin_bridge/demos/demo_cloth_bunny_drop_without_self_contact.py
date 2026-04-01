@@ -4109,6 +4109,12 @@ def simulate(
     body_q: list[np.ndarray] = []
     body_qd: list[np.ndarray] = []
     body_vel: list[np.ndarray] = []
+    collision_force_particle_q: list[np.ndarray] = []
+    collision_force_body_q: list[np.ndarray] = []
+    collision_force_penalty_force: list[np.ndarray] = []
+    collision_force_total_force: list[np.ndarray] = []
+    collision_force_mask: list[np.ndarray] = []
+    collision_force_sim_time: list[float] = []
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
@@ -4200,6 +4206,27 @@ def simulate(
                     f_external_total_np = (
                         f_after_particle_body_np - f_before_particle_body_np
                     ).astype(np.float32, copy=False)
+                    if int(substep_index_in_frame) == 0:
+                        particle_q_np_live = state_in.particle_q.numpy().astype(np.float32, copy=False)[:n_obj].copy()
+                        body_q_np_live = (
+                            state_in.body_q.numpy().astype(np.float32).copy()
+                            if state_in.body_q is not None
+                            else np.zeros((0, 7), dtype=np.float32)
+                        )
+                        total_force_np = (
+                            f_internal_total_np
+                            + f_external_total_np
+                            + particle_mass_diag[:, None] * gravity_vec_diag.reshape(1, 3)
+                        ).astype(np.float32, copy=False)
+                        force_mask_np = (
+                            np.linalg.norm(f_external_total_np, axis=1) > float(force_eps)
+                        ).astype(np.bool_, copy=False)
+                        collision_force_particle_q.append(particle_q_np_live)
+                        collision_force_body_q.append(body_q_np_live)
+                        collision_force_penalty_force.append(f_external_total_np.copy())
+                        collision_force_total_force.append(total_force_np.copy())
+                        collision_force_mask.append(force_mask_np.copy())
+                        collision_force_sim_time.append(float(frame) * float(sim_dt) * float(substeps))
                     current_max_external_norm = float(
                         np.max(np.linalg.norm(f_external_total_np, axis=1))
                     ) if f_external_total_np.size else 0.0
@@ -4403,7 +4430,25 @@ def simulate(
         "substeps": int(substeps),
         "wall_time": float(wall_time),
         "use_decoupled_shape_materials": bool(use_decoupled_shape_materials),
+        "rigid_shape": str(meta.get("rigid_shape", "")),
     }
+    if collision_force_particle_q:
+        collision_force_mask_np = np.stack(collision_force_mask, axis=0).astype(np.bool_, copy=False)
+        first_force_contact_frames = np.flatnonzero(np.any(collision_force_mask_np, axis=1))
+        result["collision_force_rollout"] = {
+            "particle_q": np.stack(collision_force_particle_q, axis=0).astype(np.float32, copy=False),
+            "body_q": np.stack(collision_force_body_q, axis=0).astype(np.float32, copy=False),
+            "penalty_force": np.stack(collision_force_penalty_force, axis=0).astype(np.float32, copy=False),
+            "total_force": np.stack(collision_force_total_force, axis=0).astype(np.float32, copy=False),
+            "force_contact_mask": collision_force_mask_np,
+            "sim_time_s": np.asarray(collision_force_sim_time, dtype=np.float32),
+            "frame_indices": np.arange(len(collision_force_particle_q), dtype=np.int32),
+            "first_force_contact_frame": (
+                None if first_force_contact_frames.size == 0 else int(first_force_contact_frames[0])
+            ),
+            "force_definition_penalty": "f_external_total",
+            "force_definition_total": "f_internal_total + f_external_total + mass * gravity_vec",
+        }
     if force_diagnostic is not None:
         result["force_diagnostic"] = force_diagnostic
     return result
@@ -4735,6 +4780,45 @@ def save_scene_npz(args: argparse.Namespace, sim_data: dict[str, Any], meta: dic
     return scene_npz
 
 
+def save_collision_force_rollout(args: argparse.Namespace, sim_data: dict[str, Any], scene_npz_path: Path | None = None) -> tuple[Path, Path] | tuple[None, None]:
+    rollout = sim_data.get("collision_force_rollout")
+    if not isinstance(rollout, dict):
+        return None, None
+    detector_dir = args.out_dir / "detector"
+    detector_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = detector_dir / "collision_force_rollout_bundle.npz"
+    summary_path = detector_dir / "summary.json"
+    np.savez_compressed(
+        npz_path,
+        particle_q=np.asarray(rollout["particle_q"], dtype=np.float32),
+        body_q=np.asarray(rollout["body_q"], dtype=np.float32),
+        penalty_force=np.asarray(rollout["penalty_force"], dtype=np.float32),
+        total_force=np.asarray(rollout["total_force"], dtype=np.float32),
+        force_contact_mask=np.asarray(rollout["force_contact_mask"], dtype=np.bool_),
+        sim_time_s=np.asarray(rollout["sim_time_s"], dtype=np.float32),
+        frame_indices=np.asarray(rollout["frame_indices"], dtype=np.int32),
+    )
+    summary = {
+        "npz_path": str(npz_path),
+        "scene_npz_path": None if scene_npz_path is None else str(scene_npz_path),
+        "rigid_shape": str(sim_data.get("rigid_shape", "")),
+        "node_selection_mode": "all_force_contact_nodes",
+        "first_force_contact_frame_index": rollout.get("first_force_contact_frame"),
+        "force_definition_penalty": str(rollout.get("force_definition_penalty", "f_external_total")),
+        "force_definition_total": str(
+            rollout.get("force_definition_total", "f_internal_total + f_external_total + mass * gravity_vec")
+        ),
+        "sim_frame_count": int(np.asarray(rollout["frame_indices"], dtype=np.int32).shape[0]),
+        "sim_frame_dt_s": float(sim_data["sim_dt"]) * float(sim_data["substeps"]),
+        "force_contact_node_count_per_frame": [
+            int(v)
+            for v in np.sum(np.asarray(rollout["force_contact_mask"], dtype=np.bool_), axis=1, dtype=np.int32).tolist()
+        ],
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return npz_path, summary_path
+
+
 def build_summary(
     model,
     args: argparse.Namespace,
@@ -4982,6 +5066,23 @@ def build_summary(
                     ),
                 }
             )
+    collision_force_rollout = sim_data.get("collision_force_rollout")
+    if isinstance(collision_force_rollout, dict):
+        summary.update(
+            {
+                "collision_force_rollout_enabled": True,
+                "collision_force_rollout_first_force_contact_frame": collision_force_rollout.get("first_force_contact_frame"),
+                "collision_force_rollout_force_definition_penalty": str(
+                    collision_force_rollout.get("force_definition_penalty", "f_external_total")
+                ),
+                "collision_force_rollout_force_definition_total": str(
+                    collision_force_rollout.get(
+                        "force_definition_total",
+                        "f_internal_total + f_external_total + mass * gravity_vec",
+                    )
+                ),
+            }
+        )
     return summary
 
 

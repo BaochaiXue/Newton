@@ -112,6 +112,22 @@ def _load_semiimplicit_bridge_kernels():
         "eval_triangle_forces": eval_triangle_forces,
     }
 
+
+def _load_phystwin_contact_stack():
+    from phystwin_contact_stack import (
+        build_strict_phystwin_contact_context,
+        is_strict_phystwin_mode,
+        step_strict_phystwin_contact_stack,
+        validate_strict_phystwin_mode,
+    )
+
+    return {
+        "build_strict_phystwin_contact_context": build_strict_phystwin_contact_context,
+        "is_strict_phystwin_mode": is_strict_phystwin_mode,
+        "step_strict_phystwin_contact_stack": step_strict_phystwin_contact_stack,
+        "validate_strict_phystwin_mode": validate_strict_phystwin_mode,
+    }
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════
@@ -290,6 +306,7 @@ class ModelResult:
     bridge_self_contact_grid: Any = None
     bridge_neighbor_table: Any = None
     bridge_neighbor_count: Any = None
+    phystwin_contact_context: Any = None
     checks: dict = field(default_factory=dict)
 
 
@@ -384,7 +401,8 @@ def parse_args() -> argparse.Namespace:
             "`off` disables particle self-contact, "
             "`native` uses Newton's built-in particle kernel, "
             "`custom` uses bridge-side filtered penalty self-contact, "
-            "`phystwin` uses bridge-side PhysTwin-style velocity correction."
+            "`phystwin` uses the strict bridge-side PhysTwin contact stack "
+            "(pairwise self-collision + implicit z=0 ground plane only)."
         ),
     )
     p.add_argument(
@@ -957,6 +975,10 @@ def _use_collision_pipeline(cfg: SimConfig, ir: dict) -> bool:
     of `self_collision`. To preserve parity, we must run the collision pipeline
     whenever a ground plane is present, not only when self-collision is enabled.
     """
+    if _resolve_self_contact_mode(cfg, ir) == SELF_CONTACT_MODE_PHYSTWIN:
+        # Strict bridge `phystwin` uses its own self-collision + implicit ground
+        # plane handling and does not mix in Newton's shape collision pipeline.
+        return False
     return bool(cfg.shape_contacts or cfg.add_ground_plane or _resolve_particle_contacts(cfg, ir))
 
 
@@ -1293,15 +1315,32 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     checks = validate_ir_physics(ir, cfg)
     particle_contacts = _resolve_particle_contacts(cfg, ir)
     self_contact_mode = _resolve_self_contact_mode(cfg, ir)
+    phystwin_contact_stack = (
+        _load_phystwin_contact_stack()
+        if self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN
+        else None
+    )
+    if phystwin_contact_stack is not None:
+        phystwin_contact_stack["validate_strict_phystwin_mode"](
+            cfg,
+            ir,
+            particle_contacts_enabled=particle_contacts,
+        )
 
     builder = newton.ModelBuilder(
         up_axis=newton.Axis.from_any(cfg.up_axis),
         gravity=0.0,
     )
 
-    radius, ver, radius_src = _add_particles(builder, ir, cfg, particle_contacts)
+    radius, ver, radius_src = _add_particles(
+        builder,
+        ir,
+        cfg,
+        particle_contacts and (self_contact_mode != SELF_CONTACT_MODE_PHYSTWIN),
+    )
     _add_springs(builder, ir, cfg, checks)
-    _add_ground_plane(builder, ir, cfg, checks)
+    if self_contact_mode != SELF_CONTACT_MODE_PHYSTWIN:
+        _add_ground_plane(builder, ir, cfg, checks)
 
     # ── Extension point ──
     # Add new objects here: builder.add_body(), builder.add_shape_mesh(), etc.
@@ -1315,7 +1354,8 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     bridge_self_contact_grid = None
     bridge_neighbor_table = None
     bridge_neighbor_count = None
-    if self_contact_mode in {SELF_CONTACT_MODE_CUSTOM, SELF_CONTACT_MODE_PHYSTWIN}:
+    phystwin_contact_context = None
+    if self_contact_mode == SELF_CONTACT_MODE_CUSTOM:
         self_contact_kernels = _load_self_contact_kernels()
         bridge_self_contact_grid = model.particle_grid
         model.particle_grid = None
@@ -1341,6 +1381,13 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
                 "excluded_pair_count": float(exclusion_summary["excluded_pair_count"]),
             }
         )
+    elif self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN:
+        model.particle_grid = None
+        assert phystwin_contact_stack is not None
+        phystwin_contact_context, phystwin_checks = phystwin_contact_stack[
+            "build_strict_phystwin_contact_context"
+        ](model, ir, cfg, device=device)
+        checks.update(phystwin_checks)
     elif not particle_contact_kernel:
         model.particle_grid = None
 
@@ -1349,11 +1396,16 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     model.set_gravity(gravity_vec)
 
     # Optional mapping from PhysTwin object-collision params to Newton particle-contact params.
-    object_collision_mapped = _apply_ps_object_collision_mapping(model, ir, cfg, checks)
-    _apply_shape_contact_scaling(model, cfg, checks)
+    if self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN:
+        object_collision_mapped = False
+    else:
+        object_collision_mapped = _apply_ps_object_collision_mapping(model, ir, cfg, checks)
+        _apply_shape_contact_scaling(model, cfg, checks)
 
     # Particle friction fallback/override.
-    if cfg.particle_mu_override is not None:
+    if self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN:
+        pass
+    elif cfg.particle_mu_override is not None:
         model.particle_mu = float(np.clip(cfg.particle_mu_override, 0, MU_MAX))
     elif (not object_collision_mapped) and "contact_collide_fric" in ir:
         model.particle_mu = float(
@@ -1361,10 +1413,16 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
         )
 
     checks.setdefault("particle_contact_param_source", "newton_default")
-    checks["particle_contact_final_ke"] = float(model.particle_ke)
-    checks["particle_contact_final_kd"] = float(model.particle_kd)
-    checks["particle_contact_final_kf"] = float(model.particle_kf)
-    checks["particle_contact_final_mu"] = float(model.particle_mu)
+    if self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN:
+        checks.setdefault("particle_contact_final_ke", None)
+        checks.setdefault("particle_contact_final_kd", None)
+        checks.setdefault("particle_contact_final_kf", None)
+        checks.setdefault("particle_contact_final_mu", None)
+    else:
+        checks["particle_contact_final_ke"] = float(model.particle_ke)
+        checks["particle_contact_final_kd"] = float(model.particle_kd)
+        checks["particle_contact_final_kf"] = float(model.particle_kf)
+        checks["particle_contact_final_mu"] = float(model.particle_mu)
     checks["particle_contacts_enabled"] = particle_contact_kernel
     checks["self_contact_mode"] = self_contact_mode
     checks["collision_radius_source"] = radius_src
@@ -1377,6 +1435,7 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
         bridge_self_contact_grid=bridge_self_contact_grid,
         bridge_neighbor_table=bridge_neighbor_table,
         bridge_neighbor_count=bridge_neighbor_count,
+        phystwin_contact_context=phystwin_contact_context,
         checks=checks,
     )
 
@@ -1469,13 +1528,18 @@ def simulate(
     use_custom_self_contact = self_contact_mode == SELF_CONTACT_MODE_CUSTOM
     use_phystwin_self_contact = self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN
     use_manual_force_path = use_custom_self_contact or use_phystwin_self_contact
-    self_contact_kernels = _load_self_contact_kernels() if use_manual_force_path else {}
-    semiimplicit_kernels = _load_semiimplicit_bridge_kernels() if use_manual_force_path else {}
+    self_contact_kernels = _load_self_contact_kernels() if use_custom_self_contact else {}
+    semiimplicit_kernels = _load_semiimplicit_bridge_kernels() if use_custom_self_contact else {}
+    phystwin_contact_stack = _load_phystwin_contact_stack() if use_phystwin_self_contact else {}
 
     particle_grid = (
         model.particle_grid
         if use_native_self_contact
-        else (model_result.bridge_self_contact_grid if model_result is not None else None)
+        else (
+            model_result.bridge_self_contact_grid
+            if (use_custom_self_contact and model_result is not None)
+            else None
+        )
     )
     if particle_grid is not None:
         with wp.ScopedDevice(model.device):
@@ -1485,17 +1549,6 @@ def simulate(
         search_radius = max(search_radius, float(EPSILON))
     else:
         search_radius = 0.0
-
-    if use_phystwin_self_contact and (cfg.shape_contacts or cfg.add_ground_plane):
-        raise ValueError(
-            "Importer phystwin self-contact currently supports self-collision-only scenes. "
-            "Use the dedicated cloth+box demo for particle-vs-shape contact scenes."
-        )
-
-    phystwin_collision_dist = float(np.asarray(ir["contact_collision_dist"]).ravel()[0])
-    phystwin_collide_elas = float(np.asarray(ir["contact_collide_object_elas"]).ravel()[0])
-    phystwin_collide_fric = float(np.asarray(ir["contact_collide_object_fric"]).ravel()[0])
-    phystwin_qd_tmp = wp.empty_like(state_in.particle_qd) if use_phystwin_self_contact else None
 
     # Collect rollout
     rollout_all: list[np.ndarray] = []
@@ -1547,6 +1600,21 @@ def simulate(
 
             if not use_manual_force_path:
                 solver.step(state_in, state_out, control, contacts, sim_dt)
+            elif use_phystwin_self_contact:
+                if model_result is None or model_result.phystwin_contact_context is None:
+                    raise RuntimeError(
+                        "Strict bridge `phystwin` mode requires a shared PhysTwin contact context."
+                    )
+                phystwin_contact_stack["step_strict_phystwin_contact_stack"](
+                    model,
+                    state_in,
+                    state_out,
+                    control,
+                    model_result.phystwin_contact_context,
+                    sim_dt=sim_dt,
+                    joint_attach_ke=solver.joint_attach_ke,
+                    joint_attach_kd=solver.joint_attach_kd,
+                )
             else:
                 particle_f = state_in.particle_f if state_in.particle_count else None
                 semiimplicit_kernels["eval_spring_forces"](model, state_in, particle_f)
@@ -1554,34 +1622,16 @@ def simulate(
                 semiimplicit_kernels["eval_bending_forces"](model, state_in, particle_f)
                 semiimplicit_kernels["eval_tetrahedra_forces"](model, state_in, control, particle_f)
 
-                if use_phystwin_self_contact:
-                    self_contact_kernels["apply_velocity_update_from_force"](model, state_in, dt=sim_dt)
-                    particle_f.zero_()
-                    if phystwin_qd_tmp is None or model_result is None:
-                        raise RuntimeError("PhysTwin self-contact path requires bridge-side model metadata.")
-                    self_contact_kernels["eval_filtered_self_contact_phystwin_velocity"](
-                        model,
-                        state_in,
-                        particle_grid,
-                        model_result.bridge_neighbor_table,
-                        model_result.bridge_neighbor_count,
-                        collision_dist=phystwin_collision_dist,
-                        collide_elas=phystwin_collide_elas,
-                        collide_fric=phystwin_collide_fric,
-                        particle_qd_out=phystwin_qd_tmp,
-                    )
-                    state_in.particle_qd.assign(phystwin_qd_tmp)
-                elif use_custom_self_contact:
-                    if model_result is None:
-                        raise RuntimeError("Custom self-contact path requires bridge-side model metadata.")
-                    self_contact_kernels["eval_filtered_self_contact_forces"](
-                        model,
-                        state_in,
-                        particle_f,
-                        particle_grid,
-                        model_result.bridge_neighbor_table,
-                        model_result.bridge_neighbor_count,
-                    )
+                if model_result is None:
+                    raise RuntimeError("Custom self-contact path requires bridge-side model metadata.")
+                self_contact_kernels["eval_filtered_self_contact_forces"](
+                    model,
+                    state_in,
+                    particle_f,
+                    particle_grid,
+                    model_result.bridge_neighbor_table,
+                    model_result.bridge_neighbor_count,
+                )
 
                 if solver.enable_tri_contact:
                     semiimplicit_kernels["eval_triangle_contact_forces"](model, state_in, particle_f)
@@ -1589,7 +1639,7 @@ def simulate(
 
             state_in, state_out = state_out, state_in
 
-            if drag > 0.0:
+            if drag > 0.0 and not use_phystwin_self_contact:
                 # PhysTwin drag is a post-step velocity damping; Newton doesn't have
                 # an equivalent built-in knob, so we apply it explicitly here.
                 # Important: this is limited to the first n_obj spring-mass object

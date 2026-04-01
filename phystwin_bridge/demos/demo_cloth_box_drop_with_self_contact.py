@@ -265,8 +265,8 @@ def parse_args() -> argparse.Namespace:
             "off: disable particle self-contact; "
             "native: use Newton's built-in particle kernel; "
             "custom: disable native kernel and use bridge-side penalty self-contact with filtered pairs; "
-            "phystwin: disable native kernel and use bridge-side PhysTwin-style velocity correction "
-            "with zero excluded pairs."
+            "phystwin: currently unfinished in this cloth+box demo because strict PhysTwin-style "
+            "contact only supports the cloth self-collision + implicit ground-plane parity scene."
         ),
     )
     p.add_argument(
@@ -306,7 +306,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Backend used only when --self-contact-mode phystwin. "
             "'warp' is the fast bridge operator. "
-            "'numpy' is a literal bridge-side reference implementation of the same PhysTwin law."
+            "'numpy' is a literal bridge-side reference implementation of the same PhysTwin law. "
+            "This demo currently rejects phystwin mode entirely."
         ),
     )
     return p.parse_args()
@@ -342,6 +343,14 @@ def _self_contact_case_tag(mode: str) -> str:
     if mode == "off":
         return "self_off"
     raise ValueError(f"Unsupported self_contact_mode: {mode}")
+
+
+def _unsupported_phystwin_message() -> str:
+    return (
+        "unfinished / unsupported: strict PhysTwin contact stack currently supports only "
+        "cloth self-collision + implicit ground-plane parity, not cloth+box support shapes. "
+        "Use --self-contact-mode off/native/custom for this demo."
+    )
 
 
 def _effective_self_contact_filter_hops(args: argparse.Namespace) -> int:
@@ -1184,6 +1193,8 @@ def _case_out_dir(base_out_dir: Path, mode: str) -> Path:
 
 
 def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], device: str) -> dict[str, Path]:
+    if str(base_args.self_contact_mode) == "phystwin":
+        raise RuntimeError(_unsupported_phystwin_message())
     args = copy.deepcopy(base_args)
     args.out_dir = _case_out_dir(base_args.out_dir, str(base_args.self_contact_mode))
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1241,6 +1252,8 @@ def run_case(base_args: argparse.Namespace, raw_ir: dict[str, np.ndarray], devic
 def main() -> int:
     args = parse_args()
     _validate_scaling_args(args)
+    if str(args.self_contact_mode) == "phystwin":
+        raise SystemExit(_unsupported_phystwin_message())
     args.out_dir = args.out_dir.resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 

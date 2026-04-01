@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--shape-contacts",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--add-ground-plane",
@@ -266,6 +266,7 @@ def main() -> int:
         "",
         "- In-scope parity target: `blue_cloth_double_lift_around` PhysTwin self-collision case",
         "- Bridge-side self-contact mode: `phystwin`",
+        "- Contact scope: pairwise self-collision + implicit `z=0` ground plane only",
         "- Summary JSON: `strict_self_collision_parity_summary.json`",
         "- Report: `strict_self_collision_parity_report.md`",
         "- Support demo: `support_demo/parity_support_demo.mp4`",

@@ -232,6 +232,72 @@ def apply_velocity_update_from_force(
 
 
 @wp.kernel
+def _update_vel_from_force_phystwin(
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_f: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=wp.float32),
+    particle_flags: wp.array(dtype=wp.int32),
+    n_object: int,
+    dt: float,
+    drag_damping: float,
+    gravity_mag: float,
+    reverse_factor: float,
+    particle_qd_out: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    v0 = particle_qd[tid]
+    if tid >= n_object:
+        particle_qd_out[tid] = v0
+        return
+    if (particle_flags[tid] & newton.ParticleFlags.ACTIVE) == 0:
+        particle_qd_out[tid] = v0
+        return
+
+    m0 = particle_mass[tid]
+    if m0 <= 0.0:
+        particle_qd_out[tid] = v0
+        return
+
+    f0 = particle_f[tid]
+    drag_damping_factor = wp.exp(-dt * drag_damping)
+    all_force = f0 + m0 * wp.vec3(0.0, 0.0, -gravity_mag) * reverse_factor
+    a = all_force / m0
+    v1 = v0 + a * dt
+    particle_qd_out[tid] = v1 * drag_damping_factor
+
+
+def update_vel_from_force_phystwin(
+    model: Any,
+    state: Any,
+    *,
+    n_object: int,
+    dt: float,
+    drag_damping: float,
+    gravity_mag: float,
+    reverse_factor: float,
+    particle_qd_out: Any,
+) -> None:
+    wp.launch(
+        kernel=_update_vel_from_force_phystwin,
+        dim=model.particle_count,
+        inputs=[
+            state.particle_qd,
+            state.particle_f,
+            model.particle_mass,
+            model.particle_flags,
+            int(n_object),
+            float(dt),
+            float(drag_damping),
+            float(gravity_mag),
+            float(reverse_factor),
+        ],
+        outputs=[particle_qd_out],
+        device=model.device,
+    )
+
+
+@wp.kernel
 def _eval_filtered_self_contact_phystwin(
     grid: wp.uint64,
     particle_x: wp.array(dtype=wp.vec3),
@@ -303,6 +369,45 @@ def _eval_filtered_self_contact_phystwin(
         particle_qd_out[i] = v1
 
 
+def apply_self_collision_phystwin_velocity(
+    *,
+    device: Any,
+    particle_count: int,
+    particle_x: Any,
+    particle_qd: Any,
+    particle_mass: Any,
+    particle_flags: Any,
+    grid: wp.HashGrid | None,
+    neighbor_table: Any,
+    neighbor_count: Any,
+    collision_dist: float,
+    collide_elas: float,
+    collide_fric: float,
+    particle_qd_out: Any,
+) -> None:
+    if grid is None:
+        particle_qd_out.assign(particle_qd)
+        return
+    wp.launch(
+        kernel=_eval_filtered_self_contact_phystwin,
+        dim=particle_count,
+        inputs=[
+            grid.id,
+            particle_x,
+            particle_qd,
+            particle_mass,
+            particle_flags,
+            neighbor_table,
+            neighbor_count,
+            float(collision_dist),
+            float(np.clip(collide_elas, 0.0, 1.0)),
+            float(np.clip(collide_fric, 0.0, 2.0)),
+        ],
+        outputs=[particle_qd_out],
+        device=device,
+    )
+
+
 def eval_filtered_self_contact_phystwin_velocity(
     model: Any,
     state: Any,
@@ -315,24 +420,111 @@ def eval_filtered_self_contact_phystwin_velocity(
     collide_fric: float,
     particle_qd_out: Any,
 ) -> None:
-    if grid is None:
+    apply_self_collision_phystwin_velocity(
+        device=model.device,
+        particle_count=model.particle_count,
+        particle_x=state.particle_q,
+        particle_qd=state.particle_qd,
+        particle_mass=model.particle_mass,
+        particle_flags=model.particle_flags,
+        grid=grid,
+        neighbor_table=neighbor_table,
+        neighbor_count=neighbor_count,
+        collision_dist=collision_dist,
+        collide_elas=collide_elas,
+        collide_fric=collide_fric,
+        particle_qd_out=particle_qd_out,
+    )
+
+
+@wp.kernel
+def _integrate_ground_collision_phystwin(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    n_object: int,
+    collide_elas: float,
+    collide_fric: float,
+    dt: float,
+    reverse_factor: float,
+    particle_q_out: wp.array(dtype=wp.vec3),
+    particle_qd_out: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    x0 = particle_q[tid]
+    v0 = particle_qd[tid]
+    if tid >= n_object:
+        particle_q_out[tid] = x0
+        particle_qd_out[tid] = v0
         return
+    if (particle_flags[tid] & newton.ParticleFlags.ACTIVE) == 0:
+        particle_q_out[tid] = x0
+        particle_qd_out[tid] = v0
+        return
+
+    normal = wp.vec3(0.0, 0.0, 1.0) * reverse_factor
+    x_z = x0[2]
+    v_z = v0[2]
+    next_x_z = (x_z + v_z * dt) * reverse_factor
+
+    if next_x_z < 0.0 and v_z * reverse_factor < -1.0e-4:
+        v_normal = wp.dot(v0, normal) * normal
+        v_tao = v0 - v_normal
+        v_normal_length = wp.length(v_normal)
+        v_tao_length = wp.max(wp.length(v_tao), 1.0e-6)
+
+        clamp_collide_elas = wp.clamp(collide_elas, low=0.0, high=1.0)
+        clamp_collide_fric = wp.clamp(collide_fric, low=0.0, high=2.0)
+
+        v_normal_new = -clamp_collide_elas * v_normal
+        a = wp.max(
+            0.0,
+            1.0
+            - clamp_collide_fric
+            * (1.0 + clamp_collide_elas)
+            * v_normal_length
+            / v_tao_length,
+        )
+        v_tao_new = a * v_tao
+
+        v1 = v_normal_new + v_tao_new
+        toi = -x_z / v_z
+    else:
+        v1 = v0
+        toi = 0.0
+
+    particle_q_out[tid] = x0 + v0 * toi + v1 * (dt - toi)
+    particle_qd_out[tid] = v1
+
+
+def integrate_ground_collision_phystwin(
+    model: Any,
+    particle_q: Any,
+    particle_qd: Any,
+    *,
+    n_object: int,
+    collide_elas: float,
+    collide_fric: float,
+    dt: float,
+    reverse_factor: float,
+    particle_q_out: Any,
+    particle_qd_out: Any,
+) -> None:
     wp.launch(
-        kernel=_eval_filtered_self_contact_phystwin,
+        kernel=_integrate_ground_collision_phystwin,
         dim=model.particle_count,
         inputs=[
-            grid.id,
-            state.particle_q,
-            state.particle_qd,
-            model.particle_mass,
+            particle_q,
+            particle_qd,
             model.particle_flags,
-            neighbor_table,
-            neighbor_count,
-            float(collision_dist),
+            int(n_object),
             float(np.clip(collide_elas, 0.0, 1.0)),
             float(np.clip(collide_fric, 0.0, 2.0)),
+            float(dt),
+            float(reverse_factor),
         ],
-        outputs=[particle_qd_out],
+        outputs=[particle_q_out, particle_qd_out],
         device=model.device,
     )
 
