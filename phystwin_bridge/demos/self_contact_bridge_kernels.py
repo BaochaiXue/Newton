@@ -408,6 +408,181 @@ def apply_self_collision_phystwin_velocity(
     )
 
 
+@wp.kernel(enable_backward=False)
+def _build_potential_self_collision_table(
+    grid: wp.uint64,
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    n_object: int,
+    collision_dist: float,
+    capacity: int,
+    collision_indices: wp.array2d(dtype=wp.int32),
+    collision_number: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+    i = wp.hash_grid_point_id(grid, tid)
+    if i == -1 or i >= n_object:
+        return
+    if (particle_flags[i] & newton.ParticleFlags.ACTIVE) == 0:
+        return
+
+    x1 = particle_x[i]
+    query = wp.hash_grid_query(grid, x1, collision_dist * 5.0)
+    index = int(0)
+    while wp.hash_grid_query_next(query, index):
+        if index == i or index >= n_object:
+            continue
+        if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
+            continue
+
+        dis = particle_x[index] - x1
+        dis_len = wp.length(dis)
+        if dis_len < collision_dist:
+            count = collision_number[i]
+            if count < capacity:
+                collision_indices[i, count] = index
+                collision_number[i] = count + 1
+
+
+def build_potential_self_collision_table(
+    *,
+    device: Any,
+    particle_count: int,
+    grid: wp.HashGrid,
+    particle_x: Any,
+    particle_flags: Any,
+    n_object: int,
+    collision_dist: float,
+    collision_table_capacity: int,
+    collision_indices: Any,
+    collision_number: Any,
+) -> None:
+    collision_number.zero_()
+    wp.launch(
+        kernel=_build_potential_self_collision_table,
+        dim=particle_count,
+        inputs=[
+            grid.id,
+            particle_x,
+            particle_flags,
+            int(n_object),
+            float(collision_dist),
+            int(collision_table_capacity),
+        ],
+        outputs=[collision_indices, collision_number],
+        device=device,
+    )
+
+
+@wp.kernel
+def _apply_self_collision_phystwin_from_table(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=wp.float32),
+    particle_flags: wp.array(dtype=wp.int32),
+    n_object: int,
+    collision_indices: wp.array2d(dtype=wp.int32),
+    collision_number: wp.array(dtype=wp.int32),
+    collision_table_capacity: int,
+    collision_dist: float,
+    collide_elas: float,
+    collide_fric: float,
+    particle_qd_out: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    v1 = particle_qd[tid]
+    if tid >= n_object:
+        particle_qd_out[tid] = v1
+        return
+    if (particle_flags[tid] & newton.ParticleFlags.ACTIVE) == 0:
+        particle_qd_out[tid] = v1
+        return
+
+    x1 = particle_x[tid]
+    m1 = particle_mass[tid]
+    if m1 <= 0.0:
+        particle_qd_out[tid] = v1
+        return
+
+    valid_count = float(0.0)
+    J_sum = wp.vec3(0.0)
+    count = wp.min(collision_number[tid], collision_table_capacity)
+    for k in range(count):
+        index = collision_indices[tid, k]
+        if index < 0 or index == tid or index >= n_object:
+            continue
+        if (particle_flags[index] & newton.ParticleFlags.ACTIVE) == 0:
+            continue
+
+        x2 = particle_x[index]
+        v2 = particle_qd[index]
+        m2 = particle_mass[index]
+        if m2 <= 0.0:
+            continue
+
+        dis = x2 - x1
+        dis_len = wp.length(dis)
+        relative_v = v2 - v1
+        if dis_len < collision_dist and wp.dot(dis, relative_v) < -1.0e-4:
+            valid_count += 1.0
+            collision_normal = dis / wp.max(dis_len, 1.0e-6)
+            v_rel_n = wp.dot(relative_v, collision_normal) * collision_normal
+            impulse_n = (-(1.0 + collide_elas) * v_rel_n) / (1.0 / m1 + 1.0 / m2)
+            v_rel_n_length = wp.length(v_rel_n)
+
+            v_rel_t = relative_v - v_rel_n
+            v_rel_t_length = wp.max(wp.length(v_rel_t), 1.0e-6)
+            a = wp.max(
+                0.0,
+                1.0 - collide_fric * (1.0 + collide_elas) * v_rel_n_length / v_rel_t_length,
+            )
+            impulse_t = (a - 1.0) * v_rel_t / (1.0 / m1 + 1.0 / m2)
+            J_sum += impulse_n + impulse_t
+
+    if valid_count > 0.0:
+        particle_qd_out[tid] = v1 - J_sum / valid_count / m1
+    else:
+        particle_qd_out[tid] = v1
+
+
+def apply_self_collision_phystwin_velocity_from_table(
+    *,
+    device: Any,
+    particle_count: int,
+    particle_x: Any,
+    particle_qd: Any,
+    particle_mass: Any,
+    particle_flags: Any,
+    n_object: int,
+    collision_indices: Any,
+    collision_number: Any,
+    collision_table_capacity: int,
+    collision_dist: float,
+    collide_elas: float,
+    collide_fric: float,
+    particle_qd_out: Any,
+) -> None:
+    wp.launch(
+        kernel=_apply_self_collision_phystwin_from_table,
+        dim=particle_count,
+        inputs=[
+            particle_x,
+            particle_qd,
+            particle_mass,
+            particle_flags,
+            int(n_object),
+            collision_indices,
+            collision_number,
+            int(collision_table_capacity),
+            float(collision_dist),
+            float(np.clip(collide_elas, 0.0, 1.0)),
+            float(np.clip(collide_fric, 0.0, 2.0)),
+        ],
+        outputs=[particle_qd_out],
+        device=device,
+    )
+
+
 def eval_filtered_self_contact_phystwin_velocity(
     model: Any,
     state: Any,

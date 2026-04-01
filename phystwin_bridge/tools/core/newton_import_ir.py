@@ -117,6 +117,7 @@ def _load_phystwin_contact_stack():
     from phystwin_contact_stack import (
         build_strict_phystwin_contact_context,
         is_strict_phystwin_mode,
+        prepare_strict_phystwin_contact_frame,
         step_strict_phystwin_contact_stack,
         validate_strict_phystwin_mode,
     )
@@ -124,6 +125,7 @@ def _load_phystwin_contact_stack():
     return {
         "build_strict_phystwin_contact_context": build_strict_phystwin_contact_context,
         "is_strict_phystwin_mode": is_strict_phystwin_mode,
+        "prepare_strict_phystwin_contact_frame": prepare_strict_phystwin_contact_frame,
         "step_strict_phystwin_contact_stack": step_strict_phystwin_contact_stack,
         "validate_strict_phystwin_mode": validate_strict_phystwin_mode,
     }
@@ -177,6 +179,8 @@ class SimConfig:
     add_ground_plane: bool = True
     self_contact_mode: str | None = None
     custom_self_contact_hops: int = 0
+    phystwin_freeze_collision_table: bool = False
+    phystwin_collision_table_capacity: int = 500
     # Override for IR `self_collision` (which we treat as the PhysTwin collision enable).
     # Note: enabling particle self-collision in SemiImplicit also requires enabling the
     # particle contact kernel (see `disable_particle_contact_kernel`).
@@ -255,6 +259,8 @@ class SimConfig:
             add_ground_plane=args.add_ground_plane,
             self_contact_mode=args.self_contact_mode,
             custom_self_contact_hops=args.custom_self_contact_hops,
+            phystwin_freeze_collision_table=args.phystwin_freeze_collision_table,
+            phystwin_collision_table_capacity=args.phystwin_collision_table_capacity,
             particle_contacts=args.particle_contacts,
             particle_contact_radius=args.particle_contact_radius,
             object_contact_radius=args.object_contact_radius,
@@ -412,6 +418,25 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Graph-hop exclusion radius for bridge-side self-contact tables. "
             "0 keeps all non-self pairs eligible; 1 excludes direct spring neighbors."
+        ),
+    )
+    p.add_argument(
+        "--phystwin-freeze-collision-table",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experimental strict-phystwin option: freeze the self-collision candidate "
+            "table once per frame using PhysTwin-style update_collision_graph semantics "
+            "instead of rebuilding a dynamic hash query every substep."
+        ),
+    )
+    p.add_argument(
+        "--phystwin-collision-table-capacity",
+        type=int,
+        default=500,
+        help=(
+            "Experimental strict-phystwin candidate-table capacity. "
+            "PhysTwin allocates 500 collision candidates per particle."
         ),
     )
     p.add_argument(
@@ -1563,6 +1588,16 @@ def simulate(
     # Main loop
     t0 = time.perf_counter()
     for frame in frame_range:
+        if use_phystwin_self_contact:
+            if model_result is None or model_result.phystwin_contact_context is None:
+                raise RuntimeError(
+                    "Strict bridge `phystwin` mode requires a shared PhysTwin contact context."
+                )
+            phystwin_contact_stack["prepare_strict_phystwin_contact_frame"](
+                model,
+                state_in,
+                model_result.phystwin_contact_context,
+            )
         for sub in range(substeps):
             # Newton state stores force accumulators; clear them every substep so forces
             # don't unintentionally persist across integration steps.
@@ -1601,10 +1636,6 @@ def simulate(
             if not use_manual_force_path:
                 solver.step(state_in, state_out, control, contacts, sim_dt)
             elif use_phystwin_self_contact:
-                if model_result is None or model_result.phystwin_contact_context is None:
-                    raise RuntimeError(
-                        "Strict bridge `phystwin` mode requires a shared PhysTwin contact context."
-                    )
                 phystwin_contact_stack["step_strict_phystwin_contact_stack"](
                     model,
                     state_in,
@@ -1751,6 +1782,8 @@ def save_results(
             "add_ground_plane": cfg.add_ground_plane,
             "self_contact_mode": cfg.self_contact_mode,
             "custom_self_contact_hops": cfg.custom_self_contact_hops,
+            "phystwin_freeze_collision_table": cfg.phystwin_freeze_collision_table,
+            "phystwin_collision_table_capacity": cfg.phystwin_collision_table_capacity,
             "particle_contacts_override": cfg.particle_contacts,
             "disable_particle_contact_kernel": cfg.disable_particle_contact_kernel,
             "particle_contact_radius": cfg.particle_contact_radius,

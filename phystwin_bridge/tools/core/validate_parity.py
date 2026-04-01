@@ -137,6 +137,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--phystwin-freeze-collision-table",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Experimental pass-through for strict phystwin mode: freeze the candidate "
+            "collision table once per frame instead of using the current per-substep hash query."
+        ),
+    )
+    parser.add_argument(
+        "--phystwin-collision-table-capacity",
+        type=int,
+        default=500,
+        help="Experimental pass-through for strict phystwin mode. PhysTwin uses 500.",
+    )
+    parser.add_argument(
         "--particle-contacts",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -517,6 +532,14 @@ def _build_importer_cmd(
     if args.self_contact_mode is not None:
         cmd.extend(["--self-contact-mode", str(args.self_contact_mode)])
         cmd.extend(["--custom-self-contact-hops", str(int(args.custom_self_contact_hops))])
+        cmd.append(
+            "--phystwin-freeze-collision-table"
+            if args.phystwin_freeze_collision_table
+            else "--no-phystwin-freeze-collision-table"
+        )
+        cmd.extend(
+            ["--phystwin-collision-table-capacity", str(int(args.phystwin_collision_table_capacity))]
+        )
     if args.particle_contact_ke is not None:
         cmd.extend(["--particle-contact-ke", str(args.particle_contact_ke)])
     if args.object_contact_radius is not None:

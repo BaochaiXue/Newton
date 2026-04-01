@@ -49,13 +49,10 @@ from bridge_deformable_common import (
 from bridge_shared import apply_viewer_shape_colors, compute_visual_particle_radii, temporary_particle_radius_override
 from bridge_shared import overlay_text_lines_rgb
 from self_contact_bridge_kernels import (
-    apply_velocity_update_from_force,
     build_filtered_self_contact_tables,
     compute_nonexcluded_overlap_stats,
     compute_nonexcluded_overlap_curve,
     eval_filtered_self_contact_forces,
-    eval_filtered_self_contact_phystwin_velocity,
-    reference_filtered_self_contact_phystwin_velocity,
 )
 from semiimplicit_bridge_kernels import (
     eval_body_contact_forces,
@@ -560,8 +557,6 @@ def simulate(
     self_contact_mode = str(args.self_contact_mode)
     use_native_self_contact = self_contact_mode == "native"
     use_custom_self_contact = self_contact_mode == "custom"
-    use_phystwin_self_contact = self_contact_mode == "phystwin"
-    use_phystwin_numpy_backend = use_phystwin_self_contact and str(args.phystwin_backend) == "numpy"
     shape_contacts_enabled = bool(args.shape_contacts) and _box_enabled(args)
     cfg = newton_import_ir.SimConfig(
         ir_path=args.ir.resolve(),
@@ -618,15 +613,7 @@ def simulate(
     use_decoupled_shape_materials = bool(args.decouple_shape_materials) or (
         not np.isclose(float(ir_obj.get("weight_scale", 1.0)), 1.0)
     )
-    use_manual_force_path = (
-        bool(use_decoupled_shape_materials)
-        or use_custom_self_contact
-        or use_phystwin_self_contact
-    )
-    phystwin_collision_dist = float(np.asarray(ir_obj["contact_collision_dist"]).ravel()[0])
-    phystwin_collide_elas = float(np.asarray(ir_obj["contact_collide_object_elas"]).ravel()[0])
-    phystwin_collide_fric = float(np.asarray(ir_obj["contact_collide_object_fric"]).ravel()[0])
-    phystwin_qd_tmp = wp.empty_like(state_in.particle_qd) if use_phystwin_self_contact else None
+    use_manual_force_path = bool(use_decoupled_shape_materials) or use_custom_self_contact
 
     n_frames = max(2, int(args.frames))
     particle_q_all: list[np.ndarray] = []
@@ -675,43 +662,7 @@ def simulate(
                 eval_body_joint_forces(
                     model, state_in, control, body_f_work, solver.joint_attach_ke, solver.joint_attach_kd
                 )
-                if use_phystwin_self_contact:
-                    apply_velocity_update_from_force(model, state_in, dt=sim_dt)
-                    particle_f.zero_()
-                    if use_phystwin_numpy_backend:
-                        qd_reference = reference_filtered_self_contact_phystwin_velocity(
-                            state_in.particle_q.numpy().astype(np.float32, copy=False),
-                            state_in.particle_qd.numpy().astype(np.float32, copy=False),
-                            model.particle_mass.numpy().astype(np.float32, copy=False),
-                            collision_dist=phystwin_collision_dist,
-                            collide_elas=phystwin_collide_elas,
-                            collide_fric=phystwin_collide_fric,
-                            excluded_pairs=set(meta.get("excluded_pairs_cpu", set())),
-                            active_mask=(
-                                model.particle_flags.numpy().astype(np.int32, copy=False)
-                                & int(newton.ParticleFlags.ACTIVE)
-                            )
-                            != 0,
-                        )
-                        state_in.particle_qd.assign(
-                            wp.array(qd_reference.astype(np.float32, copy=False), dtype=wp.vec3, device=model.device)
-                        )
-                    else:
-                        if phystwin_qd_tmp is None:
-                            raise RuntimeError("PhysTwin self-contact path requires a temporary velocity buffer.")
-                        eval_filtered_self_contact_phystwin_velocity(
-                            model,
-                            state_in,
-                            particle_grid,
-                            meta["custom_neighbor_table"],
-                            meta["custom_neighbor_count"],
-                            collision_dist=phystwin_collision_dist,
-                            collide_elas=phystwin_collide_elas,
-                            collide_fric=phystwin_collide_fric,
-                            particle_qd_out=phystwin_qd_tmp,
-                        )
-                        state_in.particle_qd.assign(phystwin_qd_tmp)
-                elif use_native_self_contact:
+                if use_native_self_contact:
                     eval_particle_contact_forces(model, state_in, particle_f)
                 elif use_custom_self_contact:
                     eval_filtered_self_contact_forces(
@@ -942,11 +893,7 @@ def render_video(
                         frame,
                         [
                             "CLOTH BOX DROP",
-                            (
-                                f"SELF COLLISION: PHYSTWIN [{str(args.phystwin_backend).upper()}]"
-                                if str(args.self_contact_mode) == "phystwin"
-                                else f"SELF COLLISION: {str(args.self_contact_mode).upper()}"
-                            ),
+                            f"SELF COLLISION: {str(args.self_contact_mode).upper()}",
                             mass_label,
                             f"frame {out_idx + 1:03d}/{n_out_frames:03d}  t={sim_t:.3f}s",
                         ],
@@ -1160,9 +1107,7 @@ def build_summary(
         "particle_contact_kd_final": float(model.particle_kd),
         "particle_contact_kf_final": float(model.particle_kf),
         "particle_self_contact_scale": float(args.particle_self_contact_scale),
-        "phystwin_backend": (
-            str(args.phystwin_backend) if str(args.self_contact_mode) == "phystwin" else None
-        ),
+        "phystwin_backend": None,
         "particle_contacts_enabled": bool(particle_contacts_enabled),
         "disable_particle_contact_kernel": bool(disable_particle_contact_kernel),
         "final_nonexcluded_self_contact_pair_count": float(self_contact_stats["pair_count"]),

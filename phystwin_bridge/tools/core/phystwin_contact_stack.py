@@ -27,7 +27,9 @@ if str(DEMOS_DIR) not in sys.path:
     sys.path.insert(0, str(DEMOS_DIR))
 
 from self_contact_bridge_kernels import (  # noqa: E402
+    apply_self_collision_phystwin_velocity_from_table,
     apply_self_collision_phystwin_velocity,
+    build_potential_self_collision_table,
     build_filtered_self_contact_tables,
     integrate_ground_collision_phystwin,
     update_vel_from_force_phystwin,
@@ -56,6 +58,10 @@ class PhysTwinContactContext:
     neighbor_count: Any
     qd_after_force: Any
     qd_after_collision: Any
+    freeze_collision_table: bool
+    collision_table_capacity: int
+    collision_indices: Any
+    collision_number: Any
     collision_dist: float
     collide_elas: float
     collide_fric: float
@@ -181,6 +187,23 @@ def build_strict_phystwin_contact_context(
         particle_grid = wp.HashGrid(128, 128, 128)
         particle_grid.reserve(model.particle_count)
 
+    freeze_collision_table = bool(getattr(cfg, "phystwin_freeze_collision_table", False))
+    collision_table_capacity = int(getattr(cfg, "phystwin_collision_table_capacity", 500))
+    if collision_table_capacity <= 0:
+        raise ValueError(
+            f"phystwin_collision_table_capacity must be positive, got {collision_table_capacity}"
+        )
+    collision_indices = None
+    collision_number = None
+    if freeze_collision_table:
+        collision_indices_np = np.full(
+            (int(model.particle_count), collision_table_capacity),
+            -1,
+            dtype=np.int32,
+        )
+        collision_indices = wp.array(collision_indices_np, dtype=wp.int32, device=device)
+        collision_number = wp.zeros(int(model.particle_count), dtype=wp.int32, device=device)
+
     search_radius = max(
         float(model.particle_max_radius) * 2.0 + float(model.particle_cohesion),
         collision_dist * 5.0,
@@ -195,6 +218,10 @@ def build_strict_phystwin_contact_context(
         neighbor_count=neighbor_count,
         qd_after_force=wp.empty(model.particle_count, dtype=wp.vec3, device=device),
         qd_after_collision=wp.empty(model.particle_count, dtype=wp.vec3, device=device),
+        freeze_collision_table=freeze_collision_table,
+        collision_table_capacity=collision_table_capacity,
+        collision_indices=collision_indices,
+        collision_number=collision_number,
         collision_dist=collision_dist,
         collide_elas=collide_elas,
         collide_fric=collide_fric,
@@ -225,6 +252,10 @@ def build_strict_phystwin_contact_context(
         "phystwin_collision_dist": float(collision_dist),
         "phystwin_collide_elas": float(collide_elas),
         "phystwin_collide_fric": float(collide_fric),
+        "phystwin_collision_candidate_mode": (
+            "frame_frozen_table" if freeze_collision_table else "dynamic_hash_query"
+        ),
+        "phystwin_collision_table_capacity": int(collision_table_capacity),
         "particle_contact_param_source": "phystwin_bridge_exact",
         "ground_contact_param_source": "phystwin_ground_integrator",
         "ground_contact_context": "implicit_z0_plane",
@@ -246,6 +277,31 @@ def build_strict_phystwin_contact_context(
     return ctx, check_updates
 
 
+def prepare_strict_phystwin_contact_frame(
+    model: Any,
+    state_in: Any,
+    ctx: PhysTwinContactContext,
+) -> None:
+    if not ctx.freeze_collision_table:
+        return
+    with wp.ScopedDevice(model.device):
+        ctx.particle_grid.build(state_in.particle_q, radius=ctx.search_radius)
+    assert ctx.collision_indices is not None
+    assert ctx.collision_number is not None
+    build_potential_self_collision_table(
+        device=model.device,
+        particle_count=model.particle_count,
+        grid=ctx.particle_grid,
+        particle_x=state_in.particle_q,
+        particle_flags=model.particle_flags,
+        n_object=ctx.n_object,
+        collision_dist=ctx.collision_dist,
+        collision_table_capacity=ctx.collision_table_capacity,
+        collision_indices=ctx.collision_indices,
+        collision_number=ctx.collision_number,
+    )
+
+
 def step_strict_phystwin_contact_stack(
     model: Any,
     state_in: Any,
@@ -259,8 +315,9 @@ def step_strict_phystwin_contact_stack(
 ) -> None:
     """Run one strict PhysTwin-style substep for the cloth parity scene."""
 
-    with wp.ScopedDevice(model.device):
-        ctx.particle_grid.build(state_in.particle_q, radius=ctx.search_radius)
+    if not ctx.freeze_collision_table:
+        with wp.ScopedDevice(model.device):
+            ctx.particle_grid.build(state_in.particle_q, radius=ctx.search_radius)
 
     particle_f = state_in.particle_f if state_in.particle_count else None
     body_f = state_in.body_f if state_in.body_count else None
@@ -292,21 +349,41 @@ def step_strict_phystwin_contact_stack(
         reverse_factor=float(ctx.reverse_factor),
         particle_qd_out=ctx.qd_after_force,
     )
-    apply_self_collision_phystwin_velocity(
-        device=model.device,
-        particle_count=model.particle_count,
-        particle_x=state_in.particle_q,
-        particle_qd=ctx.qd_after_force,
-        particle_mass=model.particle_mass,
-        particle_flags=model.particle_flags,
-        grid=ctx.particle_grid,
-        neighbor_table=ctx.neighbor_table,
-        neighbor_count=ctx.neighbor_count,
-        collision_dist=float(ctx.collision_dist),
-        collide_elas=float(ctx.collide_elas),
-        collide_fric=float(ctx.collide_fric),
-        particle_qd_out=ctx.qd_after_collision,
-    )
+    if ctx.freeze_collision_table:
+        assert ctx.collision_indices is not None
+        assert ctx.collision_number is not None
+        apply_self_collision_phystwin_velocity_from_table(
+            device=model.device,
+            particle_count=model.particle_count,
+            particle_x=state_in.particle_q,
+            particle_qd=ctx.qd_after_force,
+            particle_mass=model.particle_mass,
+            particle_flags=model.particle_flags,
+            n_object=ctx.n_object,
+            collision_indices=ctx.collision_indices,
+            collision_number=ctx.collision_number,
+            collision_table_capacity=ctx.collision_table_capacity,
+            collision_dist=float(ctx.collision_dist),
+            collide_elas=float(ctx.collide_elas),
+            collide_fric=float(ctx.collide_fric),
+            particle_qd_out=ctx.qd_after_collision,
+        )
+    else:
+        apply_self_collision_phystwin_velocity(
+            device=model.device,
+            particle_count=model.particle_count,
+            particle_x=state_in.particle_q,
+            particle_qd=ctx.qd_after_force,
+            particle_mass=model.particle_mass,
+            particle_flags=model.particle_flags,
+            grid=ctx.particle_grid,
+            neighbor_table=ctx.neighbor_table,
+            neighbor_count=ctx.neighbor_count,
+            collision_dist=float(ctx.collision_dist),
+            collide_elas=float(ctx.collide_elas),
+            collide_fric=float(ctx.collide_fric),
+            particle_qd_out=ctx.qd_after_collision,
+        )
     integrate_ground_collision_phystwin(
         model,
         particle_q=state_in.particle_q,

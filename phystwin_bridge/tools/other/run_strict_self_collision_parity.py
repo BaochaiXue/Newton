@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=302)
     parser.add_argument("--custom-self-contact-hops", type=int, default=0)
     parser.add_argument(
+        "--phystwin-freeze-collision-table",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--phystwin-collision-table-capacity", type=int, default=500)
+    parser.add_argument(
         "--shape-contacts",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -163,6 +169,8 @@ def main() -> int:
             "phystwin",
             "--custom-self-contact-hops",
             str(int(args.custom_self_contact_hops)),
+            "--phystwin-collision-table-capacity",
+            str(int(args.phystwin_collision_table_capacity)),
             "--interpolate-controls",
             "--apply-drag",
             "--ground-restitution-mode",
@@ -179,6 +187,11 @@ def main() -> int:
             "--max-last30-rmse",
             str(thresholds["last30_rmse"]),
         ]
+        validate_cmd.append(
+            "--phystwin-freeze-collision-table"
+            if args.phystwin_freeze_collision_table
+            else "--no-phystwin-freeze-collision-table"
+        )
         validate_cmd.append("--shape-contacts" if args.shape_contacts else "--no-shape-contacts")
         validate_cmd.append("--add-ground-plane" if args.add_ground_plane else "--no-add-ground-plane")
         _run_logged(
@@ -202,9 +215,9 @@ def main() -> int:
             "--report",
             str(report_json),
             "--newton-label",
-            "Newton phystwin",
+            "Newton Bridge Rollout",
             "--phystwin-label",
-            "PhysTwin reference",
+            "PhysTwin Reference Rollout",
             "--out-mp4",
             str(support_mp4),
         ]
