@@ -369,6 +369,48 @@ def parse_args() -> argparse.Namespace:
         default=0.014,
         help="Finger target position while the rope is supported.",
     )
+    p.add_argument(
+        "--drop-support-patch-count",
+        type=int,
+        default=8,
+        help="Number of particles constrained in the visible support patch for `drop_release_baseline`.",
+    )
+    p.add_argument(
+        "--settle-window-seconds",
+        type=float,
+        default=0.08,
+        help="Required pre-release settle window length [s].",
+    )
+    p.add_argument(
+        "--pre-release-particle-speed-mean-max",
+        type=float,
+        default=0.05,
+        help="Maximum allowed rope particle mean speed over the settle window [m/s].",
+    )
+    p.add_argument(
+        "--pre-release-com-horizontal-speed-max",
+        type=float,
+        default=0.03,
+        help="Maximum allowed rope COM horizontal speed over the settle window [m/s].",
+    )
+    p.add_argument(
+        "--pre-release-support-speed-mean-max",
+        type=float,
+        default=0.02,
+        help="Maximum allowed support-patch mean speed over the settle window [m/s].",
+    )
+    p.add_argument(
+        "--post-release-kick-window-seconds",
+        type=float,
+        default=0.08,
+        help="Post-release window used for horizontal-kick diagnostics [s].",
+    )
+    p.add_argument(
+        "--drop-preroll-settle-seconds",
+        type=float,
+        default=2.0,
+        help="Maximum hidden settle time before the recorded support/release sequence starts [s].",
+    )
 
     p.add_argument("--render-fps", type=float, default=30.0)
     p.add_argument("--slowdown", type=float, default=None)
@@ -615,6 +657,54 @@ def _activate_particle_indices(model: newton.Model, particle_indices: np.ndarray
     flags = model.particle_flags.numpy().astype(np.int32, copy=True)
     flags[particle_indices] = flags[particle_indices] | active_mask
     model.particle_flags = wp.array(flags, dtype=wp.int32, device=device)
+
+
+def _select_drop_support_patch_indices(points: np.ndarray, *, count: int) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"Unexpected point shape for support selection: {pts.shape}")
+    count = max(1, int(count))
+    candidate_count = min(int(pts.shape[0]), max(24, 4 * count))
+    top_idx = np.argsort(-pts[:, 2])[:candidate_count].astype(np.int32)
+    top_pts = pts[top_idx]
+    seed_count = min(int(top_pts.shape[0]), max(4, count))
+    seed_center = np.mean(top_pts[:seed_count], axis=0).astype(np.float32, copy=False)
+    d = np.linalg.norm(top_pts - seed_center[None, :], axis=1)
+    chosen = top_idx[np.argsort(d)[: min(count, top_idx.shape[0])]]
+    return np.sort(chosen.astype(np.int32, copy=False))
+
+
+def _settle_window_metrics_from_series(
+    particle_speed_mean_series: np.ndarray,
+    rope_com_horizontal_speed_series: np.ndarray,
+    support_patch_speed_mean_series: np.ndarray,
+    *,
+    frame_idx: int,
+    window_frames: int,
+    particle_speed_threshold_m_s: float,
+    com_horizontal_speed_threshold_m_s: float,
+    support_patch_speed_threshold_m_s: float,
+    frame_dt: float,
+) -> tuple[dict[str, Any], bool]:
+    start = max(0, int(frame_idx) - int(window_frames) + 1)
+    metrics = {
+        "window_start_frame": int(start),
+        "window_end_frame": int(frame_idx),
+        "window_duration_s": float((int(frame_idx) - start + 1) * frame_dt),
+        "particle_speed_mean_max_m_s": float(np.max(particle_speed_mean_series[start : int(frame_idx) + 1])),
+        "com_horizontal_speed_max_m_s": float(np.max(rope_com_horizontal_speed_series[start : int(frame_idx) + 1])),
+        "support_patch_speed_mean_max_m_s": float(np.max(support_patch_speed_mean_series[start : int(frame_idx) + 1])),
+        "particle_speed_mean_threshold_m_s": float(particle_speed_threshold_m_s),
+        "com_horizontal_speed_threshold_m_s": float(com_horizontal_speed_threshold_m_s),
+        "support_patch_speed_threshold_m_s": float(support_patch_speed_threshold_m_s),
+    }
+    settle_ok = (
+        (int(frame_idx) - start + 1) >= int(window_frames)
+        and metrics["particle_speed_mean_max_m_s"] <= float(particle_speed_threshold_m_s)
+        and metrics["com_horizontal_speed_max_m_s"] <= float(com_horizontal_speed_threshold_m_s)
+        and metrics["support_patch_speed_mean_max_m_s"] <= float(support_patch_speed_threshold_m_s)
+    )
+    return metrics, bool(settle_ok)
 
 
 def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -876,20 +966,27 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
 
     endpoint_indices = _rope_endpoints(edges, n_obj, x0)
     endpoint_mid = 0.5 * (x0[int(endpoint_indices[0])] + x0[int(endpoint_indices[1])])
+    if drop_release_task:
+        support_patch_indices = _select_drop_support_patch_indices(
+            x0[:n_obj],
+            count=int(args.drop_support_patch_count),
+        )
+        support_patch_center = np.mean(x0[support_patch_indices], axis=0).astype(np.float32, copy=False)
+    else:
+        support_patch_indices = np.empty((0,), dtype=np.int32)
+        support_patch_center = endpoint_mid.astype(np.float32, copy=False)
     shift = np.array(
         [
-            -float(endpoint_mid[0]),
-            -float(endpoint_mid[1]),
-            float(args.anchor_height) - float(endpoint_mid[2]),
+            -float(support_patch_center[0] if drop_release_task else endpoint_mid[0]),
+            -float(support_patch_center[1] if drop_release_task else endpoint_mid[1]),
+            float(args.anchor_height) - float(support_patch_center[2] if drop_release_task else endpoint_mid[2]),
         ],
         dtype=np.float32,
     )
     shifted_q = x0 + shift
     rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
     if drop_release_task:
-        anchor_indices = _anchor_particle_indices(
-            shifted_q, endpoint_indices=endpoint_indices, count_per_end=int(args.anchor_count_per_end)
-        )
+        anchor_indices = support_patch_indices.astype(np.int32, copy=False)
         anchor_positions = shifted_q[anchor_indices].astype(np.float32, copy=False)
     else:
         anchor_indices = _anchor_particle_indices(
@@ -931,7 +1028,9 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         if (not drop_release_task) and str(args.anchor_mass_mode) == "zero":
             builder.particle_mass[idx] = 0.0
 
-    robot_base_pos = rope_center + np.asarray(args.robot_base_offset, dtype=np.float32)
+    support_patch_center_shifted = np.mean(anchor_positions, axis=0).astype(np.float32, copy=False) if anchor_positions.size else rope_center
+    robot_reference_point = support_patch_center_shifted if drop_release_task else rope_center
+    robot_base_pos = robot_reference_point + np.asarray(args.robot_base_offset, dtype=np.float32)
     franka_asset = newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf"
     builder.add_urdf(
         franka_asset,
@@ -960,12 +1059,12 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     ee_offset_local = np.asarray([0.0, 0.0, 0.22], dtype=np.float32)
     floor_z = 0.0
     if drop_release_task:
-        support_anchor_center = np.asarray(rope_center, dtype=np.float32)
+        support_anchor_center = support_patch_center_shifted.astype(np.float32, copy=False)
         support_point = np.asarray(
             [
-                float(support_anchor_center[0] + 0.045),
+                float(support_anchor_center[0]),
                 float(support_anchor_center[1]),
-                float(support_anchor_center[2] + 0.10),
+                float(support_anchor_center[2] + 0.015),
             ],
             dtype=np.float32,
         )
@@ -973,15 +1072,15 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             [
                 float(support_anchor_center[0]),
                 float(support_anchor_center[1]),
-                float(max(support_anchor_center[2] + 0.14, floor_z + 0.18)),
+                float(max(support_anchor_center[2] + 0.025, floor_z + 0.18)),
             ],
             dtype=np.float32,
         )
         anchor_bar_scale = np.asarray(
             [
-                0.028,
-                0.12,
-                0.020,
+                max(0.012, 0.5 * float(np.max(anchor_positions[:, 0]) - np.min(anchor_positions[:, 0])) + 0.015),
+                max(0.028, 0.5 * float(np.max(anchor_positions[:, 1]) - np.min(anchor_positions[:, 1])) + 0.020),
+                0.010,
             ],
             dtype=np.float32,
         )
@@ -1135,6 +1234,9 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "endpoint_indices": endpoint_indices.astype(np.int32),
         "anchor_indices": anchor_indices.astype(np.int32),
         "anchor_positions": shifted_q[anchor_indices].astype(np.float32),
+        "support_patch_indices": anchor_indices.astype(np.int32),
+        "support_patch_center_m": support_patch_center_shifted.astype(np.float32),
+        "visible_support_center_m": support_patch_center_shifted.astype(np.float32),
         "rope_center": rope_center.astype(np.float32),
         "render_edges": render_edges,
         "particle_contacts": bool(particle_contacts),
@@ -1231,6 +1333,12 @@ def simulate(
     frame_dt = sim_dt * float(substeps)
     release_triggered = False
     anchor_indices = np.asarray(meta.get("anchor_indices", np.empty((0,), dtype=np.int32)), dtype=np.int32)
+    settle_window_frames = max(1, int(np.ceil(float(args.settle_window_seconds) / max(frame_dt, 1.0e-12))))
+    release_frame_actual = None
+    release_time_actual = None
+    settle_gate_pass = None
+    settle_gate_frame = None
+    settle_gate_metrics: dict[str, Any] | None = None
     replay = None
     if str(args.robot_motion_mode) == "replay":
         if args.replay_source is None:
@@ -1246,6 +1354,94 @@ def simulate(
     body_q = store.allocate("body_q", (n_frames, body_q0.shape[0], body_q0.shape[1]), np.float32)
     body_vel = store.allocate("body_vel", (n_frames, body_qd0.shape[0], 3), np.float32)
     ee_target_pos = store.allocate("ee_target_pos", (n_frames, 3), np.float32)
+    particle_speed_mean_series = np.zeros((n_frames,), dtype=np.float32)
+    support_patch_speed_mean_series = np.zeros((n_frames,), dtype=np.float32)
+    rope_com_horizontal_speed_series = np.zeros((n_frames,), dtype=np.float32)
+    rope_com_vertical_speed_series = np.zeros((n_frames,), dtype=np.float32)
+    rope_spring_energy_proxy_series = np.zeros((n_frames,), dtype=np.float32)
+    support_patch_center_series = np.zeros((n_frames, 3), dtype=np.float32)
+    prev_q_obj = None
+    prev_rope_com = None
+    spring_edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
+    spring_rest = np.asarray(ir_obj.get("spring_rest_length", ir_obj.get("spring_rest_lengths", np.zeros((spring_edges.shape[0],), dtype=np.float32))), dtype=np.float32).reshape(-1)
+    if spring_rest.shape[0] != spring_edges.shape[0]:
+        spring_rest = np.zeros((spring_edges.shape[0],), dtype=np.float32)
+    preroll_settle_pass = None
+    preroll_settle_time_s = None
+    preroll_settle_metrics = None
+    preroll_frame_count = 0
+
+    if drop_release_task and float(args.drop_preroll_settle_seconds) > 0.0:
+        preroll_max_frames = max(1, int(np.ceil(float(args.drop_preroll_settle_seconds) / max(frame_dt, 1.0e-12))))
+        preroll_particle_speed = np.zeros((preroll_max_frames,), dtype=np.float32)
+        preroll_support_speed = np.zeros((preroll_max_frames,), dtype=np.float32)
+        preroll_com_h_speed = np.zeros((preroll_max_frames,), dtype=np.float32)
+        prev_q_obj_preroll = None
+        prev_rope_com_preroll = None
+        for preroll_frame in range(preroll_max_frames):
+            q_obj_preroll = state_in.particle_q.numpy().astype(np.float32)[:n_obj]
+            rope_com_preroll = np.mean(q_obj_preroll, axis=0).astype(np.float32, copy=False)
+            if prev_q_obj_preroll is not None:
+                qd_preroll = (q_obj_preroll - prev_q_obj_preroll) / max(frame_dt, 1.0e-12)
+                preroll_particle_speed[preroll_frame] = float(np.mean(np.linalg.norm(qd_preroll, axis=1)))
+                if anchor_indices.size:
+                    preroll_support_speed[preroll_frame] = float(np.mean(np.linalg.norm(qd_preroll[anchor_indices], axis=1)))
+                com_vel_preroll = (rope_com_preroll - prev_rope_com_preroll) / max(frame_dt, 1.0e-12)
+                preroll_com_h_speed[preroll_frame] = float(np.linalg.norm(com_vel_preroll[:2]))
+            prev_q_obj_preroll = q_obj_preroll.copy()
+            prev_rope_com_preroll = rope_com_preroll.copy()
+
+            preroll_settle_metrics, preroll_ok = _settle_window_metrics_from_series(
+                preroll_particle_speed,
+                preroll_com_h_speed,
+                preroll_support_speed,
+                frame_idx=preroll_frame,
+                window_frames=settle_window_frames,
+                particle_speed_threshold_m_s=float(args.pre_release_particle_speed_mean_max),
+                com_horizontal_speed_threshold_m_s=float(args.pre_release_com_horizontal_speed_max),
+                support_patch_speed_threshold_m_s=float(args.pre_release_support_speed_mean_max),
+                frame_dt=float(frame_dt),
+            )
+            preroll_frame_count = int(preroll_frame + 1)
+            if preroll_ok:
+                preroll_settle_pass = True
+                preroll_settle_time_s = float(preroll_frame * frame_dt)
+                break
+
+            for _ in range(substeps):
+                state_in.clear_forces()
+                if contacts is not None:
+                    model.collide(state_in, contacts)
+                solver.step(state_in, state_out, None, contacts, sim_dt)
+                state_out.joint_q.assign(prev_joint_q)
+                state_out.joint_qd.zero_()
+                newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                state_in, state_out = state_out, state_in
+                if drag > 0.0:
+                    if gravity_axis is not None:
+                        wp.launch(
+                            _apply_drag_correction_ignore_axis,
+                            dim=n_obj,
+                            inputs=[
+                                state_in.particle_q,
+                                state_in.particle_qd,
+                                n_obj,
+                                sim_dt,
+                                drag,
+                                wp.vec3(*gravity_axis.tolist()),
+                            ],
+                            device=device,
+                        )
+                    else:
+                        wp.launch(
+                            newton_import_ir._apply_drag_correction,
+                            dim=n_obj,
+                            inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, drag],
+                            device=device,
+                        )
+        if preroll_settle_pass is None:
+            preroll_settle_pass = False
+            preroll_settle_time_s = float(preroll_frame_count * frame_dt)
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
@@ -1255,6 +1451,24 @@ def simulate(
         q = state_in.particle_q.numpy().astype(np.float32)
         particle_q_all[frame] = q
         particle_q_object[frame] = q[:n_obj]
+        q_obj = particle_q_object[frame]
+        rope_com_frame = np.mean(q_obj, axis=0).astype(np.float32, copy=False)
+        support_patch_center_series[frame] = np.mean(q_obj[anchor_indices], axis=0).astype(np.float32, copy=False)
+        if prev_q_obj is not None:
+            qd_frame = (q_obj - prev_q_obj) / max(frame_dt, 1.0e-12)
+            particle_speed_mean_series[frame] = float(np.mean(np.linalg.norm(qd_frame, axis=1)))
+            if anchor_indices.size:
+                support_patch_speed_mean_series[frame] = float(np.mean(np.linalg.norm(qd_frame[anchor_indices], axis=1)))
+            com_vel = (rope_com_frame - prev_rope_com) / max(frame_dt, 1.0e-12)
+            rope_com_horizontal_speed_series[frame] = float(np.linalg.norm(com_vel[:2]))
+            rope_com_vertical_speed_series[frame] = float(com_vel[2])
+        if spring_edges.size:
+            edge_vec = q_obj[spring_edges[:, 0]] - q_obj[spring_edges[:, 1]]
+            edge_len = np.linalg.norm(edge_vec, axis=1)
+            stretch = edge_len - spring_rest
+            rope_spring_energy_proxy_series[frame] = float(np.mean(stretch * stretch))
+        prev_q_obj = q_obj.copy()
+        prev_rope_com = rope_com_frame.copy()
         body_q[frame] = state_in.body_q.numpy().astype(np.float32)
         body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
         if replay is not None:
@@ -1268,16 +1482,36 @@ def simulate(
             sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
             phase_name, _, _ = _task_phase_state(sim_t, meta)
             if drop_release_task and (not release_triggered) and phase_name in {"release", "free_fall"}:
-                _activate_particle_indices(model, anchor_indices, device=device)
-                if anchor_indices.size and state_in.particle_qd is not None:
-                    qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=True)
-                    qd_np[anchor_indices] = 0.0
-                    state_in.particle_qd.assign(qd_np)
-                if anchor_indices.size and state_out.particle_qd is not None:
-                    qd_np = state_out.particle_qd.numpy().astype(np.float32, copy=True)
-                    qd_np[anchor_indices] = 0.0
-                    state_out.particle_qd.assign(qd_np)
-                release_triggered = True
+                settle_gate_metrics, settle_ok = _settle_window_metrics_from_series(
+                    particle_speed_mean_series,
+                    rope_com_horizontal_speed_series,
+                    support_patch_speed_mean_series,
+                    frame_idx=frame,
+                    window_frames=settle_window_frames,
+                    particle_speed_threshold_m_s=float(args.pre_release_particle_speed_mean_max),
+                    com_horizontal_speed_threshold_m_s=float(args.pre_release_com_horizontal_speed_max),
+                    support_patch_speed_threshold_m_s=float(args.pre_release_support_speed_mean_max),
+                    frame_dt=float(frame_dt),
+                )
+                if settle_ok:
+                    _activate_particle_indices(model, anchor_indices, device=device)
+                    if anchor_indices.size and state_in.particle_qd is not None:
+                        qd_np = state_in.particle_qd.numpy().astype(np.float32, copy=True)
+                        qd_np[anchor_indices] = 0.0
+                        state_in.particle_qd.assign(qd_np)
+                    if anchor_indices.size and state_out.particle_qd is not None:
+                        qd_np = state_out.particle_qd.numpy().astype(np.float32, copy=True)
+                        qd_np[anchor_indices] = 0.0
+                        state_out.particle_qd.assign(qd_np)
+                    release_triggered = True
+                    release_frame_actual = int(frame)
+                    release_time_actual = float(frame * frame_dt)
+                    settle_gate_pass = True
+                    settle_gate_frame = int(frame)
+                else:
+                    if settle_gate_pass is None:
+                        settle_gate_pass = False
+                        settle_gate_frame = int(frame)
             if replay is not None:
                 body_q_frame = replay["body_q"][frame]
                 body_qd_frame = replay["body_qd"][frame]
@@ -1293,7 +1527,7 @@ def simulate(
                 blend = float(np.clip(float(args.ik_target_blend), 0.0, 1.0))
                 if blend < 1.0:
                     joint_target_np = prev_joint_q + blend * (joint_target_np - prev_joint_q)
-                if drop_release_task and phase_name in {"approach_support", "support_hold"}:
+                if drop_release_task and (not release_triggered):
                     joint_target_np[7:9] = float(args.gripper_hold)
                 else:
                     joint_target_np[7:9] = float(args.gripper_open)
@@ -1351,6 +1585,21 @@ def simulate(
         "body_q": body_q,
         "body_vel": body_vel,
         "ee_target_pos": ee_target_pos,
+        "particle_speed_mean_series": particle_speed_mean_series,
+        "support_patch_speed_mean_series": support_patch_speed_mean_series,
+        "rope_com_horizontal_speed_series": rope_com_horizontal_speed_series,
+        "rope_com_vertical_speed_series": rope_com_vertical_speed_series,
+        "rope_spring_energy_proxy_series": rope_spring_energy_proxy_series,
+        "support_patch_center_series": support_patch_center_series,
+        "release_frame_actual": release_frame_actual,
+        "release_time_actual": release_time_actual,
+        "settle_gate_pass": settle_gate_pass,
+        "settle_gate_frame": settle_gate_frame,
+        "settle_gate_metrics": settle_gate_metrics,
+        "preroll_settle_pass": preroll_settle_pass,
+        "preroll_settle_time_s": preroll_settle_time_s,
+        "preroll_settle_metrics": preroll_settle_metrics,
+        "preroll_frame_count": preroll_frame_count,
         "robot_motion_mode": str(args.robot_motion_mode),
         "replay_source": (None if replay is None else str(replay["source_dir"])),
         "sim_dt": float(sim_dt),
@@ -1754,6 +2003,11 @@ def build_summary(
     mid_segment_indices = np.asarray(meta["mid_segment_indices"], dtype=np.int32)
     mid_segment_z = particle_q[:, mid_segment_indices, 2].mean(axis=1)
     frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+    particle_speed_mean_series = np.asarray(sim_data.get("particle_speed_mean_series"), dtype=np.float32)
+    support_patch_speed_mean_series = np.asarray(sim_data.get("support_patch_speed_mean_series"), dtype=np.float32)
+    rope_com_horizontal_speed_series = np.asarray(sim_data.get("rope_com_horizontal_speed_series"), dtype=np.float32)
+    rope_com_vertical_speed_series = np.asarray(sim_data.get("rope_com_vertical_speed_series"), dtype=np.float32)
+    rope_spring_energy_proxy_series = np.asarray(sim_data.get("rope_spring_energy_proxy_series"), dtype=np.float32)
     phase_names = [str(_task_phase_state(float(i) * frame_dt, meta)[0]) for i in range(particle_q.shape[0])]
     pre_frames = [i for i, name in enumerate(phase_names) if name == "pre_approach"]
     baseline_z = float(np.mean(mid_segment_z[pre_frames])) if pre_frames else float(mid_segment_z[0])
@@ -1818,6 +2072,11 @@ def build_summary(
                 if window.size and not np.any(window):
                     release_frame = int(idx)
                     break
+    actual_release_frame = sim_data.get("release_frame_actual")
+    if isinstance(actual_release_frame, (int, np.integer)):
+        release_frame = int(actual_release_frame)
+    elif drop_release_task:
+        release_frame = None
 
     pre_contact_mask = np.asarray([name == "pre_approach" for name in phase_names], dtype=bool)
     release_mask = np.asarray([name in {"release", "release_retract"} for name in phase_names], dtype=bool)
@@ -1878,6 +2137,32 @@ def build_summary(
             max(0.0, (rope_com[first_contact_frame - 1, 2] - rope_com[first_contact_frame, 2]) / max(frame_dt, 1.0e-12))
         )
 
+    settle_gate_metrics = sim_data.get("settle_gate_metrics") or {}
+    settle_gate_pass = sim_data.get("settle_gate_pass")
+    settle_gate_frame = sim_data.get("settle_gate_frame")
+    release_time_s = (None if release_frame is None else float(release_frame * frame_dt))
+    post_release_kick_window_frames = max(1, int(np.ceil(float(args.post_release_kick_window_seconds) / max(frame_dt, 1.0e-12))))
+    post_release_horizontal_kick = None
+    early_fall_horizontal_velocity = None
+    pre_release_spring_energy_proxy = None
+    post_release_spring_energy_proxy = None
+    if release_frame is not None and rope_com_horizontal_speed_series.size:
+        kick_slice = rope_com_horizontal_speed_series[
+            release_frame : min(len(rope_com_horizontal_speed_series), release_frame + post_release_kick_window_frames)
+        ]
+        if kick_slice.size:
+            post_release_horizontal_kick = float(np.mean(kick_slice))
+            early_fall_horizontal_velocity = float(kick_slice[0])
+    if release_frame is not None and rope_spring_energy_proxy_series.size:
+        pre_slice = rope_spring_energy_proxy_series[max(0, release_frame - post_release_kick_window_frames) : release_frame]
+        post_slice = rope_spring_energy_proxy_series[
+            release_frame : min(len(rope_spring_energy_proxy_series), release_frame + post_release_kick_window_frames)
+        ]
+        if pre_slice.size:
+            pre_release_spring_energy_proxy = float(np.mean(pre_slice))
+        if post_slice.size:
+            post_release_spring_energy_proxy = float(np.mean(post_slice))
+
     return {
         "ir_path": str(args.ir.resolve()),
         "output_mp4": str(out_mp4),
@@ -1931,6 +2216,9 @@ def build_summary(
         "support_contact_peak_frame": support_contact_peak_frame,
         "support_contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
         "support_contact_proxy_counts": support_source_counts,
+        "support_patch_indices": np.asarray(meta.get("support_patch_indices", meta["anchor_indices"]), dtype=np.int32).astype(int).tolist(),
+        "support_patch_center_m": np.asarray(meta.get("support_patch_center_m", meta["anchor_positions"].mean(axis=0)), dtype=np.float32).astype(float).tolist(),
+        "visible_support_center_m": np.asarray(meta.get("visible_support_center_m", meta["anchor_positions"].mean(axis=0)), dtype=np.float32).astype(float).tolist(),
         "contact_proxy_mode": (
             "rope_surface_vs_ground_plane" if drop_release_task else "min(gripper_center,left_finger,right_finger,finger_span)"
         ),
@@ -1957,14 +2245,36 @@ def build_summary(
         "first_contact_phase": first_contact_phase,
         "contact_peak_frame": contact_peak_frame,
         "release_frame": release_frame,
-        "release_time_s": (None if release_frame is None else float(release_frame * frame_dt)),
-        "t_release_s": (None if release_frame is None else float(release_frame * frame_dt)),
+        "release_time_s": release_time_s,
+        "t_release_s": release_time_s,
         "impact_speed_before_first_contact_m_s": impact_speed_estimate,
         "early_fall_acceleration_estimate_m_s2": early_fall_accel_estimate,
+        "early_fall_com_horizontal_velocity_m_s": early_fall_horizontal_velocity,
+        "post_release_horizontal_kick_window_s": float(args.post_release_kick_window_seconds),
+        "post_release_horizontal_kick_m_s": post_release_horizontal_kick,
         "contact_duration_s": contact_duration_s,
         "contact_active_frames": int(len(contact_frames)),
         "contact_phase_count": int(np.count_nonzero(contact_mask)),
         "task_phase_sequence": unique_phase_sequence,
+        "rope_com_horizontal_speed_mean_pre_release_m_s": (
+            None if release_frame is None or rope_com_horizontal_speed_series.size == 0 else float(np.mean(rope_com_horizontal_speed_series[:release_frame]))
+        ),
+        "rope_particle_speed_mean_pre_release_m_s": (
+            None if release_frame is None or particle_speed_mean_series.size == 0 else float(np.mean(particle_speed_mean_series[:release_frame]))
+        ),
+        "support_patch_speed_mean_pre_release_m_s": (
+            None if release_frame is None or support_patch_speed_mean_series.size == 0 else float(np.mean(support_patch_speed_mean_series[:release_frame]))
+        ),
+        "pre_release_spring_energy_proxy": pre_release_spring_energy_proxy,
+        "post_release_spring_energy_proxy": post_release_spring_energy_proxy,
+        "settle_window_seconds": float(args.settle_window_seconds),
+        "settle_gate_pass": settle_gate_pass,
+        "settle_gate_frame": settle_gate_frame,
+        "settle_gate_metrics": settle_gate_metrics,
+        "preroll_settle_pass": sim_data.get("preroll_settle_pass"),
+        "preroll_settle_time_s": sim_data.get("preroll_settle_time_s"),
+        "preroll_settle_metrics": sim_data.get("preroll_settle_metrics"),
+        "preroll_frame_count": sim_data.get("preroll_frame_count"),
         "min_clearance_min_m": float(np.min(primary_clearance)),
         "min_clearance_final_m": float(primary_clearance[-1]),
         "gripper_center_clearance_min_m": float(np.min(gripper_center_clearance_np)),
