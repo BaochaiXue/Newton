@@ -160,6 +160,19 @@ FRANKA_INIT_Q = np.asarray(
     dtype=np.float32,
 )
 
+TABLETOP_FRANKA_Q_PRE = np.asarray(
+    [-0.068, 0.617, 0.308, -2.188, -0.574, 2.691, 0.287, 0.04, 0.04],
+    dtype=np.float32,
+)
+TABLETOP_FRANKA_Q_PUSH_START = np.asarray(
+    [0.374, 0.834, 0.036, -1.997, -0.040, 2.518, 0.528, 0.04, 0.04],
+    dtype=np.float32,
+)
+TABLETOP_FRANKA_Q_PUSH_END = np.asarray(
+    [-0.105, 0.980, 0.332, -1.779, 0.577, 2.578, 1.363, 0.04, 0.04],
+    dtype=np.float32,
+)
+
 
 def _default_rope_ir() -> Path:
     return BRIDGE_ROOT / "ir" / "rope_double_hand" / "phystwin_ir_v2_bf_strict.npz"
@@ -205,6 +218,12 @@ def parse_args() -> argparse.Namespace:
             "`replay` replays a native-robot body trajectory from a prior validated run "
             "while keeping the rope in the semi-implicit simulation."
         ),
+    )
+    p.add_argument(
+        "--tabletop-control-mode",
+        choices=["ik", "joint_trajectory"],
+        default="ik",
+        help="Controller used only for tabletop_push_hero. `ik` is the default meeting-facing path; `joint_trajectory` replays a fixed native Franka joint-space waypoint sequence.",
     )
     p.add_argument(
         "--ik-target-blend",
@@ -662,6 +681,21 @@ def _gripper_center_world_position(body_q: np.ndarray, left_finger_idx: int, rig
     left = body_q[int(left_finger_idx), :3]
     right = body_q[int(right_finger_idx), :3]
     return 0.5 * (left + right)
+
+
+def _fk_gripper_center_from_joint_q(
+    model: newton.Model,
+    joint_q_row: np.ndarray,
+    *,
+    left_finger_idx: int,
+    right_finger_idx: int,
+) -> np.ndarray:
+    state = model.state()
+    state.joint_q.assign(np.asarray(joint_q_row, dtype=np.float32))
+    state.joint_qd.zero_()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    body_q = state.body_q.numpy().astype(np.float32)
+    return _gripper_center_world_position(body_q, left_finger_idx, right_finger_idx)
 
 
 def _quat_relative(q_curr: np.ndarray, q_prev: np.ndarray) -> np.ndarray:
@@ -1236,6 +1270,31 @@ def _task_phase_state(t: float, meta: dict[str, Any]) -> tuple[str, np.ndarray, 
     return str(last["name"]), np.asarray(last["end"], dtype=np.float32), np.asarray(last["quat"], dtype=np.float32)
 
 
+def _tabletop_joint_phase_waypoints() -> list[dict[str, Any]]:
+    return [
+        {"name": "settle", "start_q": TABLETOP_FRANKA_Q_PRE.copy(), "end_q": TABLETOP_FRANKA_Q_PRE.copy()},
+        {"name": "approach", "start_q": TABLETOP_FRANKA_Q_PRE.copy(), "end_q": TABLETOP_FRANKA_Q_PUSH_START.copy()},
+        {"name": "push", "start_q": TABLETOP_FRANKA_Q_PUSH_START.copy(), "end_q": TABLETOP_FRANKA_Q_PUSH_END.copy()},
+        {"name": "hold", "start_q": TABLETOP_FRANKA_Q_PUSH_END.copy(), "end_q": TABLETOP_FRANKA_Q_PUSH_END.copy()},
+        {"name": "retract", "start_q": TABLETOP_FRANKA_Q_PUSH_END.copy(), "end_q": TABLETOP_FRANKA_Q_PRE.copy()},
+    ]
+
+
+def _joint_phase_state(t: float, meta: dict[str, Any]) -> tuple[str, np.ndarray]:
+    phases = meta["joint_task_phases"]
+    elapsed = 0.0
+    for phase in phases:
+        duration = max(float(phase["duration"]), 1.0e-8)
+        end_t = elapsed + duration
+        if t <= end_t:
+            alpha = 0.0 if np.allclose(phase["start_q"], phase["end_q"]) else np.clip((t - elapsed) / duration, 0.0, 1.0)
+            q = (1.0 - alpha) * np.asarray(phase["start_q"], dtype=np.float32) + alpha * np.asarray(phase["end_q"], dtype=np.float32)
+            return str(phase["name"]), q.astype(np.float32, copy=False)
+        elapsed = end_t
+    last = phases[-1]
+    return str(last["name"]), np.asarray(last["end_q"], dtype=np.float32)
+
+
 def _find_index_by_suffix(labels: list[str], suffix: str) -> int:
     for idx, label in enumerate(labels):
         if label.endswith(suffix):
@@ -1247,6 +1306,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     raw_ir = load_ir(args.ir)
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
+    tabletop_joint_mode = tabletop_task and str(args.tabletop_control_mode) == "joint_trajectory"
     _validate_scaling_args(args)
     _maybe_autoset_mass_spring_scale(args, raw_ir)
     ir_obj = _copy_object_only_ir(raw_ir, args)
@@ -1347,8 +1407,9 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         force_show_colliders=False,
     )
 
-    builder.joint_q[:9] = FRANKA_INIT_Q.tolist()
-    builder.joint_target_pos[:9] = FRANKA_INIT_Q.tolist()
+    robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_joint_mode else FRANKA_INIT_Q.copy()
+    builder.joint_q[:9] = robot_joint_init.tolist()
+    builder.joint_target_pos[:9] = robot_joint_init.tolist()
     builder.joint_target_ke[:7] = [float(args.joint_target_ke)] * 7
     builder.joint_target_kd[:7] = [float(args.joint_target_kd)] * 7
     builder.joint_target_ke[7:9] = [float(args.finger_target_ke)] * 2
@@ -1581,7 +1642,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     model.set_gravity(gravity_vec)
     init_state = model.state()
-    init_state.joint_q.assign(FRANKA_INIT_Q.astype(np.float32))
+    init_state.joint_q.assign(robot_joint_init.astype(np.float32))
     init_state.joint_qd.zero_()
     newton.eval_fk(model, init_state.joint_q, init_state.joint_qd, init_state)
     init_body_q = init_state.body_q.numpy().astype(np.float32)
@@ -1634,7 +1695,21 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "floor_scale": floor_scale.astype(np.float32),
         "floor_z": float(floor_z),
         "camera_presets": camera_presets,
-        "joint_q_init": FRANKA_INIT_Q.astype(np.float32),
+        "joint_q_init": robot_joint_init.astype(np.float32),
+        "tabletop_control_mode": str(args.tabletop_control_mode) if tabletop_task else None,
+        "joint_task_phases": (
+            [
+                {
+                    "name": pos_phase["name"],
+                    "duration": pos_phase["duration"],
+                    "start_q": joint_phase["start_q"],
+                    "end_q": joint_phase["end_q"],
+                }
+                for pos_phase, joint_phase in zip(task_phases, _tabletop_joint_phase_waypoints(), strict=True)
+            ]
+            if tabletop_joint_mode
+            else None
+        ),
         "endpoint_indices": endpoint_indices.astype(np.int32),
         "anchor_indices": anchor_indices.astype(np.int32),
         "anchor_positions": shifted_q[anchor_indices].astype(np.float32),
@@ -1671,6 +1746,7 @@ def simulate(
 ) -> dict[str, Any]:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
+    tabletop_joint_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_trajectory"
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
@@ -1726,29 +1802,34 @@ def simulate(
     if bool(args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
         gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
 
-    ik_joint_q = wp.array(np.asarray(meta["joint_q_init"], dtype=np.float32).reshape(1, -1), dtype=wp.float32, device=device)
-    pos_obj = ik.IKObjectivePosition(
-        link_index=int(meta["ee_body_index"]),
-        link_offset=wp.vec3(*np.asarray(meta["ee_offset_local"], dtype=np.float32).tolist()),
-        target_positions=wp.array([wp.vec3(*np.asarray(meta["ee_target_start"], dtype=np.float32).tolist())], dtype=wp.vec3, device=device),
-    )
-    rot_obj = ik.IKObjectiveRotation(
-        link_index=int(meta["ee_body_index"]),
-        link_offset_rotation=wp.quat_identity(),
-        target_rotations=wp.array([wp.vec4(*np.asarray(meta["ee_target_quat"], dtype=np.float32).tolist())], dtype=wp.vec4, device=device),
-    )
-    joint_limit_obj = ik.IKObjectiveJointLimit(
-        joint_limit_lower=model.joint_limit_lower,
-        joint_limit_upper=model.joint_limit_upper,
-        weight=10.0,
-    )
-    ik_solver = ik.IKSolver(
-        model=model,
-        n_problems=1,
-        objectives=[pos_obj, rot_obj, joint_limit_obj],
-        lambda_initial=0.1,
-        jacobian_mode=ik.IKJacobianType.ANALYTIC,
-    )
+    ik_joint_q = None
+    pos_obj = None
+    rot_obj = None
+    ik_solver = None
+    if not tabletop_joint_mode:
+        ik_joint_q = wp.array(np.asarray(meta["joint_q_init"], dtype=np.float32).reshape(1, -1), dtype=wp.float32, device=device)
+        pos_obj = ik.IKObjectivePosition(
+            link_index=int(meta["ee_body_index"]),
+            link_offset=wp.vec3(*np.asarray(meta["ee_offset_local"], dtype=np.float32).tolist()),
+            target_positions=wp.array([wp.vec3(*np.asarray(meta["ee_target_start"], dtype=np.float32).tolist())], dtype=wp.vec3, device=device),
+        )
+        rot_obj = ik.IKObjectiveRotation(
+            link_index=int(meta["ee_body_index"]),
+            link_offset_rotation=wp.quat_identity(),
+            target_rotations=wp.array([wp.vec4(*np.asarray(meta["ee_target_quat"], dtype=np.float32).tolist())], dtype=wp.vec4, device=device),
+        )
+        joint_limit_obj = ik.IKObjectiveJointLimit(
+            joint_limit_lower=model.joint_limit_lower,
+            joint_limit_upper=model.joint_limit_upper,
+            weight=10.0,
+        )
+        ik_solver = ik.IKSolver(
+            model=model,
+            n_problems=1,
+            objectives=[pos_obj, rot_obj, joint_limit_obj],
+            lambda_initial=0.1,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
 
     n_frames = max(2, int(args.frames))
     frame_dt = sim_dt * float(substeps)
@@ -1775,6 +1856,7 @@ def simulate(
     body_q = store.allocate("body_q", (n_frames, body_q0.shape[0], body_q0.shape[1]), np.float32)
     body_vel = store.allocate("body_vel", (n_frames, body_qd0.shape[0], 3), np.float32)
     ee_target_pos = store.allocate("ee_target_pos", (n_frames, 3), np.float32)
+    particle_radius = model.particle_radius.numpy().astype(np.float32)[:n_obj]
     particle_speed_mean_series = np.zeros((n_frames,), dtype=np.float32)
     support_patch_speed_mean_series = np.zeros((n_frames,), dtype=np.float32)
     rope_com_horizontal_speed_series = np.zeros((n_frames,), dtype=np.float32)
@@ -1808,6 +1890,9 @@ def simulate(
         prev_rope_com_preroll = None
         preroll_target_pos = np.asarray(meta["task_phases"][0]["end"], dtype=np.float32)
         preroll_target_quat = np.asarray(meta["ee_target_quat"], dtype=np.float32)
+        tabletop_preroll_joint_q = None
+        if tabletop_joint_mode:
+            _, tabletop_preroll_joint_q = _joint_phase_state(0.0, meta)
         for preroll_frame in range(preroll_max_frames):
             q_obj_preroll = state_in.particle_q.numpy().astype(np.float32)[:n_obj]
             rope_com_preroll = np.mean(q_obj_preroll, axis=0).astype(np.float32, copy=False)
@@ -1853,7 +1938,15 @@ def simulate(
 
             for _ in range(substeps):
                 state_in.clear_forces()
-                if tabletop_task:
+                if tabletop_joint_mode:
+                    joint_target_np = np.asarray(tabletop_preroll_joint_q, dtype=np.float32).copy()
+                    joint_target_np[7:9] = float(args.gripper_open)
+                    joint_target_qd = np.zeros_like(joint_target_np, dtype=np.float32)
+                    prev_joint_q = joint_target_np.copy()
+                    state_in.joint_q.assign(joint_target_np)
+                    state_in.joint_qd.assign(joint_target_qd)
+                    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+                elif tabletop_task:
                     pos_obj.set_target_position(0, wp.vec3(*preroll_target_pos.tolist()))
                     rot_obj.set_target_rotation(0, wp.vec4(*preroll_target_quat.tolist()))
                     ik_solver.step(ik_joint_q, ik_joint_q, iterations=int(args.ik_iters))
@@ -1870,7 +1963,11 @@ def simulate(
                 if contacts is not None:
                     model.collide(state_in, contacts)
                 solver.step(state_in, state_out, None, contacts, sim_dt)
-                if tabletop_task:
+                if tabletop_joint_mode:
+                    state_out.joint_q.assign(joint_target_np)
+                    state_out.joint_qd.assign(joint_target_qd)
+                    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                elif tabletop_task:
                     state_out.joint_q.assign(joint_target_np)
                     state_out.joint_qd.assign(joint_target_qd)
                     newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
@@ -1936,9 +2033,39 @@ def simulate(
         body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
         if replay is not None:
             ee_target_pos[frame] = replay["ee_target_pos"][frame]
+        elif tabletop_joint_mode:
+            _, joint_target_frame = _joint_phase_state(float(frame) * frame_dt, meta)
+            joint_target_frame = np.asarray(joint_target_frame, dtype=np.float32).copy()
+            joint_target_frame[7:9] = float(args.gripper_open)
+            ee_target_pos[frame] = _fk_gripper_center_from_joint_q(
+                model,
+                joint_target_frame,
+                left_finger_idx=int(meta["left_finger_index"]),
+                right_finger_idx=int(meta["right_finger_index"]),
+            )
         else:
             _, target_pos_frame, _ = _task_phase_state(float(frame) * frame_dt, meta)
             ee_target_pos[frame] = target_pos_frame
+
+        frame_tracking_err = None
+        frame_clearance = None
+        if tabletop_task:
+            frame_gripper_center = _gripper_center_world_position(
+                body_q[frame],
+                int(meta["left_finger_index"]),
+                int(meta["right_finger_index"]),
+            )
+            frame_tracking_err = float(np.linalg.norm(frame_gripper_center - ee_target_pos[frame]))
+            frame_clearance, _, _ = _min_gripper_proxy_clearance(
+                q_obj,
+                particle_radius,
+                {
+                    "gripper_center": frame_gripper_center,
+                    "left_finger": body_q[frame, int(meta["left_finger_index"]), :3],
+                    "right_finger": body_q[frame, int(meta["right_finger_index"]), :3],
+                },
+                float(args.ee_contact_radius),
+            )
 
         for sub in range(substeps):
             state_in.clear_forces()
@@ -1980,6 +2107,16 @@ def simulate(
                 body_qd_frame = replay["body_qd"][frame]
                 state_in.body_q.assign(body_q_frame)
                 state_in.body_qd.assign(body_qd_frame)
+            elif tabletop_joint_mode:
+                _, joint_target_np = _joint_phase_state(sim_t, meta)
+                joint_target_np = np.asarray(joint_target_np, dtype=np.float32).copy()
+                joint_target_np[7:9] = float(args.gripper_open)
+                joint_target_qd = (joint_target_np - prev_joint_q) / sim_dt
+                prev_joint_q = joint_target_np.copy()
+
+                state_in.joint_q.assign(joint_target_np)
+                state_in.joint_qd.assign(joint_target_qd)
+                newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             else:
                 _, target_pos, target_quat = _task_phase_state(sim_t, meta)
                 pos_obj.set_target_position(0, wp.vec3(*target_pos.tolist()))
@@ -2006,6 +2143,10 @@ def simulate(
             if replay is not None:
                 state_out.body_q.assign(body_q_frame)
                 state_out.body_qd.assign(body_qd_frame)
+            elif tabletop_joint_mode:
+                state_out.joint_q.assign(joint_target_np)
+                state_out.joint_qd.assign(joint_target_qd)
+                newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
             else:
                 state_out.joint_q.assign(joint_target_np)
                 state_out.joint_qd.assign(joint_target_qd)
@@ -2043,8 +2184,18 @@ def simulate(
                         device=device,
                     )
 
-        if (frame + 1) % 50 == 0 or frame == n_frames - 1:
-            print(f"  frame {frame + 1}/{n_frames}", flush=True)
+        if (frame + 1) % 25 == 0 or frame == n_frames - 1:
+            if tabletop_task and frame_tracking_err is not None and frame_clearance is not None:
+                phase_name_frame = str(_task_phase_state(float(frame) * frame_dt, meta)[0])
+                print(
+                    f"  frame {frame + 1}/{n_frames}"
+                    f" phase={phase_name_frame}"
+                    f" target_err={frame_tracking_err:.4f}m"
+                    f" min_clearance={float(frame_clearance):.4f}m",
+                    flush=True,
+                )
+            else:
+                print(f"  frame {frame + 1}/{n_frames}", flush=True)
 
     wall_time = time.perf_counter() - t0
     print(f"  Simulation done: {n_frames} frames in {wall_time:.1f}s", flush=True)

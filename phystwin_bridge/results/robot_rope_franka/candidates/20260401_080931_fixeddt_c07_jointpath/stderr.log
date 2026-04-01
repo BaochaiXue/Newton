@@ -1,0 +1,98 @@
+/home/xinjie/Newton_Connection/Newton/phystwin_bridge/tools/core/newton_import_ir.py:1209: UserWarning: tabletop_table_box: PhysTwin ground collide_elas is present in IR, but native Newton SemiImplicit has no direct 1-to-1 restitution field for particle-vs-shape contacts. Ground bounce will therefore use native Newton ground ke/kd/kf defaults unless --ground-restitution-mode=approximate-native is selected.
+  warnings.warn(message)
+ffmpeg version 6.1.1-3ubuntu5+esm7 Copyright (c) 2000-2023 the FFmpeg developers
+  built with gcc 13 (Ubuntu 13.3.0-6ubuntu2~24.04)
+  configuration: --prefix=/usr --extra-version=3ubuntu5+esm7 --toolchain=hardened --libdir=/usr/lib/x86_64-linux-gnu --incdir=/usr/include/x86_64-linux-gnu --arch=amd64 --enable-gpl --disable-stripping --disable-omx --enable-gnutls --enable-libaom --enable-libass --enable-libbs2b --enable-libcaca --enable-libcdio --enable-libcodec2 --enable-libdav1d --enable-libflite --enable-libfontconfig --enable-libfreetype --enable-libfribidi --enable-libglslang --enable-libgme --enable-libgsm --enable-libharfbuzz --enable-libmp3lame --enable-libmysofa --enable-libopenjpeg --enable-libopenmpt --enable-libopus --enable-librubberband --enable-libshine --enable-libsnappy --enable-libsoxr --enable-libspeex --enable-libtheora --enable-libtwolame --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx265 --enable-libxml2 --enable-libxvid --enable-libzimg --enable-openal --enable-opencl --enable-opengl --disable-sndio --enable-libvpl --disable-libmfx --enable-libdc1394 --enable-libdrm --enable-libiec61883 --enable-chromaprint --enable-frei0r --enable-ladspa --enable-libbluray --enable-libjack --enable-libpulse --enable-librabbitmq --enable-librist --enable-libsrt --enable-libssh --enable-libsvtav1 --enable-libx264 --enable-libzmq --enable-libzvbi --enable-lv2 --enable-sdl2 --enable-libplacebo --enable-librav1e --enable-pocketsphinx --enable-librsvg --enable-libjxl --enable-shared
+  libavutil      58. 29.100 / 58. 29.100
+  libavcodec     60. 31.102 / 60. 31.102
+  libavformat    60. 16.100 / 60. 16.100
+  libavdevice    60.  3.100 / 60.  3.100
+  libavfilter     9. 12.100 /  9. 12.100
+  libswscale      7.  5.100 /  7.  5.100
+  libswresample   4. 12.100 /  4. 12.100
+  libpostproc    57.  3.100 / 57.  3.100
+Input #0, rawvideo, from 'fd:':
+  Duration: N/A, start: 0.000000, bitrate: 663552 kb/s
+  Stream #0:0: Video: rawvideo (RGB[24] / 0x18424752), rgb24, 1280x720, 663552 kb/s, 30 tbr, 30 tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (rawvideo (native) -> h264 (libx264))
+[libx264 @ 0x5e64b9138480] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+[libx264 @ 0x5e64b9138480] profile High, level 3.1, 4:2:0, 8-bit
+[libx264 @ 0x5e64b9138480] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=1 ref=3 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=7 psy=1 psy_rd=1.00:0.00 mixed_ref=1 me_range=16 chroma_me=1 trellis=1 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=-2 threads=22 lookahead_threads=3 sliced_threads=0 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=3 b_pyramid=2 b_adapt=1 b_bias=0 direct=1 weightb=1 open_gop=0 weightp=2 keyint=250 keyint_min=25 scenecut=40 intra_refresh=0 rc_lookahead=40 rc=crf mbtree=1 crf=18.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 ip_ratio=1.40 aq=1:1.00
+Output #0, mp4, to '/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_080931_fixeddt_c07_jointpath/presentation/work/robot_rope_tabletop_hero.mp4':
+  Metadata:
+    encoder         : Lavf60.16.100
+  Stream #0:0: Video: h264 (avc1 / 0x31637661), yuv420p(tv, progressive), 1280x720, q=2-31, 30 fps, 15360 tbn
+    Metadata:
+      encoder         : Lavc60.31.102 libx264
+    Side data:
+      cpb: bitrate max/min/avg: 0/0/0 buffer size: 0 vbv_delay: N/A
+frame=    0 fps=0.0 q=0.0 size=       0kB time=N/A bitrate=N/A speed=N/A    frame=   10 fps=0.0 q=24.0 size=       0kB time=00:00:00.26 bitrate=   1.4kbits/s speed=0.532x    frame=   87 fps= 87 q=24.0 size=     256kB time=00:00:02.83 bitrate= 740.3kbits/s speed=2.82x    [out#0/mp4 @ 0x5e64b9136c80] video:649kB audio:0kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.454158%
+frame=  180 fps=148 q=-1.0 Lsize=     652kB time=00:00:05.90 bitrate= 905.7kbits/s speed=4.85x    
+[libx264 @ 0x5e64b9138480] frame I:1     Avg QP:11.68  size: 83295
+[libx264 @ 0x5e64b9138480] frame P:46    Avg QP:15.86  size:  7105
+[libx264 @ 0x5e64b9138480] frame B:133   Avg QP:22.61  size:  1911
+[libx264 @ 0x5e64b9138480] consecutive B-frames:  1.1%  1.1%  0.0% 97.8%
+[libx264 @ 0x5e64b9138480] mb I  I16..4: 23.1% 35.9% 40.9%
+[libx264 @ 0x5e64b9138480] mb P  I16..4:  0.2%  0.5%  0.3%  P16..4:  5.2%  3.1%  2.2%  0.0%  0.0%    skip:88.5%
+[libx264 @ 0x5e64b9138480] mb B  I16..4:  0.0%  0.0%  0.0%  B16..8:  4.1%  1.5%  0.6%  direct: 0.5%  skip:93.1%  L0:36.4% L1:41.3% BI:22.3%
+[libx264 @ 0x5e64b9138480] 8x8 transform intra:40.0% inter:21.9%
+[libx264 @ 0x5e64b9138480] coded y,uvDC,uvAC intra: 36.9% 42.0% 35.8% inter: 2.1% 0.7% 0.3%
+[libx264 @ 0x5e64b9138480] i16 v,h,dc,p: 53% 28%  9%  9%
+[libx264 @ 0x5e64b9138480] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu: 42% 13% 28%  1%  5%  3%  3%  1%  3%
+[libx264 @ 0x5e64b9138480] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 20% 31% 17%  2%  7%  4% 10%  2%  7%
+[libx264 @ 0x5e64b9138480] i8c dc,h,v,p: 66% 20% 11%  3%
+[libx264 @ 0x5e64b9138480] Weighted P-Frames: Y:0.0% UV:0.0%
+[libx264 @ 0x5e64b9138480] ref P L0: 66.8% 10.8% 16.5%  5.8%
+[libx264 @ 0x5e64b9138480] ref B L0: 85.0% 12.9%  2.1%
+[libx264 @ 0x5e64b9138480] ref B L1: 94.1%  5.9%
+[libx264 @ 0x5e64b9138480] kb/s:885.70
+/home/xinjie/Newton_Connection/Newton/phystwin_bridge/tools/core/newton_import_ir.py:1209: UserWarning: tabletop_table_box: PhysTwin ground collide_elas is present in IR, but native Newton SemiImplicit has no direct 1-to-1 restitution field for particle-vs-shape contacts. Ground bounce will therefore use native Newton ground ke/kd/kf defaults unless --ground-restitution-mode=approximate-native is selected.
+  warnings.warn(message)
+ffmpeg version 6.1.1-3ubuntu5+esm7 Copyright (c) 2000-2023 the FFmpeg developers
+  built with gcc 13 (Ubuntu 13.3.0-6ubuntu2~24.04)
+  configuration: --prefix=/usr --extra-version=3ubuntu5+esm7 --toolchain=hardened --libdir=/usr/lib/x86_64-linux-gnu --incdir=/usr/include/x86_64-linux-gnu --arch=amd64 --enable-gpl --disable-stripping --disable-omx --enable-gnutls --enable-libaom --enable-libass --enable-libbs2b --enable-libcaca --enable-libcdio --enable-libcodec2 --enable-libdav1d --enable-libflite --enable-libfontconfig --enable-libfreetype --enable-libfribidi --enable-libglslang --enable-libgme --enable-libgsm --enable-libharfbuzz --enable-libmp3lame --enable-libmysofa --enable-libopenjpeg --enable-libopenmpt --enable-libopus --enable-librubberband --enable-libshine --enable-libsnappy --enable-libsoxr --enable-libspeex --enable-libtheora --enable-libtwolame --enable-libvidstab --enable-libvorbis --enable-libvpx --enable-libwebp --enable-libx265 --enable-libxml2 --enable-libxvid --enable-libzimg --enable-openal --enable-opencl --enable-opengl --disable-sndio --enable-libvpl --disable-libmfx --enable-libdc1394 --enable-libdrm --enable-libiec61883 --enable-chromaprint --enable-frei0r --enable-ladspa --enable-libbluray --enable-libjack --enable-libpulse --enable-librabbitmq --enable-librist --enable-libsrt --enable-libssh --enable-libsvtav1 --enable-libx264 --enable-libzmq --enable-libzvbi --enable-lv2 --enable-sdl2 --enable-libplacebo --enable-librav1e --enable-pocketsphinx --enable-librsvg --enable-libjxl --enable-shared
+  libavutil      58. 29.100 / 58. 29.100
+  libavcodec     60. 31.102 / 60. 31.102
+  libavformat    60. 16.100 / 60. 16.100
+  libavdevice    60.  3.100 / 60.  3.100
+  libavfilter     9. 12.100 /  9. 12.100
+  libswscale      7.  5.100 /  7.  5.100
+  libswresample   4. 12.100 /  4. 12.100
+  libpostproc    57.  3.100 / 57.  3.100
+Input #0, rawvideo, from 'fd:':
+  Duration: N/A, start: 0.000000, bitrate: 663552 kb/s
+  Stream #0:0: Video: rawvideo (RGB[24] / 0x18424752), rgb24, 1280x720, 663552 kb/s, 30 tbr, 30 tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (rawvideo (native) -> h264 (libx264))
+[libx264 @ 0x6143403e5480] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2
+[libx264 @ 0x6143403e5480] profile High, level 3.1, 4:2:0, 8-bit
+[libx264 @ 0x6143403e5480] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=1 ref=3 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=7 psy=1 psy_rd=1.00:0.00 mixed_ref=1 me_range=16 chroma_me=1 trellis=1 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=-2 threads=22 lookahead_threads=3 sliced_threads=0 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=3 b_pyramid=2 b_adapt=1 b_bias=0 direct=1 weightb=1 open_gop=0 weightp=2 keyint=250 keyint_min=25 scenecut=40 intra_refresh=0 rc_lookahead=40 rc=crf mbtree=1 crf=18.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 ip_ratio=1.40 aq=1:1.00
+Output #0, mp4, to '/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_080931_fixeddt_c07_jointpath/debug/work/robot_rope_tabletop_hero_debug.mp4':
+  Metadata:
+    encoder         : Lavf60.16.100
+  Stream #0:0: Video: h264 (avc1 / 0x31637661), yuv420p(tv, progressive), 1280x720, q=2-31, 30 fps, 15360 tbn
+    Metadata:
+      encoder         : Lavc60.31.102 libx264
+    Side data:
+      cpb: bitrate max/min/avg: 0/0/0 buffer size: 0 vbv_delay: N/A
+frame=    0 fps=0.0 q=0.0 size=       0kB time=N/A bitrate=N/A speed=N/A    frame=    0 fps=0.0 q=0.0 size=       0kB time=N/A bitrate=N/A speed=N/A    frame=    7 fps=6.9 q=24.0 size=       0kB time=00:00:00.16 bitrate=   2.3kbits/s speed=0.164x    frame=   51 fps= 34 q=24.0 size=       0kB time=00:00:01.63 bitrate=   0.2kbits/s speed=1.07x    frame=   97 fps= 48 q=24.0 size=     256kB time=00:00:03.16 bitrate= 662.4kbits/s speed=1.56x    [out#0/mp4 @ 0x6143403e3c80] video:654kB audio:0kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.446342%
+frame=  180 fps= 76 q=-1.0 Lsize=     657kB time=00:00:05.90 bitrate= 911.8kbits/s speed=2.48x    
+[libx264 @ 0x6143403e5480] frame I:1     Avg QP: 9.74  size: 53116
+[libx264 @ 0x6143403e5480] frame P:47    Avg QP:17.66  size:  7808
+[libx264 @ 0x6143403e5480] frame B:132   Avg QP:24.93  size:  1884
+[libx264 @ 0x6143403e5480] consecutive B-frames:  1.1%  1.1%  6.7% 91.1%
+[libx264 @ 0x6143403e5480] mb I  I16..4: 59.1% 18.0% 22.9%
+[libx264 @ 0x6143403e5480] mb P  I16..4:  0.2%  0.3%  0.4%  P16..4:  4.1%  2.8%  2.4%  0.0%  0.0%    skip:89.9%
+[libx264 @ 0x6143403e5480] mb B  I16..4:  0.0%  0.0%  0.0%  B16..8:  3.2%  1.3%  0.7%  direct: 0.6%  skip:94.1%  L0:34.7% L1:42.3% BI:22.9%
+[libx264 @ 0x6143403e5480] 8x8 transform intra:23.5% inter:22.2%
+[libx264 @ 0x6143403e5480] coded y,uvDC,uvAC intra: 27.9% 25.2% 16.2% inter: 2.3% 0.7% 0.3%
+[libx264 @ 0x6143403e5480] i16 v,h,dc,p: 80% 15%  2%  2%
+[libx264 @ 0x6143403e5480] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu: 33% 19% 37%  1%  1%  1%  2%  1%  3%
+[libx264 @ 0x6143403e5480] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 27% 27% 16%  3%  5%  6%  7%  4%  6%
+[libx264 @ 0x6143403e5480] i8c dc,h,v,p: 70% 20%  9%  2%
+[libx264 @ 0x6143403e5480] Weighted P-Frames: Y:0.0% UV:0.0%
+[libx264 @ 0x6143403e5480] ref P L0: 66.5% 14.6% 14.3%  4.6%
+[libx264 @ 0x6143403e5480] ref B L0: 86.3% 11.6%  2.1%
+[libx264 @ 0x6143403e5480] ref B L1: 96.0%  4.0%
+[libx264 @ 0x6143403e5480] kb/s:891.67
