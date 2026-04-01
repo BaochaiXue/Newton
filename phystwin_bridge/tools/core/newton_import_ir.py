@@ -179,7 +179,7 @@ class SimConfig:
     add_ground_plane: bool = True
     self_contact_mode: str | None = None
     custom_self_contact_hops: int = 0
-    phystwin_freeze_collision_table: bool = False
+    phystwin_freeze_collision_table: bool = True
     phystwin_collision_table_capacity: int = 500
     # Override for IR `self_collision` (which we treat as the PhysTwin collision enable).
     # Note: enabling particle self-collision in SemiImplicit also requires enabling the
@@ -423,7 +423,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--phystwin-freeze-collision-table",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Experimental strict-phystwin option: freeze the self-collision candidate "
             "table once per frame using PhysTwin-style update_collision_graph semantics "

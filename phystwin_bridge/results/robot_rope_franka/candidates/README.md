@@ -1,4 +1,4 @@
 # Candidates
 
-Timestamped candidate runs for the tabletop-push hero demo belong here until a
-best run is selected.
+Candidate hero-demo runs are stored as timestamped subdirectories under this
+folder.

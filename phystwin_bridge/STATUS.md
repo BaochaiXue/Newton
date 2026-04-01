@@ -1,27 +1,28 @@
-# PhysTwin Bridge Local Status
+# phystwin_bridge Status
 
-Last updated: 2026-04-01
+## Current Focus
 
-## Active Hero-Demo Workstream
+- Hero-demo validation pipeline for the native Newton Franka + native Newton
+  table + PhysTwin rope workflow.
+- New strict validator:
+  - `scripts/validate_robot_rope_franka_hero.py`
 
-- Target:
-  - native Newton Franka + native Newton table + PhysTwin rope tabletop push
-- Task page:
-  - `docs/bridge/tasks/robot_rope_franka_tabletop_push_hero.md`
-- Main code path:
-  - `demos/demo_robot_rope_franka.py`
-- Local result root:
-  - `results/robot_rope_franka/`
+## Canonical Result Root
 
-## Current Known References
+- `Newton/phystwin_bridge/results/robot_rope_franka/`
 
-- historical native robot baseline:
-  - `/home/xinjie/Newton_Connection/results/robot_deformable_demo/`
-- stage-0 release/drop sanity baseline:
-  - `/home/xinjie/Newton_Connection/results/native_robot_rope_drop_release/`
+## Expected Candidate Layout
 
-## Current Blockers
+- `candidates/<timestamp>_<short_tag>/`
+  - `manifest.json`
+  - `run_command.txt`
+  - `metrics.json`
+  - `validation.md`
+  - `ffprobe.json`
+  - `contact_sheet.png`
+  - `keyframes/`
 
-- no phystwin_bridge-local canonical hero bundle yet
-- no dedicated tabletop-push task preset yet
-- no strict hero-demo validation bundle yet for local candidate runs
+## Current State
+
+- Validation workflow scaffolded.
+- No accepted hero run has been selected yet.

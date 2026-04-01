@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phystwin-freeze-collision-table",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
     parser.add_argument("--phystwin-collision-table-capacity", type=int, default=500)
     parser.add_argument(

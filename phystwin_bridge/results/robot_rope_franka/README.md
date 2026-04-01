@@ -1,33 +1,43 @@
-# Native Franka Tabletop Push Hero Results
+# Robot Rope Franka Hero Results
 
-This folder is the phystwin_bridge-local canonical result root for the meeting
-hero demo:
+Canonical result root for the native Newton Franka + native Newton table +
+PhysTwin rope hero demo.
 
-- native Newton Franka
-- native Newton tabletop
-- PhysTwin-loaded rope
-- slow, readable robot push
-
-## Layout
+## Expected Layout
 
 - `BEST_RUN/`
-  - exact promoted assets only
+  - authoritative accepted run and its copied/pinned artifacts
 - `candidates/<timestamp>_<short_tag>/`
-  - every serious candidate with metrics and validation
+  - each candidate run folder with:
+    - `manifest.json`
+    - `run_command.txt`
+    - `metrics.json`
+    - `validation.md`
+    - `hero_presentation.mp4`
+    - `hero_debug.mp4`
+    - `validation_camera.mp4`
+    - `contact_sheet.png`
+    - `keyframes/`
 
-## Required Candidate Files
+## Validation
 
-- `manifest.json`
-- `run_command.txt`
+Use the strict hero validator:
+
+```bash
+python scripts/validate_robot_rope_franka_hero.py <candidate_run_dir> \
+  --manual-review-json <candidate_run_dir>/manual_review.json
+```
+
+The validator writes:
+
+- `ffprobe.json`
 - `metrics.json`
 - `validation.md`
-- `hero_presentation.mp4`
-- `hero_debug.mp4`
-- `validation_camera.mp4`
 - `contact_sheet.png`
 - `keyframes/`
+- `manifest.json` when absent
+- `run_command.txt` when absent
 
-## Promotion Rule
+## Status
 
-Do not copy a candidate into `BEST_RUN/` unless it passes the visual and
-artifact hard gates in the task page and local status notes.
+This bundle is a workflow scaffold. No accepted hero run has been selected yet.

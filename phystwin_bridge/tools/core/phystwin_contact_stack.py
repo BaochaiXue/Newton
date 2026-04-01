@@ -47,12 +47,25 @@ PHYSTWIN_MODE = "phystwin"
 EPSILON = 1.0e-12
 
 
+@wp.kernel
+def _copy_object_positions(
+    particle_q: wp.array(dtype=wp.vec3),
+    n_object: int,
+    object_q: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    if tid >= n_object:
+        return
+    object_q[tid] = particle_q[tid]
+
+
 @dataclass
 class PhysTwinContactContext:
     """Reusable bridge-side context for the strict `phystwin` mode."""
 
     n_object: int
     particle_grid: wp.HashGrid
+    object_q: Any
     search_radius: float
     neighbor_table: Any
     neighbor_count: Any
@@ -62,6 +75,8 @@ class PhysTwinContactContext:
     collision_table_capacity: int
     collision_indices: Any
     collision_number: Any
+    collision_candidate_total: Any
+    collision_candidate_truncated: Any
     collision_dist: float
     collide_elas: float
     collide_fric: float
@@ -147,7 +162,7 @@ def build_strict_phystwin_contact_context(
 
     neighbor_table, neighbor_count, _, exclusion_summary = build_filtered_self_contact_tables(
         edges,
-        n_particles=int(model.particle_count),
+        n_particles=n_object,
         hops=0,
         device=device,
     )
@@ -185,9 +200,9 @@ def build_strict_phystwin_contact_context(
 
     with wp.ScopedDevice(device):
         particle_grid = wp.HashGrid(128, 128, 128)
-        particle_grid.reserve(model.particle_count)
+        particle_grid.reserve(n_object)
 
-    freeze_collision_table = bool(getattr(cfg, "phystwin_freeze_collision_table", False))
+    freeze_collision_table = bool(getattr(cfg, "phystwin_freeze_collision_table", True))
     collision_table_capacity = int(getattr(cfg, "phystwin_collision_table_capacity", 500))
     if collision_table_capacity <= 0:
         raise ValueError(
@@ -195,24 +210,23 @@ def build_strict_phystwin_contact_context(
         )
     collision_indices = None
     collision_number = None
+    collision_candidate_total = wp.zeros(n_object, dtype=wp.int32, device=device)
+    collision_candidate_truncated = wp.zeros(n_object, dtype=wp.int32, device=device)
     if freeze_collision_table:
         collision_indices_np = np.full(
-            (int(model.particle_count), collision_table_capacity),
+            (n_object, collision_table_capacity),
             -1,
             dtype=np.int32,
         )
         collision_indices = wp.array(collision_indices_np, dtype=wp.int32, device=device)
-        collision_number = wp.zeros(int(model.particle_count), dtype=wp.int32, device=device)
+        collision_number = wp.zeros(n_object, dtype=wp.int32, device=device)
 
-    search_radius = max(
-        float(model.particle_max_radius) * 2.0 + float(model.particle_cohesion),
-        collision_dist * 5.0,
-        EPSILON,
-    )
+    search_radius = max(collision_dist * 5.0, EPSILON)
 
     ctx = PhysTwinContactContext(
         n_object=n_object,
         particle_grid=particle_grid,
+        object_q=wp.empty(n_object, dtype=wp.vec3, device=device),
         search_radius=search_radius,
         neighbor_table=neighbor_table,
         neighbor_count=neighbor_count,
@@ -222,6 +236,8 @@ def build_strict_phystwin_contact_context(
         collision_table_capacity=collision_table_capacity,
         collision_indices=collision_indices,
         collision_number=collision_number,
+        collision_candidate_total=collision_candidate_total,
+        collision_candidate_truncated=collision_candidate_truncated,
         collision_dist=collision_dist,
         collide_elas=collide_elas,
         collide_fric=collide_fric,
@@ -256,6 +272,7 @@ def build_strict_phystwin_contact_context(
             "frame_frozen_table" if freeze_collision_table else "dynamic_hash_query"
         ),
         "phystwin_collision_table_capacity": int(collision_table_capacity),
+        "phystwin_collision_runtime_object_only": True,
         "particle_contact_param_source": "phystwin_bridge_exact",
         "ground_contact_param_source": "phystwin_ground_integrator",
         "ground_contact_context": "implicit_z0_plane",
@@ -282,23 +299,32 @@ def prepare_strict_phystwin_contact_frame(
     state_in: Any,
     ctx: PhysTwinContactContext,
 ) -> None:
+    wp.launch(
+        kernel=_copy_object_positions,
+        dim=ctx.n_object,
+        inputs=[state_in.particle_q, int(ctx.n_object)],
+        outputs=[ctx.object_q],
+        device=model.device,
+    )
     if not ctx.freeze_collision_table:
         return
     with wp.ScopedDevice(model.device):
-        ctx.particle_grid.build(state_in.particle_q, radius=ctx.search_radius)
+        ctx.particle_grid.build(ctx.object_q, radius=ctx.search_radius)
     assert ctx.collision_indices is not None
     assert ctx.collision_number is not None
     build_potential_self_collision_table(
         device=model.device,
-        particle_count=model.particle_count,
+        particle_count=ctx.n_object,
         grid=ctx.particle_grid,
-        particle_x=state_in.particle_q,
+        particle_x=ctx.object_q,
         particle_flags=model.particle_flags,
         n_object=ctx.n_object,
         collision_dist=ctx.collision_dist,
         collision_table_capacity=ctx.collision_table_capacity,
         collision_indices=ctx.collision_indices,
         collision_number=ctx.collision_number,
+        collision_candidate_total=ctx.collision_candidate_total,
+        collision_candidate_truncated=ctx.collision_candidate_truncated,
     )
 
 
@@ -316,8 +342,15 @@ def step_strict_phystwin_contact_stack(
     """Run one strict PhysTwin-style substep for the cloth parity scene."""
 
     if not ctx.freeze_collision_table:
+        wp.launch(
+            kernel=_copy_object_positions,
+            dim=ctx.n_object,
+            inputs=[state_in.particle_q, int(ctx.n_object)],
+            outputs=[ctx.object_q],
+            device=model.device,
+        )
         with wp.ScopedDevice(model.device):
-            ctx.particle_grid.build(state_in.particle_q, radius=ctx.search_radius)
+            ctx.particle_grid.build(ctx.object_q, radius=ctx.search_radius)
 
     particle_f = state_in.particle_f if state_in.particle_count else None
     body_f = state_in.body_f if state_in.body_count else None

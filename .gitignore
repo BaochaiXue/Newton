@@ -13,3 +13,6 @@ phystwin_bridge/**/._frames_*/
 # Python cache
 **/__pycache__/
 *.py[cod]
+
+# NumPy arrays are generated artifacts in this workspace.
+*.npy

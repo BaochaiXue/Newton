@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--phystwin-freeze-collision-table",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Experimental pass-through for strict phystwin mode: freeze the candidate "
             "collision table once per frame instead of using the current per-substep hash query."

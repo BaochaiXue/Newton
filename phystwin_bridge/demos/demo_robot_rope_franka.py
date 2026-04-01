@@ -514,6 +514,18 @@ def parse_args() -> argparse.Namespace:
         help="Retract offset relative to the rope/table center for the tabletop hero [m].",
     )
     p.add_argument(
+        "--tabletop-preroll-settle-seconds",
+        type=float,
+        default=2.4,
+        help="Hidden preroll time used to settle the rope on the tabletop before the recorded hero clip [s].",
+    )
+    p.add_argument(
+        "--tabletop-preroll-damping-scale",
+        type=float,
+        default=6.0,
+        help="Extra preroll damping scale used only while settling the tabletop hero before the recorded clip.",
+    )
+    p.add_argument(
         "--pre-release-settle-damping-scale",
         type=float,
         default=8.0,
@@ -1069,11 +1081,10 @@ def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -
         ]
 
     if str(args.task) == TABLETOP_PUSH_TASK:
-        settle = rope_center + np.asarray([-0.22, -0.16, 0.14], dtype=np.float32)
-        approach = settle + np.asarray([0.08, 0.04, -0.03], dtype=np.float32)
-        contact_ready = rope_center + np.asarray(np.asarray(args.tabletop_push_contact_offset, dtype=np.float32), dtype=np.float32)
-        push_end = rope_center + np.asarray(np.asarray(args.tabletop_push_end_offset, dtype=np.float32), dtype=np.float32)
-        retract = rope_center + np.asarray(np.asarray(args.tabletop_retract_offset, dtype=np.float32), dtype=np.float32)
+        settle = rope_center + np.asarray(args.tabletop_push_start_offset, dtype=np.float32)
+        contact_ready = rope_center + np.asarray(args.tabletop_push_contact_offset, dtype=np.float32)
+        push_end = rope_center + np.asarray(args.tabletop_push_end_offset, dtype=np.float32)
+        retract = rope_center + np.asarray(args.tabletop_retract_offset, dtype=np.float32)
         return [
             {
                 "name": "settle",
@@ -1086,7 +1097,7 @@ def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -
                 "name": "approach",
                 "duration": float(args.tabletop_approach_seconds),
                 "start": settle,
-                "end": approach,
+                "end": contact_ready,
                 "quat": target_quat,
             },
             {
@@ -1156,6 +1167,7 @@ def _find_index_by_suffix(labels: list[str], suffix: str) -> int:
 def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, dict[str, Any], dict[str, Any], int]:
     raw_ir = load_ir(args.ir)
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
+    tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
     _validate_scaling_args(args)
     _maybe_autoset_mass_spring_scale(args, raw_ir)
     ir_obj = _copy_object_only_ir(raw_ir, args)
@@ -1168,11 +1180,12 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     endpoint_mid = 0.5 * (x0[int(endpoint_indices[0])] + x0[int(endpoint_indices[1])])
     support_patch_indices = np.empty((0,), dtype=np.int32)
     support_patch_center = endpoint_mid.astype(np.float32, copy=False)
+    rope_height_target = float(args.tabletop_rope_height) if tabletop_task else float(args.anchor_height)
     shift = np.array(
         [
             -float(endpoint_mid[0]),
             -float(endpoint_mid[1]),
-            float(args.anchor_height) - float(endpoint_mid[2]),
+            rope_height_target - float(endpoint_mid[2]),
         ],
         dtype=np.float32,
     )
@@ -1224,8 +1237,12 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             builder.particle_mass[idx] = 0.0
 
     support_patch_center_shifted = np.mean(anchor_positions, axis=0).astype(np.float32, copy=False) if anchor_positions.size else rope_center
-    robot_reference_point = support_patch_center_shifted if drop_release_task else rope_center
-    robot_base_pos = robot_reference_point + np.asarray(args.robot_base_offset, dtype=np.float32)
+    if tabletop_task:
+        robot_reference_point = rope_center
+        robot_base_pos = robot_reference_point + np.asarray(args.tabletop_robot_base_offset, dtype=np.float32)
+    else:
+        robot_reference_point = support_patch_center_shifted if drop_release_task else rope_center
+        robot_base_pos = robot_reference_point + np.asarray(args.robot_base_offset, dtype=np.float32)
     franka_asset = newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf"
     builder.add_urdf(
         franka_asset,
@@ -1253,6 +1270,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
     ee_offset_local = np.asarray([0.0, 0.0, 0.22], dtype=np.float32)
     floor_z = 0.0
+    table_top_z = float(args.tabletop_table_top_z) if tabletop_task else None
     if drop_release_task:
         support_anchor_center = support_patch_center_shifted.astype(np.float32, copy=False)
         support_point = np.asarray(
@@ -1276,6 +1294,31 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
                 max(0.012, 0.5 * float(np.max(anchor_positions[:, 0]) - np.min(anchor_positions[:, 0])) + 0.015),
                 max(0.028, 0.5 * float(np.max(anchor_positions[:, 1]) - np.min(anchor_positions[:, 1])) + 0.020),
                 0.010,
+            ],
+            dtype=np.float32,
+        )
+    elif tabletop_task:
+        support_point = np.asarray(
+            [
+                float(rope_center[0]),
+                float(rope_center[1]),
+                float(table_top_z),
+            ],
+            dtype=np.float32,
+        )
+        anchor_bar_center = np.asarray(
+            [
+                float(rope_center[0]),
+                float(rope_center[1]),
+                float(table_top_z - float(args.tabletop_table_hz)),
+            ],
+            dtype=np.float32,
+        )
+        anchor_bar_scale = np.asarray(
+            [
+                float(args.tabletop_table_hx),
+                float(args.tabletop_table_hy),
+                float(args.tabletop_table_hz),
             ],
             dtype=np.float32,
         )
@@ -1306,14 +1349,34 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         task_phases[2]["end"] = support_point.astype(np.float32, copy=False)
         task_phases[3]["start"] = support_point.astype(np.float32, copy=False)
         task_phases[3]["end"] = support_point.astype(np.float32, copy=False)
+    elif tabletop_task:
+        task_phases[0]["end"] = task_phases[0]["start"].astype(np.float32, copy=False)
+        task_phases[1]["start"] = task_phases[0]["end"].astype(np.float32, copy=False)
+        task_phases[2]["start"] = np.asarray(rope_center + np.asarray(args.tabletop_push_contact_offset, dtype=np.float32), dtype=np.float32)
+        task_phases[3]["start"] = task_phases[2]["end"].astype(np.float32, copy=False)
+        task_phases[4]["start"] = task_phases[3]["end"].astype(np.float32, copy=False)
     ee_target_end = np.asarray(task_phases[-1]["end"], dtype=np.float32)
     ee_target_quat = np.asarray(task_phases[0]["quat"], dtype=np.float32)
     mid_segment_indices = _mid_segment_indices(shifted_q[:n_obj], rope_center)
-    stage_center = np.asarray(
-        [float(rope_center[0]), float(rope_center[1]), float(floor_z + (0.16 if drop_release_task else 0.18))],
-        dtype=np.float32,
-    )
-    stage_scale = np.asarray([0.28, 0.18, 0.05], dtype=np.float32)
+    if tabletop_task:
+        stage_center = np.asarray(
+            [
+                float(rope_center[0]),
+                float(rope_center[1]),
+                float(table_top_z - float(args.tabletop_table_hz)),
+            ],
+            dtype=np.float32,
+        )
+        stage_scale = np.asarray(
+            [float(args.tabletop_table_hx), float(args.tabletop_table_hy), float(args.tabletop_table_hz)],
+            dtype=np.float32,
+        )
+    else:
+        stage_center = np.asarray(
+            [float(rope_center[0]), float(rope_center[1]), float(floor_z + (0.16 if drop_release_task else 0.18))],
+            dtype=np.float32,
+        )
+        stage_scale = np.asarray([0.28, 0.18, 0.05], dtype=np.float32)
     robot_base_scale = np.asarray([0.17, 0.17, max(0.18, float(robot_base_pos[2] - floor_z))], dtype=np.float32)
     robot_base_center = np.asarray(
         [
@@ -1324,6 +1387,12 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         dtype=np.float32,
     )
     if drop_release_task:
+        anchor_left_center = np.zeros((3,), dtype=np.float32)
+        anchor_right_center = np.zeros((3,), dtype=np.float32)
+        floor_scale = np.asarray([1.45, 1.10, 0.012], dtype=np.float32)
+        floor_center = np.asarray([0.0, 0.0, float(floor_z - floor_scale[2])], dtype=np.float32)
+        anchor_post_scale = np.asarray([0.024, 0.024, 0.024], dtype=np.float32)
+    elif tabletop_task:
         anchor_left_center = np.zeros((3,), dtype=np.float32)
         anchor_right_center = np.zeros((3,), dtype=np.float32)
         floor_scale = np.asarray([1.45, 1.10, 0.012], dtype=np.float32)
@@ -1359,10 +1428,11 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             "task": str(args.task),
             "support_point": support_point,
             "floor_z": float(floor_z),
+            "table_top_z": table_top_z,
         }
     )
 
-    if drop_release_task:
+    if drop_release_task or tabletop_task:
         ground_cfg = builder.default_shape_cfg.copy()
         newton_import_ir._configure_ground_contact_material(
             ground_cfg,
@@ -1380,6 +1450,24 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             cfg=ground_cfg,
             label="ground_floor_box",
         )
+    if tabletop_task:
+        table_cfg = builder.default_shape_cfg.copy()
+        newton_import_ir._configure_ground_contact_material(
+            table_cfg,
+            ir_obj,
+            cfg,
+            checks,
+            context="tabletop_table_box",
+        )
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform(wp.vec3(*stage_center.tolist()), wp.quat_identity()),
+            hx=float(stage_scale[0]),
+            hy=float(stage_scale[1]),
+            hz=float(stage_scale[2]),
+            cfg=table_cfg,
+            label="tabletop_table_box",
+        )
     model = builder.finalize(device=device)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
     if not bool(particle_contact_kernel):
@@ -1391,11 +1479,22 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     init_state.joint_qd.zero_()
     newton.eval_fk(model, init_state.joint_q, init_state.joint_qd, init_state)
     init_body_q = init_state.body_q.numpy().astype(np.float32)
-    ee_target_start = _ee_world_position(init_body_q[int(ee_body_index)], ee_offset_local)
-    task_phases[0]["start"] = ee_target_start.astype(np.float32, copy=False)
-    if not drop_release_task:
-        task_phases[0]["end"] = ee_target_start.astype(np.float32, copy=False)
-        task_phases[1]["start"] = ee_target_start.astype(np.float32, copy=False)
+    ee_world_start = _ee_world_position(init_body_q[int(ee_body_index)], ee_offset_local)
+    if tabletop_task:
+        ee_target_start = np.asarray(task_phases[0]["start"], dtype=np.float32)
+        tabletop_push_focus = (
+            0.5
+            * (
+                np.asarray(task_phases[2]["start"], dtype=np.float32)
+                + np.asarray(task_phases[2]["end"], dtype=np.float32)
+            )
+        ).astype(np.float32, copy=False)
+    else:
+        ee_target_start = ee_world_start.astype(np.float32, copy=False)
+        task_phases[0]["start"] = ee_target_start.astype(np.float32, copy=False)
+        if not drop_release_task:
+            task_phases[0]["end"] = ee_target_start.astype(np.float32, copy=False)
+            task_phases[1]["start"] = ee_target_start.astype(np.float32, copy=False)
 
     render_edges = edges[:: max(1, int(args.spring_stride))].astype(np.int32, copy=True)
     meta = {
@@ -1433,11 +1532,19 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "support_patch_center_m": support_patch_center_shifted.astype(np.float32),
         "visible_support_center_m": support_patch_center_shifted.astype(np.float32),
         "rope_center": rope_center.astype(np.float32),
+        "table_center": stage_center.astype(np.float32),
+        "table_top_z": (None if table_top_z is None else float(table_top_z)),
+        "tabletop_push_focus": (
+            tabletop_push_focus.astype(np.float32) if tabletop_task else rope_center.astype(np.float32)
+        ),
         "render_edges": render_edges,
         "particle_contacts": bool(particle_contacts),
         "particle_contact_kernel": bool(particle_contact_kernel),
         "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
-        "release_phase_start_s": _phase_start_time(task_phases, "release" if drop_release_task else "release_retract"),
+        "release_phase_start_s": _phase_start_time(
+            task_phases,
+            "release" if drop_release_task else ("retract" if tabletop_task else "release_retract"),
+        ),
     }
     return model, ir_obj, meta, n_obj
 
@@ -1451,6 +1558,7 @@ def simulate(
     device: str,
 ) -> dict[str, Any]:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
+    tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
@@ -1497,6 +1605,9 @@ def simulate(
     settle_drag = 0.0
     if drop_release_task and "drag_damping" in ir_obj:
         settle_drag = float(newton_import_ir.ir_scalar(ir_obj, "drag_damping")) * float(args.pre_release_settle_damping_scale)
+    tabletop_preroll_drag = 0.0
+    if tabletop_task and "drag_damping" in ir_obj:
+        tabletop_preroll_drag = float(newton_import_ir.ir_scalar(ir_obj, "drag_damping")) * float(args.tabletop_preroll_damping_scale)
     _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     gravity_axis = None
     gravity_norm = float(np.linalg.norm(gravity_vec))
@@ -1569,13 +1680,22 @@ def simulate(
     preroll_settle_metrics = None
     preroll_frame_count = 0
 
-    if drop_release_task and float(args.drop_preroll_settle_seconds) > 0.0:
-        preroll_max_frames = max(1, int(np.ceil(float(args.drop_preroll_settle_seconds) / max(frame_dt, 1.0e-12))))
+    if (drop_release_task and float(args.drop_preroll_settle_seconds) > 0.0) or (
+        tabletop_task and float(args.tabletop_preroll_settle_seconds) > 0.0
+    ):
+        preroll_duration_s = (
+            float(args.drop_preroll_settle_seconds)
+            if drop_release_task
+            else float(args.tabletop_preroll_settle_seconds)
+        )
+        preroll_max_frames = max(1, int(np.ceil(preroll_duration_s / max(frame_dt, 1.0e-12))))
         preroll_particle_speed = np.zeros((preroll_max_frames,), dtype=np.float32)
         preroll_support_speed = np.zeros((preroll_max_frames,), dtype=np.float32)
         preroll_com_h_speed = np.zeros((preroll_max_frames,), dtype=np.float32)
         prev_q_obj_preroll = None
         prev_rope_com_preroll = None
+        preroll_target_pos = np.asarray(meta["task_phases"][0]["end"], dtype=np.float32)
+        preroll_target_quat = np.asarray(meta["ee_target_quat"], dtype=np.float32)
         for preroll_frame in range(preroll_max_frames):
             q_obj_preroll = state_in.particle_q.numpy().astype(np.float32)[:n_obj]
             rope_com_preroll = np.mean(q_obj_preroll, axis=0).astype(np.float32, copy=False)
@@ -1589,17 +1709,30 @@ def simulate(
             prev_q_obj_preroll = q_obj_preroll.copy()
             prev_rope_com_preroll = rope_com_preroll.copy()
 
-            preroll_settle_metrics, preroll_ok = _settle_window_metrics_from_series(
-                preroll_particle_speed,
-                preroll_com_h_speed,
-                preroll_support_speed,
-                frame_idx=preroll_frame,
-                window_frames=settle_window_frames,
-                particle_speed_threshold_m_s=float(args.pre_release_particle_speed_mean_max),
-                com_horizontal_speed_threshold_m_s=float(args.pre_release_com_horizontal_speed_max),
-                support_patch_speed_threshold_m_s=float(args.pre_release_support_speed_mean_max),
-                frame_dt=float(frame_dt),
-            )
+            if drop_release_task:
+                preroll_settle_metrics, preroll_ok = _settle_window_metrics_from_series(
+                    preroll_particle_speed,
+                    preroll_com_h_speed,
+                    preroll_support_speed,
+                    frame_idx=preroll_frame,
+                    window_frames=settle_window_frames,
+                    particle_speed_threshold_m_s=float(args.pre_release_particle_speed_mean_max),
+                    com_horizontal_speed_threshold_m_s=float(args.pre_release_com_horizontal_speed_max),
+                    support_patch_speed_threshold_m_s=float(args.pre_release_support_speed_mean_max),
+                    frame_dt=float(frame_dt),
+                )
+            else:
+                preroll_settle_metrics, preroll_ok = _settle_window_metrics_from_series(
+                    preroll_particle_speed,
+                    preroll_com_h_speed,
+                    preroll_support_speed,
+                    frame_idx=preroll_frame,
+                    window_frames=max(1, int(np.ceil(0.20 / max(frame_dt, 1.0e-12)))),
+                    particle_speed_threshold_m_s=0.08,
+                    com_horizontal_speed_threshold_m_s=0.05,
+                    support_patch_speed_threshold_m_s=0.02,
+                    frame_dt=float(frame_dt),
+                )
             preroll_frame_count = int(preroll_frame + 1)
             if preroll_ok:
                 preroll_settle_pass = True
@@ -1608,14 +1741,34 @@ def simulate(
 
             for _ in range(substeps):
                 state_in.clear_forces()
+                if tabletop_task:
+                    pos_obj.set_target_position(0, wp.vec3(*preroll_target_pos.tolist()))
+                    rot_obj.set_target_rotation(0, wp.vec4(*preroll_target_quat.tolist()))
+                    ik_solver.step(ik_joint_q, ik_joint_q, iterations=int(args.ik_iters))
+                    joint_target_np = ik_joint_q.numpy().reshape(-1).astype(np.float32)
+                    blend = float(np.clip(float(args.ik_target_blend), 0.0, 1.0))
+                    if blend < 1.0:
+                        joint_target_np = prev_joint_q + blend * (joint_target_np - prev_joint_q)
+                    joint_target_np[7:9] = float(args.gripper_open)
+                    joint_target_qd = (joint_target_np - prev_joint_q) / sim_dt
+                    prev_joint_q = joint_target_np.copy()
+                    state_in.joint_q.assign(joint_target_np)
+                    state_in.joint_qd.assign(joint_target_qd)
+                    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
                 if contacts is not None:
                     model.collide(state_in, contacts)
                 solver.step(state_in, state_out, None, contacts, sim_dt)
-                state_out.joint_q.assign(prev_joint_q)
-                state_out.joint_qd.zero_()
-                newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                if tabletop_task:
+                    state_out.joint_q.assign(joint_target_np)
+                    state_out.joint_qd.assign(joint_target_qd)
+                    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                else:
+                    state_out.joint_q.assign(prev_joint_q)
+                    state_out.joint_qd.zero_()
+                    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
                 state_in, state_out = state_out, state_in
-                if settle_drag > 0.0:
+                preroll_drag = tabletop_preroll_drag if tabletop_task else settle_drag
+                if preroll_drag > 0.0:
                     if gravity_axis is not None:
                         wp.launch(
                             _apply_drag_correction_ignore_axis,
@@ -1625,7 +1778,7 @@ def simulate(
                                 state_in.particle_qd,
                                 n_obj,
                                 sim_dt,
-                                settle_drag,
+                                preroll_drag,
                                 wp.vec3(*gravity_axis.tolist()),
                             ],
                             device=device,
@@ -1634,7 +1787,7 @@ def simulate(
                         wp.launch(
                             newton_import_ir._apply_drag_correction,
                             dim=n_obj,
-                            inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, settle_drag],
+                            inputs=[state_in.particle_q, state_in.particle_qd, n_obj, sim_dt, preroll_drag],
                             device=device,
                         )
         if preroll_settle_pass is None:
@@ -1822,6 +1975,7 @@ def render_video(
     device: str,
 ) -> Path:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
+    tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found in PATH")
@@ -1916,6 +2070,9 @@ def render_video(
         robot_base_scale = np.asarray(meta["robot_base_scale"], dtype=np.float32)
         floor_center = np.asarray(meta["floor_center"], dtype=np.float32)
         floor_scale = np.asarray(meta["floor_scale"], dtype=np.float32)
+        table_center = np.asarray(meta.get("table_center", stage_center), dtype=np.float32)
+        table_top_z = meta.get("table_top_z")
+        table_top_z = None if table_top_z is None else float(table_top_z)
         ground_grid_z = float(meta.get("floor_z", 0.0))
         ground_grid_size = float(max(1.10, 1.0 + 0.25 * abs(float(stage_center[0]))))
         ground_grid_steps = 10
@@ -2040,6 +2197,71 @@ def render_video(
                                 anchor_xforms_wp,
                                 anchor_colors_wp,
                             )
+                    elif tabletop_task:
+                        viewer.log_shapes(
+                            "/demo/floor",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in floor_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*floor_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.24, 0.22, 0.19)], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/table_top",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in stage_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*table_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.56, 0.46, 0.34)], dtype=wp.vec3, device=device),
+                        )
+                        leg_height = max(0.10, float(table_center[2] - ground_grid_z - stage_scale[2]))
+                        leg_hz = 0.5 * leg_height
+                        leg_scale = (0.024, 0.024, leg_hz)
+                        leg_offset_x = max(0.06, 0.76 * float(stage_scale[0]))
+                        leg_offset_y = max(0.05, 0.76 * float(stage_scale[1]))
+                        leg_center_z = float(ground_grid_z + leg_hz)
+                        leg_centers = [
+                            [float(table_center[0] - leg_offset_x), float(table_center[1] - leg_offset_y), leg_center_z],
+                            [float(table_center[0] - leg_offset_x), float(table_center[1] + leg_offset_y), leg_center_z],
+                            [float(table_center[0] + leg_offset_x), float(table_center[1] - leg_offset_y), leg_center_z],
+                            [float(table_center[0] + leg_offset_x), float(table_center[1] + leg_offset_y), leg_center_z],
+                        ]
+                        viewer.log_shapes(
+                            "/demo/table_legs",
+                            newton.GeoType.BOX,
+                            leg_scale,
+                            wp.array(
+                                [wp.transform(wp.vec3(*center), wp.quat_identity()) for center in leg_centers],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.39, 0.31, 0.24) for _ in leg_centers], dtype=wp.vec3, device=device),
+                        )
+                        viewer.log_shapes(
+                            "/demo/robot_pedestal",
+                            newton.GeoType.BOX,
+                            tuple(float(v) for v in robot_base_scale.tolist()),
+                            wp.array(
+                                [wp.transform(wp.vec3(*robot_base_center.tolist()), wp.quat_identity())],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(0.44, 0.38, 0.31)], dtype=wp.vec3, device=device),
+                        )
+                        if anchor_xforms_wp is not None and anchor_colors_wp is not None:
+                            viewer.log_shapes(
+                                "/demo/rope_clamps",
+                                newton.GeoType.SPHERE,
+                                0.014,
+                                anchor_xforms_wp,
+                                wp.array([wp.vec3(0.28, 0.82, 0.42) for _ in range(anchor_positions.shape[0])], dtype=wp.vec3, device=device),
+                            )
                     else:
                         viewer.log_shapes(
                             "/demo/floor",
@@ -2149,7 +2371,11 @@ def render_video(
                         frame,
                         [
                             f"task: {args.task} | phase: {phase_name}",
-                            "Native Newton Franka Panda + rope drop baseline | yellow=target, cyan=gripper center",
+                            (
+                                "Native Newton Franka Panda + tabletop rope push | yellow=target, cyan=gripper center"
+                                if tabletop_task
+                                else "Native Newton Franka Panda + rope drop baseline | yellow=target, cyan=gripper center"
+                            ),
                             tracking_line,
                             f"contact: {contact_state} via {min_proxy_name} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm",
                         ],
@@ -2179,6 +2405,7 @@ def build_summary(
     out_mp4: Path,
 ) -> dict[str, Any]:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
+    tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
     particle_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
     body_q = np.asarray(sim_data["body_q"], dtype=np.float32)
     body_vel = np.asarray(sim_data["body_vel"], dtype=np.float32)
@@ -2201,9 +2428,16 @@ def build_summary(
     rope_com = particle_q.mean(axis=1)
     rope_min_z = np.min(particle_q[:, :, 2], axis=1)
     ground_z = float(meta.get("floor_z", 0.0))
+    table_top_z = meta.get("table_top_z")
+    table_top_z = None if table_top_z is None else float(table_top_z)
     rope_surface_clearance_to_ground = np.min(
         particle_q[:, :, 2] - particle_radius[None, :], axis=1
     ) - ground_z
+    rope_surface_clearance_to_table = (
+        None
+        if table_top_z is None
+        else np.min(particle_q[:, :, 2] - particle_radius[None, :], axis=1) - table_top_z
+    )
     rope_com_disp = float(np.linalg.norm(rope_com[-1] - rope_com[0]))
     mid_segment_indices = np.asarray(meta["mid_segment_indices"], dtype=np.int32)
     mid_segment_z = particle_q[:, mid_segment_indices, 2].mean(axis=1)
@@ -2214,7 +2448,7 @@ def build_summary(
     rope_com_vertical_speed_series = np.asarray(sim_data.get("rope_com_vertical_speed_series"), dtype=np.float32)
     rope_spring_energy_proxy_series = np.asarray(sim_data.get("rope_spring_energy_proxy_series"), dtype=np.float32)
     phase_names = [str(_task_phase_state(float(i) * frame_dt, meta)[0]) for i in range(particle_q.shape[0])]
-    pre_frames = [i for i, name in enumerate(phase_names) if name == "pre_approach"]
+    pre_frames = [i for i, name in enumerate(phase_names) if name in {"pre_approach", "settle"}]
     baseline_z = float(np.mean(mid_segment_z[pre_frames])) if pre_frames else float(mid_segment_z[0])
     rope_mid_peak_z_delta = float(np.max(mid_segment_z) - baseline_z)
     rope_mid_final_z_delta = float(mid_segment_z[-1] - baseline_z)
@@ -2258,6 +2492,12 @@ def build_summary(
 
     ground_contact_mask = np.asarray(rope_surface_clearance_to_ground <= 0.0, dtype=bool)
     ground_contact_frames = np.flatnonzero(ground_contact_mask).tolist()
+    table_contact_mask = (
+        np.asarray(rope_surface_clearance_to_table <= 0.0, dtype=bool)
+        if rope_surface_clearance_to_table is not None
+        else np.zeros_like(ground_contact_mask)
+    )
+    table_contact_frames = np.flatnonzero(table_contact_mask).tolist()
     contact_mask = ground_contact_mask if drop_release_task else support_contact_mask
     contact_frames = ground_contact_frames if drop_release_task else support_contact_frames
     primary_clearance = rope_surface_clearance_to_ground if drop_release_task else np.asarray(min_clearance, dtype=np.float32)
@@ -2280,7 +2520,7 @@ def build_summary(
     actual_release_frame = sim_data.get("release_frame_actual")
     if isinstance(actual_release_frame, (int, np.integer)):
         release_frame = int(actual_release_frame)
-    elif drop_release_task:
+    elif drop_release_task or tabletop_task:
         release_frame = None
 
     pre_contact_mask = np.asarray([name == "pre_approach" for name in phase_names], dtype=bool)
@@ -2413,8 +2653,17 @@ def build_summary(
         "gripper_center_speed_release_mean_m_s": release_speed_mean,
         "gripper_center_path_length_m": gripper_path_length,
         "ground_z_m": float(ground_z),
+        "table_top_z_m": table_top_z,
         "rope_min_z_m": float(np.min(rope_min_z)),
         "rope_surface_clearance_min_m": float(np.min(rope_surface_clearance_to_ground)),
+        "rope_surface_clearance_to_table_min_m": (
+            None if rope_surface_clearance_to_table is None else float(np.min(rope_surface_clearance_to_table))
+        ),
+        "table_contact_active_frames": int(len(table_contact_frames)),
+        "table_contact_duration_s": float(np.count_nonzero(table_contact_mask) * frame_dt),
+        "table_contact_peak_frame": (
+            None if rope_surface_clearance_to_table is None else int(np.argmin(rope_surface_clearance_to_table))
+        ),
         "support_contact_active_frames": int(len(support_contact_frames)),
         "support_contact_duration_s": float(support_contact_duration_s),
         "support_first_contact_frame": support_first_contact_frame,
@@ -2426,7 +2675,9 @@ def build_summary(
         "support_patch_center_m": np.asarray(meta.get("support_patch_center_m", meta["anchor_positions"].mean(axis=0)), dtype=np.float32).astype(float).tolist(),
         "visible_support_center_m": np.asarray(meta.get("visible_support_center_m", meta["anchor_positions"].mean(axis=0)), dtype=np.float32).astype(float).tolist(),
         "contact_proxy_mode": (
-            "rope_surface_vs_ground_plane" if drop_release_task else "min(gripper_center,left_finger,right_finger,finger_span)"
+            "rope_surface_vs_ground_plane"
+            if drop_release_task
+            else "min(gripper_center,left_finger,right_finger,finger_span)"
         ),
         "contact_proxy_radius_m": (
             0.0 if drop_release_task else float(_gripper_contact_proxy_radii(float(args.ee_contact_radius))["gripper_center"])
@@ -2496,7 +2747,7 @@ def build_summary(
         "drag_phase_gating": (
             "pre_approach + release_retract"
             if str(args.task) == "lift_release"
-            else "always_on"
+            else ("always_on_quasi_static" if tabletop_task else "always_on")
         ),
     }
 

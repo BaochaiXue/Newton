@@ -1,0 +1,25 @@
+{
+  "run_id": "",
+  "status": "candidate",
+  "task": "robot_rope_franka_hero",
+  "output_root": "results/robot_rope_franka/candidates/<timestamp>_<short_tag>",
+  "videos": {
+    "hero_presentation": "hero_presentation.mp4",
+    "hero_debug": "hero_debug.mp4",
+    "validation_camera": "validation_camera.mp4"
+  },
+  "required_outputs": [
+    "manifest.json",
+    "run_command.txt",
+    "metrics.json",
+    "validation.md",
+    "ffprobe.json",
+    "contact_sheet.png",
+    "keyframes/"
+  ],
+  "validation": {
+    "validator": "scripts/validate_robot_rope_franka_hero.py",
+    "manual_review_json": "manual_review.json",
+    "notes": "Fill the manual review JSON with explicit YES/NO answers before promotion."
+  }
+}
