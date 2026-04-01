@@ -1,5 +1,5 @@
 {
-  "task_slug": "robot_rope_franka_tabletop_push",
+  "task_slug": "robot_rope_franka_tabletop_push_hero",
   "status": "planned",
   "bundle_root": "Newton/phystwin_bridge/results/robot_rope_franka",
   "entrypoint": "Newton/phystwin_bridge/demos/demo_robot_rope_franka.py",

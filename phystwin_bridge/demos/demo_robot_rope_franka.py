@@ -143,6 +143,7 @@ from rope_demo_common import (  # noqa: E402
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 MID_SEGMENT_WINDOW_SIZE = 24
 DROP_RELEASE_TASK = "drop_release_baseline"
+TABLETOP_PUSH_TASK = "tabletop_push_hero"
 
 FRANKA_INIT_Q = np.asarray(
     [
@@ -174,12 +175,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=path_defaults.default_device())
     p.add_argument(
         "--task",
-        choices=["lift_release", "push_probe", "drop_release_baseline"],
+        choices=["lift_release", "push_probe", "drop_release_baseline", TABLETOP_PUSH_TASK],
         default="lift_release",
         help=(
             "Task preset. `lift_release` is the meeting-ready default; "
             "`push_probe` keeps the older contact-probe behavior; "
-            "`drop_release_baseline` is the stage-0 gravity drop sanity case."
+            "`drop_release_baseline` is the stage-0 gravity drop sanity case; "
+            f"`{TABLETOP_PUSH_TASK}` is the slow tabletop push hero demo."
         ),
     )
     p.add_argument(
@@ -412,6 +414,106 @@ def parse_args() -> argparse.Namespace:
         help="Maximum hidden settle time before the recorded support/release sequence starts [s].",
     )
     p.add_argument(
+        "--tabletop-settle-seconds",
+        type=float,
+        default=0.9,
+        help="Initial stillness window before the tabletop push starts [s].",
+    )
+    p.add_argument(
+        "--tabletop-approach-seconds",
+        type=float,
+        default=1.2,
+        help="Approach-to-contact phase for the tabletop push hero [s].",
+    )
+    p.add_argument(
+        "--tabletop-push-seconds",
+        type=float,
+        default=2.6,
+        help="Slow lateral push phase for the tabletop push hero [s].",
+    )
+    p.add_argument(
+        "--tabletop-hold-seconds",
+        type=float,
+        default=0.8,
+        help="Short hold phase after the tabletop push reaches the target [s].",
+    )
+    p.add_argument(
+        "--tabletop-retract-seconds",
+        type=float,
+        default=1.1,
+        help="Retract-and-settle phase after the tabletop push [s].",
+    )
+    p.add_argument(
+        "--tabletop-rope-height",
+        type=float,
+        default=0.135,
+        help="Target rope center height used for the tabletop push hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-table-top-z",
+        type=float,
+        default=0.120,
+        help="World-space tabletop surface height [m].",
+    )
+    p.add_argument(
+        "--tabletop-table-hx",
+        type=float,
+        default=0.42,
+        help="Table half-extent in X for the tabletop push hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-table-hy",
+        type=float,
+        default=0.24,
+        help="Table half-extent in Y for the tabletop push hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-table-hz",
+        type=float,
+        default=0.020,
+        help="Table thickness half-extent in Z for the tabletop push hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-robot-base-offset",
+        type=float,
+        nargs=3,
+        default=(0.56, -0.34, 0.10),
+        metavar=("X", "Y", "Z"),
+        help="Robot base offset relative to the rope/table center for the tabletop hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-push-start-offset",
+        type=float,
+        nargs=3,
+        default=(-0.28, -0.12, 0.11),
+        metavar=("X", "Y", "Z"),
+        help="Approach start offset relative to the rope/table center for the tabletop hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-push-contact-offset",
+        type=float,
+        nargs=3,
+        default=(-0.10, -0.06, 0.02),
+        metavar=("X", "Y", "Z"),
+        help="Contact-ready offset relative to the rope/table center for the tabletop hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-push-end-offset",
+        type=float,
+        nargs=3,
+        default=(0.18, -0.06, 0.02),
+        metavar=("X", "Y", "Z"),
+        help="Push end offset relative to the rope/table center for the tabletop hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-retract-offset",
+        type=float,
+        nargs=3,
+        default=(0.24, -0.20, 0.18),
+        metavar=("X", "Y", "Z"),
+        help="Retract offset relative to the rope/table center for the tabletop hero [m].",
+    )
+    p.add_argument(
         "--pre-release-settle-damping-scale",
         type=float,
         default=8.0,
@@ -461,6 +563,14 @@ def _total_task_duration(args: argparse.Namespace) -> float:
             + float(args.drop_support_seconds)
             + float(args.drop_release_seconds)
             + float(args.drop_freefall_seconds)
+        )
+    if str(args.task) == TABLETOP_PUSH_TASK:
+        return float(
+            float(args.tabletop_settle_seconds)
+            + float(args.tabletop_approach_seconds)
+            + float(args.tabletop_push_seconds)
+            + float(args.tabletop_hold_seconds)
+            + float(args.tabletop_retract_seconds)
         )
     return float(
         float(args.settle_seconds)
@@ -721,6 +831,7 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
     task = str(meta.get("task", ""))
     floor_z = float(meta.get("floor_z", 0.0))
     support_point = np.asarray(meta.get("support_point", anchor_bar_center), dtype=np.float32)
+    table_center = np.asarray(meta.get("table_center", stage_center), dtype=np.float32)
 
     if task == DROP_RELEASE_TASK:
         hero_target = np.asarray(
@@ -755,6 +866,45 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "pos": validation_pos.astype(np.float32, copy=False).tolist(),
                 "pitch": -12.0,
                 "yaw": -42.0,
+                "fov": 46.0,
+                "target": validation_target.astype(np.float32, copy=False).tolist(),
+            },
+        }
+
+    if task == TABLETOP_PUSH_TASK:
+        push_focus = np.asarray(meta.get("tabletop_push_focus", rope_center), dtype=np.float32)
+        hero_target = np.asarray(
+            [
+                float(0.42 * table_center[0] + 0.58 * push_focus[0] - 0.08),
+                float(0.42 * table_center[1] + 0.58 * push_focus[1] - 0.16),
+                float(max(table_center[2] + 0.20, rope_center[2] + 0.08)),
+            ],
+            dtype=np.float32,
+        )
+        hero_pos = camera_position(hero_target, yaw_deg=-28.0, pitch_deg=-22.0, distance=1.70)
+
+        validation_target = np.asarray(
+            [
+                float(push_focus[0]),
+                float(push_focus[1]),
+                float(max(table_center[2] + 0.14, rope_center[2] + 0.04)),
+            ],
+            dtype=np.float32,
+        )
+        validation_pos = camera_position(validation_target, yaw_deg=142.0, pitch_deg=-20.0, distance=1.85)
+
+        return {
+            "hero": {
+                "pos": hero_pos.astype(np.float32, copy=False).tolist(),
+                "pitch": -22.0,
+                "yaw": -28.0,
+                "fov": 34.0,
+                "target": hero_target.astype(np.float32, copy=False).tolist(),
+            },
+            "validation": {
+                "pos": validation_pos.astype(np.float32, copy=False).tolist(),
+                "pitch": -20.0,
+                "yaw": 142.0,
                 "fov": 46.0,
                 "target": validation_target.astype(np.float32, copy=False).tolist(),
             },
@@ -914,6 +1064,50 @@ def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -
                 "duration": float(args.drop_freefall_seconds),
                 "start": support,
                 "end": support,
+                "quat": target_quat,
+            },
+        ]
+
+    if str(args.task) == TABLETOP_PUSH_TASK:
+        settle = rope_center + np.asarray([-0.22, -0.16, 0.14], dtype=np.float32)
+        approach = settle + np.asarray([0.08, 0.04, -0.03], dtype=np.float32)
+        contact_ready = rope_center + np.asarray(np.asarray(args.tabletop_push_contact_offset, dtype=np.float32), dtype=np.float32)
+        push_end = rope_center + np.asarray(np.asarray(args.tabletop_push_end_offset, dtype=np.float32), dtype=np.float32)
+        retract = rope_center + np.asarray(np.asarray(args.tabletop_retract_offset, dtype=np.float32), dtype=np.float32)
+        return [
+            {
+                "name": "settle",
+                "duration": float(args.tabletop_settle_seconds),
+                "start": settle,
+                "end": settle,
+                "quat": target_quat,
+            },
+            {
+                "name": "approach",
+                "duration": float(args.tabletop_approach_seconds),
+                "start": settle,
+                "end": approach,
+                "quat": target_quat,
+            },
+            {
+                "name": "push",
+                "duration": float(args.tabletop_push_seconds),
+                "start": contact_ready,
+                "end": push_end,
+                "quat": target_quat,
+            },
+            {
+                "name": "hold",
+                "duration": float(args.tabletop_hold_seconds),
+                "start": push_end,
+                "end": push_end,
+                "quat": target_quat,
+            },
+            {
+                "name": "retract",
+                "duration": float(args.tabletop_retract_seconds),
+                "start": push_end,
+                "end": retract,
                 "quat": target_quat,
             },
         ]

@@ -418,6 +418,8 @@ def _build_potential_self_collision_table(
     capacity: int,
     collision_indices: wp.array2d(dtype=wp.int32),
     collision_number: wp.array(dtype=wp.int32),
+    collision_candidate_total: wp.array(dtype=wp.int32),
+    collision_candidate_truncated: wp.array(dtype=wp.int32),
 ):
     tid = wp.tid()
     i = wp.hash_grid_point_id(grid, tid)
@@ -438,10 +440,13 @@ def _build_potential_self_collision_table(
         dis = particle_x[index] - x1
         dis_len = wp.length(dis)
         if dis_len < collision_dist:
+            collision_candidate_total[i] = collision_candidate_total[i] + 1
             count = collision_number[i]
             if count < capacity:
                 collision_indices[i, count] = index
                 collision_number[i] = count + 1
+            else:
+                collision_candidate_truncated[i] = collision_candidate_truncated[i] + 1
 
 
 def build_potential_self_collision_table(
@@ -456,8 +461,12 @@ def build_potential_self_collision_table(
     collision_table_capacity: int,
     collision_indices: Any,
     collision_number: Any,
+    collision_candidate_total: Any,
+    collision_candidate_truncated: Any,
 ) -> None:
     collision_number.zero_()
+    collision_candidate_total.zero_()
+    collision_candidate_truncated.zero_()
     wp.launch(
         kernel=_build_potential_self_collision_table,
         dim=particle_count,
@@ -469,7 +478,12 @@ def build_potential_self_collision_table(
             float(collision_dist),
             int(collision_table_capacity),
         ],
-        outputs=[collision_indices, collision_number],
+        outputs=[
+            collision_indices,
+            collision_number,
+            collision_candidate_total,
+            collision_candidate_truncated,
+        ],
         device=device,
     )
 

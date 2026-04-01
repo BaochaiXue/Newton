@@ -6,6 +6,8 @@ Last updated: 2026-04-01
 
 - Target:
   - native Newton Franka + native Newton table + PhysTwin rope tabletop push
+- Task page:
+  - `docs/bridge/tasks/robot_rope_franka_tabletop_push_hero.md`
 - Main code path:
   - `demos/demo_robot_rope_franka.py`
 - Local result root:
