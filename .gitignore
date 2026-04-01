@@ -6,6 +6,26 @@ phystwin_bridge/results/*
 !phystwin_bridge/results/robot_rope_franka/
 !phystwin_bridge/results/robot_rope_franka/**
 
+# Robot-rope hero candidate runs keep lightweight provenance at the run root,
+# but all render/validation payloads are treated as generated artifacts.
+phystwin_bridge/results/robot_rope_franka/candidates/*/presentation/
+phystwin_bridge/results/robot_rope_franka/candidates/*/debug/
+phystwin_bridge/results/robot_rope_franka/candidates/*/validation/
+phystwin_bridge/results/robot_rope_franka/candidates/*/work/
+phystwin_bridge/results/robot_rope_franka/candidates/*/sim/history/
+phystwin_bridge/results/robot_rope_franka/candidates/*/hero_presentation.mp4
+phystwin_bridge/results/robot_rope_franka/candidates/*/hero_debug.mp4
+phystwin_bridge/results/robot_rope_franka/candidates/*/validation_camera.mp4
+phystwin_bridge/results/robot_rope_franka/candidates/*/summary.json
+phystwin_bridge/results/robot_rope_franka/candidates/*/physics_validation.json
+phystwin_bridge/results/robot_rope_franka/candidates/*/metrics.json
+phystwin_bridge/results/robot_rope_franka/candidates/*/validation.md
+phystwin_bridge/results/robot_rope_franka/candidates/*/ffprobe.json
+phystwin_bridge/results/robot_rope_franka/candidates/*/manifest.json
+phystwin_bridge/results/robot_rope_franka/candidates/*/contact_sheet.png
+phystwin_bridge/results/robot_rope_franka/candidates/*/contact_sheets/
+phystwin_bridge/results/robot_rope_franka/candidates/*/keyframes/
+
 # Temporary render artifacts
 phystwin_bridge/**/._tmp_cmp2x3_*/
 phystwin_bridge/**/._frames_*/

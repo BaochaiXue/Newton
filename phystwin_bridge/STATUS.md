@@ -1,28 +1,15 @@
 # phystwin_bridge Status
 
-## Current Focus
+> status: deprecated
+> canonical_replacement: `docs/bridge/current_status.md`
+> owner_surface: `bridge_control_plane`
+> last_reviewed: `2026-04-01`
+> notes: Legacy subtree status surface kept only as a pointer for users who enter through `Newton/phystwin_bridge/`.
 
-- Hero-demo validation pipeline for the native Newton Franka + native Newton
-  table + PhysTwin rope workflow.
-- New strict validator:
-  - `scripts/validate_robot_rope_franka_hero.py`
+Do not use this file as the canonical bridge status surface.
 
-## Canonical Result Root
+Use:
 
-- `Newton/phystwin_bridge/results/robot_rope_franka/`
-
-## Expected Candidate Layout
-
-- `candidates/<timestamp>_<short_tag>/`
-  - `manifest.json`
-  - `run_command.txt`
-  - `metrics.json`
-  - `validation.md`
-  - `ffprobe.json`
-  - `contact_sheet.png`
-  - `keyframes/`
-
-## Current State
-
-- Validation workflow scaffolded.
-- No accepted hero run has been selected yet.
+- `docs/bridge/current_status.md`
+- `docs/bridge/tasks/robot_rope_franka_tabletop_push_hero.md`
+- `Newton/phystwin_bridge/results/robot_rope_franka/README.md`

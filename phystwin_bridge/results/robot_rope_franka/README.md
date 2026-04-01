@@ -1,12 +1,12 @@
 # Robot Rope Franka Hero Results
 
-Canonical result root for the native Newton Franka + native Newton table +
-PhysTwin rope hero demo.
+Local result root for the native Newton Franka + native Newton table +
+PhysTwin rope hero-demo workflow.
 
 ## Expected Layout
 
 - `BEST_RUN/`
-  - authoritative accepted run and its copied/pinned artifacts
+  - local convenience slot for an accepted run once one exists
 - `candidates/<timestamp>_<short_tag>/`
   - each candidate run folder with:
     - `manifest.json`
@@ -38,6 +38,18 @@ The validator writes:
 - `manifest.json` when absent
 - `run_command.txt` when absent
 
+Wrapper for the full three-video local candidate flow:
+
+```bash
+scripts/run_robot_rope_franka_hero.sh --slug <short_tag> [extra demo args...]
+```
+
 ## Status
 
-This bundle is a workflow scaffold. No accepted hero run has been selected yet.
+This bundle is still a workflow scaffold. No accepted hero run has been
+selected yet.
+
+Current blocker:
+
+- stable tabletop-smoke runs can now preroll-settle the rope, but the robot
+  still does not make credible contact with the rope under the stable timestep

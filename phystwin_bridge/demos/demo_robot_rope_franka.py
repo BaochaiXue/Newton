@@ -446,13 +446,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tabletop-rope-height",
         type=float,
-        default=0.135,
+        default=0.070,
         help="Target rope center height used for the tabletop push hero [m].",
     )
     p.add_argument(
         "--tabletop-table-top-z",
         type=float,
-        default=0.120,
+        default=0.000,
         help="World-space tabletop surface height [m].",
     )
     p.add_argument(
@@ -477,7 +477,7 @@ def parse_args() -> argparse.Namespace:
         "--tabletop-robot-base-offset",
         type=float,
         nargs=3,
-        default=(0.56, -0.34, 0.10),
+        default=(-0.56, -0.34, 0.10),
         metavar=("X", "Y", "Z"),
         help="Robot base offset relative to the rope/table center for the tabletop hero [m].",
     )
@@ -512,6 +512,12 @@ def parse_args() -> argparse.Namespace:
         default=(0.24, -0.20, 0.18),
         metavar=("X", "Y", "Z"),
         help="Retract offset relative to the rope/table center for the tabletop hero [m].",
+    )
+    p.add_argument(
+        "--tabletop-initial-pose",
+        choices=["ir_shifted", "tabletop_curve"],
+        default="ir_shifted",
+        help="Initial rope pose for the tabletop hero: preserve the shifted IR shape or apply a hand-shaped tabletop curve.",
     )
     p.add_argument(
         "--tabletop-preroll-settle-seconds",
@@ -999,6 +1005,25 @@ def _mid_segment_indices(points: np.ndarray, rope_center: np.ndarray, count: int
     return np.argsort(d)[: max(1, int(count))].astype(np.int32)
 
 
+def _reshape_rope_for_tabletop(
+    points: np.ndarray,
+    *,
+    table_top_z: float,
+    particle_radius: float,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32).copy()
+    n = points.shape[0]
+    if n <= 1:
+        return points
+    u = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    surface_z = float(table_top_z) + float(particle_radius) + 0.004
+    arch = 0.016 * np.square(2.0 * u - 1.0)
+    s_curve = 0.028 * np.sin(2.0 * np.pi * u)
+    points[:, 1] = points[:, 1] + s_curve.astype(np.float32, copy=False)
+    points[:, 2] = (surface_z + arch).astype(np.float32, copy=False)
+    return points
+
+
 def _task_phase_definitions(rope_center: np.ndarray, args: argparse.Namespace) -> list[dict[str, Any]]:
     rope_center = np.asarray(rope_center, dtype=np.float32)
     target_quat = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -1190,6 +1215,20 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         dtype=np.float32,
     )
     shifted_q = x0 + shift
+    if tabletop_task and str(args.tabletop_initial_pose) == "tabletop_curve":
+        collision_radius_arr = np.asarray(
+            ir_obj.get(
+                "collision_radius",
+                ir_obj.get("contact_collision_dist", np.full((n_obj,), 0.026, dtype=np.float32)),
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
+        particle_radius_ref = float(collision_radius_arr[0]) if collision_radius_arr.size else 0.026
+        shifted_q[:n_obj] = _reshape_rope_for_tabletop(
+            shifted_q[:n_obj],
+            table_top_z=float(args.tabletop_table_top_z),
+            particle_radius=particle_radius_ref,
+        )
     rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
     if drop_release_task:
         anchor_indices = _anchor_particle_indices(
@@ -1231,10 +1270,11 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     _, _, _ = newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts=bool(particle_contacts))
     newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
     builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
-    for idx in anchor_indices.tolist():
-        builder.particle_flags[idx] = int(builder.particle_flags[idx]) & ~int(newton.ParticleFlags.ACTIVE)
-        if (not drop_release_task) and str(args.anchor_mass_mode) == "zero":
-            builder.particle_mass[idx] = 0.0
+    if not tabletop_task:
+        for idx in anchor_indices.tolist():
+            builder.particle_flags[idx] = int(builder.particle_flags[idx]) & ~int(newton.ParticleFlags.ACTIVE)
+            if (not drop_release_task) and str(args.anchor_mass_mode) == "zero":
+                builder.particle_mass[idx] = 0.0
 
     support_patch_center_shifted = np.mean(anchor_positions, axis=0).astype(np.float32, copy=False) if anchor_positions.size else rope_center
     if tabletop_task:
@@ -1268,7 +1308,12 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     ee_body_index = _find_index_by_suffix(builder.body_label, "/fr3_link7")
     left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
     right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
-    ee_offset_local = np.asarray([0.0, 0.0, 0.22], dtype=np.float32)
+    if tabletop_task:
+        ee_body_index = int(left_finger_index)
+    ee_offset_local = np.asarray(
+        [0.0, 0.0, 0.0] if tabletop_task else [0.0, 0.0, 0.22],
+        dtype=np.float32,
+    )
     floor_z = 0.0
     table_top_z = float(args.tabletop_table_top_z) if tabletop_task else None
     if drop_release_task:
@@ -1432,7 +1477,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         }
     )
 
-    if drop_release_task or tabletop_task:
+    if drop_release_task:
         ground_cfg = builder.default_shape_cfg.copy()
         newton_import_ir._configure_ground_contact_material(
             ground_cfg,
@@ -2254,14 +2299,6 @@ def render_video(
                             ),
                             wp.array([wp.vec3(0.44, 0.38, 0.31)], dtype=wp.vec3, device=device),
                         )
-                        if anchor_xforms_wp is not None and anchor_colors_wp is not None:
-                            viewer.log_shapes(
-                                "/demo/rope_clamps",
-                                newton.GeoType.SPHERE,
-                                0.014,
-                                anchor_xforms_wp,
-                                wp.array([wp.vec3(0.28, 0.82, 0.42) for _ in range(anchor_positions.shape[0])], dtype=wp.vec3, device=device),
-                            )
                     else:
                         viewer.log_shapes(
                             "/demo/floor",
@@ -2621,7 +2658,11 @@ def build_summary(
         "rope_total_mass": float(meta["total_object_mass"]),
         "anchor_count": int(meta["anchor_indices"].shape[0]),
         "anchor_constraint_mode": (
-            "inactive_fixed_particles_until_release" if drop_release_task else "inactive_fixed_particles"
+            (
+                "inactive_fixed_particles_until_release"
+                if drop_release_task
+                else ("free_tabletop_rope" if tabletop_task else "inactive_fixed_particles")
+            )
         ),
         "anchor_mass_mode": str(args.anchor_mass_mode),
         "task": str(args.task),
