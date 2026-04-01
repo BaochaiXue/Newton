@@ -4878,7 +4878,12 @@ def build_summary(
         final_penetration_p99 = float(np.quantile(penetration[-1], 0.99))
     bunny_mesh_max_penetration = None
     bunny_mesh_final_p99_penetration = None
-    if str(meta.get("rigid_shape")) == "bunny" and body_q.ndim == 3 and body_q.shape[1] > 0:
+    if (
+        not bool(args.skip_render)
+        and str(meta.get("rigid_shape")) == "bunny"
+        and body_q.ndim == 3
+        and body_q.shape[1] > 0
+    ):
         faces = np.asarray(meta.get("mesh_tri_indices", np.zeros((0, 3), dtype=np.int32)), dtype=np.int32)
         verts_local = np.asarray(meta.get("mesh_verts_local", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
         if faces.size and verts_local.size:

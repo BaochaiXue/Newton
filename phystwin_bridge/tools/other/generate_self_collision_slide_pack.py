@@ -169,6 +169,7 @@ def main() -> int:
 - `newton_import_ir.py:973-980` maps `contact_collision_dist` into Newton per-particle radius semantics.
 - `demo_cloth_box_drop_with_self_contact.py:260-298` defines `off/native/custom/phystwin` and marks `particle-self-contact-scale` as compatibility-only.
 - `self_contact_bridge_kernels.py:235-304` implements the bridge-side PhysTwin-style velocity operator.
+- PhysTwin cloth parity source only defines pairwise `object_collision` plus implicit `integrate_ground_collision`.
 """
     slide3_md = """# Cloth+Box Decision Matrix
 
@@ -178,6 +179,7 @@ def main() -> int:
   - scene evidence from this matrix
   - source-code semantic mismatch
   - operator-level exactness requirement
+- Strict `phystwin` parity is not claimed on the box scene because the PhysTwin source does not define generic box-support contact for this path.
 - Final conclusion: native is not sufficient as the final solution.
 """
     slide4_md = f"""# Bridge-Side PhysTwin Exactness
@@ -197,6 +199,7 @@ def main() -> int:
 - Camera: top-down presentation view
 - Ground plane: disabled
 - Pair semantics: zero excluded pairs
+- This slide is scene-level demo evidence, not the strict parity scope.
 """
     slide6_md = f"""# Strict Self-Collision Parity
 
@@ -206,6 +209,7 @@ def main() -> int:
 - `rmse_max = {parity['rmse_max']}`
 - `first30_rmse = {parity['first30_rmse']}`
 - `last30_rmse = {parity['last30_rmse']}`
+- Strict parity scope: PhysTwin-native cloth contact only (`object_collision` + implicit `z=0` ground plane).
 - Conclusion: the current bridge rollout semantics do not satisfy the requested `1e-5` gate on the in-scope cloth self-collision case.
 """
 
@@ -244,6 +248,7 @@ def main() -> int:
         "The importer maps PhysTwin pairwise collision distance into Newton particle-radius semantics.",
         "The cloth-box driver explicitly separates off/native/custom/phystwin.",
         "The exact PhysTwin-style operator is introduced bridge-side, not in Newton core.",
+        "PhysTwin cloth parity source only defines object_collision plus implicit z=0 ground.",
     ]
     _render_code_slide("Source-Code Evidence", blocks, slide2_bullets, out_dir / "02_native_source_code_evidence.png")
 
@@ -251,6 +256,7 @@ def main() -> int:
         "Controlled cloth+box scene only.",
         "The matrix scorer provisionally ranks native, but that is not the campaign decision.",
         "The final decision combines this scene evidence with the source-code semantic mismatch and the exactness gate.",
+        "Strict phystwin parity is intentionally not claimed on the box scene.",
         "Final conclusion: native is not sufficient as the final solution.",
     ]
     _render_image_slide(
@@ -276,6 +282,7 @@ def main() -> int:
         "Top-down presentation camera",
         "Ground plane disabled",
         "Pair semantics: zero excluded pairs",
+        "Scene-level demo evidence only, not the strict parity scope.",
     ]
     _render_image_slide(
         "Final Demo A",
@@ -291,6 +298,7 @@ def main() -> int:
         f"rmse_max = {parity['rmse_max']}",
         f"first30_rmse = {parity['first30_rmse']}",
         f"last30_rmse = {parity['last30_rmse']}",
+        "Strict scope: object_collision + implicit z=0 ground plane.",
         "Conclusion: the current bridge rollout semantics do not satisfy the requested 1e-5 gate on the in-scope cloth self-collision case.",
     ]
     _render_image_slide(

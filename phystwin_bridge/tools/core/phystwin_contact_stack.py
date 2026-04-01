@@ -162,7 +162,7 @@ def build_strict_phystwin_contact_context(
         )
     )
     reverse_z = bool(np.asarray(ir.get("reverse_z", np.asarray(True))).reshape(-1)[0])
-    reverse_factor = 1.0 if reverse_z else -1.0
+    reverse_factor = -1.0 if reverse_z else 1.0
 
     gravity_arg = getattr(cfg, "gravity", None)
     gravity_mag = abs(float(gravity_arg)) if gravity_arg is not None else abs(float(getattr(cfg, "gravity_mag", 9.8)))
