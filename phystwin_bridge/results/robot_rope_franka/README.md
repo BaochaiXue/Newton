@@ -1,7 +1,22 @@
+> status: local-only
+> canonical_replacement: `results_meta/tasks/robot_rope_franka_tabletop_push_hero.json`
+> owner_surface: `robot_rope_franka_tabletop_push_hero`
+> last_reviewed: `2026-04-01`
+> review_interval: `30d`
+> update_rule: `Update only for local navigation or bundle-layout changes. Do not use this page as committed authority.`
+> notes: Local bundle-root overview only. Committed promoted-run meaning lives in results_meta.
+
 # Robot Rope Franka Hero Results
 
 Local result root for the native Newton Franka + native Newton table +
 PhysTwin rope hero-demo workflow.
+
+Do not use this page as the committed source of truth for current/promoted run
+meaning. Use:
+
+- `results_meta/tasks/robot_rope_franka_tabletop_push_hero.json`
+- `results_meta/INDEX.md`
+- `results_meta/LATEST.md`
 
 ## Expected Layout
 
@@ -41,20 +56,24 @@ The validator writes:
 Wrapper for the full three-video local candidate flow:
 
 ```bash
-scripts/run_robot_rope_franka_hero.sh --slug <short_tag> [extra demo args...]
+scripts/run_robot_rope_franka_tabletop_hero.sh --tag <short_tag> [extra demo args...]
 ```
 
-## Status
+## Current Local Convenience Pointers
 
-Accepted hero run:
+Current committed promoted run id:
+
+- `20260401_081639_fixeddt_c08_gatepass`
+
+Local candidate directory:
 
 - `candidates/20260401_081639_fixeddt_c08_gatepass/`
 
-Promoted mirror:
+Local convenience mirror:
 
 - `BEST_RUN/`
 
-Accepted claim:
+Claim boundary mirrored from the committed registry:
 
 - native Newton Franka
 - native Newton tabletop support
@@ -63,7 +82,7 @@ Accepted claim:
 - readable robot-caused rope deformation / sliding
 - strict validator + truthful manual review both pass
 
-Implementation note:
+Implementation note kept for reruns:
 
 - the accepted run uses a tabletop-only native joint-space waypoint controller
   inside `demo_robot_rope_franka.py` because the earlier tabletop IK path did

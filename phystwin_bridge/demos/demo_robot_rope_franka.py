@@ -165,7 +165,7 @@ TABLETOP_FRANKA_Q_PRE = np.asarray(
     dtype=np.float32,
 )
 TABLETOP_FRANKA_Q_PUSH_START = np.asarray(
-    [0.374, 0.834, 0.036, -1.997, -0.040, 2.518, 0.528, 0.04, 0.04],
+    [0.28778, 0.86028, 0.08928, -1.95776, 0.07106, 2.5288, 0.6783, 0.04, 0.04],
     dtype=np.float32,
 )
 TABLETOP_FRANKA_Q_PUSH_END = np.asarray(
@@ -222,8 +222,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--tabletop-control-mode",
         choices=["ik", "joint_trajectory"],
-        default="ik",
-        help="Controller used only for tabletop_push_hero. `ik` is the default meeting-facing path; `joint_trajectory` replays a fixed native Franka joint-space waypoint sequence.",
+        default="joint_trajectory",
+        help="Controller used only for tabletop_push_hero. `joint_trajectory` is the current promoted path; `ik` remains available for bounded tabletop contact experiments.",
     )
     p.add_argument(
         "--ik-target-blend",
@@ -971,36 +971,36 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
         push_focus = np.asarray(meta.get("tabletop_push_focus", rope_center), dtype=np.float32)
         hero_target = np.asarray(
             [
-                float(0.20 * table_center[0] + 0.80 * push_focus[0] + 0.02),
-                float(0.25 * table_center[1] + 0.75 * push_focus[1] + 0.04),
-                float(max(table_center[2] + 0.10, rope_center[2] + 0.03)),
+                float(0.10 * table_center[0] + 0.90 * push_focus[0] + 0.01),
+                float(0.10 * table_center[1] + 0.90 * push_focus[1] + 0.02),
+                float(max(table_center[2] + 0.12, rope_center[2] + 0.05)),
             ],
             dtype=np.float32,
         )
-        hero_pos = camera_position(hero_target, yaw_deg=138.0, pitch_deg=-18.0, distance=1.42)
+        hero_pos = camera_position(hero_target, yaw_deg=132.0, pitch_deg=-24.0, distance=1.48)
 
         validation_target = np.asarray(
             [
                 float(push_focus[0]),
                 float(push_focus[1]),
-                float(max(table_center[2] + 0.10, rope_center[2] + 0.03)),
+                float(max(table_center[2] + 0.11, rope_center[2] + 0.04)),
             ],
             dtype=np.float32,
         )
-        validation_pos = camera_position(validation_target, yaw_deg=150.0, pitch_deg=-17.0, distance=1.72)
+        validation_pos = camera_position(validation_target, yaw_deg=156.0, pitch_deg=-23.0, distance=1.84)
 
         return {
             "hero": {
                 "pos": hero_pos.astype(np.float32, copy=False).tolist(),
-                "pitch": -18.0,
-                "yaw": 138.0,
+                "pitch": -24.0,
+                "yaw": 132.0,
                 "fov": 33.0,
                 "target": hero_target.astype(np.float32, copy=False).tolist(),
             },
             "validation": {
                 "pos": validation_pos.astype(np.float32, copy=False).tolist(),
-                "pitch": -17.0,
-                "yaw": 150.0,
+                "pitch": -23.0,
+                "yaw": 156.0,
                 "fov": 42.0,
                 "target": validation_target.astype(np.float32, copy=False).tolist(),
             },
@@ -2488,7 +2488,12 @@ def render_video(
                         )
                         leg_height = max(0.10, float(table_center[2] - ground_grid_z - stage_scale[2]))
                         leg_hz = 0.5 * leg_height
-                        leg_scale = (0.024, 0.024, leg_hz)
+                        if profile == "hero":
+                            leg_scale = (0.018, 0.018, leg_hz)
+                            leg_color = wp.vec3(0.34, 0.29, 0.23)
+                        else:
+                            leg_scale = (0.024, 0.024, leg_hz)
+                            leg_color = wp.vec3(0.39, 0.31, 0.24)
                         leg_offset_x = max(0.06, 0.76 * float(stage_scale[0]))
                         leg_offset_y = max(0.05, 0.76 * float(stage_scale[1]))
                         leg_center_z = float(ground_grid_z + leg_hz)
@@ -2507,7 +2512,7 @@ def render_video(
                                 dtype=wp.transform,
                                 device=device,
                             ),
-                            wp.array([wp.vec3(0.39, 0.31, 0.24) for _ in leg_centers], dtype=wp.vec3, device=device),
+                            wp.array([leg_color for _ in leg_centers], dtype=wp.vec3, device=device),
                         )
                         if not (profile == "hero" and bool(args.tabletop_hero_hide_pedestal)):
                             viewer.log_shapes(
