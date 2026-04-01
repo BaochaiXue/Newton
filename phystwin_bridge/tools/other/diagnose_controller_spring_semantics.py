@@ -210,6 +210,7 @@ def main() -> int:
                 samples.append(sample)
                 if one_step_metrics is None:
                     one_step_metrics = dict(sample)
+                state_in.clear_forces()
 
             solver.step(state_in, state_out, control, None, float(sim_dt))
             state_in, state_out = state_out, state_in
