@@ -1,5 +1,26 @@
 {
-  "status": "empty",
-  "task": "robot_rope_franka_tabletop_push_hero",
-  "notes": "Populate when a candidate passes all hero-demo hard gates."
+  "artifacts": {
+    "contact_sheet": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/contact_sheet.png",
+    "contact_sheets_dir": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/contact_sheets",
+    "ffprobe_json": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe.json",
+    "keyframes_dir": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes",
+    "metrics_json": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/metrics.json",
+    "validation_md": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/validation.md"
+  },
+  "output_root": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass",
+  "run_id": "20260401_081639_fixeddt_c08_gatepass",
+  "status": "candidate",
+  "task": "robot_rope_franka_hero",
+  "validation": {
+    "contact_sheet": "contact_sheet.png",
+    "ffprobe_json": "ffprobe.json",
+    "keyframes_dir": "keyframes",
+    "metrics_json": "metrics.json",
+    "validation_md": "validation.md"
+  },
+  "videos": {
+    "hero_debug": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_debug.mp4",
+    "hero_presentation": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_presentation.mp4",
+    "validation_camera": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/validation_camera.mp4"
+  }
 }

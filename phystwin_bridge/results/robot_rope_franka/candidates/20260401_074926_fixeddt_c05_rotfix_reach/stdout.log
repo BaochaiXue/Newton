@@ -513,3 +513,5 @@ Module newton._src.solvers.semi_implicit.kernels_contact d558900 load on device 
 Module newton._src.solvers.solver 16aecb3 load on device 'cuda:0' took 0.55 ms  (cached)
 Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.23 ms  (cached)
   frame 25/181 phase=approach target_err=0.3230m min_clearance=0.2970m
+  frame 50/181 phase=approach target_err=0.3654m min_clearance=0.2971m
+  frame 75/181 phase=push target_err=0.4072m min_clearance=0.2965m
