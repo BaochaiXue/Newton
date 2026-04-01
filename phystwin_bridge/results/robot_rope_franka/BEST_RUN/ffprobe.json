@@ -1,18 +1,18 @@
 {
-  "run_dir": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass",
+  "run_dir": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam",
   "summary": {
     "anchor_constraint_mode": "free_tabletop_rope",
     "anchor_count": 4,
     "anchor_mass_mode": "preserve",
     "apply_drag": true,
     "camera_profile": "hero",
-    "contact_active_frames": 78,
-    "contact_duration_s": 2.6013,
-    "contact_peak_frame": 120,
+    "contact_active_frames": 88,
+    "contact_duration_s": 2.9348000000000005,
+    "contact_peak_frame": 103,
     "contact_peak_proxy": "finger_span",
-    "contact_phase_count": 78,
+    "contact_phase_count": 88,
     "contact_proxy_counts": {
-      "finger_span": 78
+      "finger_span": 88
     },
     "contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
     "contact_proxy_radii_m": {
@@ -28,113 +28,113 @@
     "early_fall_acceleration_estimate_m_s2": null,
     "early_fall_com_horizontal_velocity_m_s": null,
     "ee_body_index": 6,
-    "finger_span_clearance_min_m": -0.01132139377295971,
-    "first_contact_frame": 77,
+    "finger_span_clearance_min_m": -0.010358987376093864,
+    "first_contact_frame": 66,
     "first_contact_phase": "push",
-    "first_contact_time_s": 2.56795,
-    "first_ground_contact_frame": 77,
-    "first_ground_contact_time_s": 2.56795,
+    "first_contact_time_s": 2.2011000000000003,
+    "first_ground_contact_frame": 66,
+    "first_ground_contact_time_s": 2.2011000000000003,
     "frame_dt": 0.033350000000000005,
     "frames": 187,
     "gravity_mag_m_s2": 9.8,
-    "gripper_center_clearance_min_m": -0.0035864748060703278,
-    "gripper_center_path_length_m": 0.3496764302253723,
-    "gripper_center_speed_during_contact_mean_m_s": 0.04800930619239807,
+    "gripper_center_clearance_min_m": -0.0015551336109638214,
+    "gripper_center_path_length_m": 0.32899802923202515,
+    "gripper_center_speed_during_contact_mean_m_s": 0.04062006250023842,
     "gripper_center_speed_max_m_s": 0.10055076330900192,
     "gripper_center_speed_pre_contact_mean_m_s": null,
     "gripper_center_speed_release_mean_m_s": null,
-    "gripper_center_tracking_error_during_contact_mean_m": 2.3937143396324245e-06,
+    "gripper_center_tracking_error_during_contact_mean_m": 2.0277836938475957e-06,
     "gripper_center_tracking_error_max_m": 5.0786734391294885e-06,
-    "gripper_center_tracking_error_mean_m": 2.803887582558673e-06,
+    "gripper_center_tracking_error_mean_m": 2.638633532114909e-06,
     "gripper_center_tracking_error_pre_contact_mean_m": null,
     "gripper_center_tracking_error_release_mean_m": null,
     "ground_z_m": 0.0,
     "history_storage_files": {
-      "body_q": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/presentation/work/robot_rope_tabletop_hero_body_q.npy",
-      "body_vel": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/presentation/work/robot_rope_tabletop_hero_body_vel.npy",
-      "ee_target_pos": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/presentation/work/robot_rope_tabletop_hero_ee_target_pos.npy",
-      "particle_q_all": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/presentation/work/robot_rope_tabletop_hero_particle_q_all.npy",
-      "particle_q_object": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/presentation/work/robot_rope_tabletop_hero_particle_q_object.npy"
+      "body_q": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/work/robot_rope_tabletop_hero_body_q.npy",
+      "body_vel": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/work/robot_rope_tabletop_hero_body_vel.npy",
+      "ee_target_pos": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/work/robot_rope_tabletop_hero_ee_target_pos.npy",
+      "particle_q_all": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/work/robot_rope_tabletop_hero_particle_q_all.npy",
+      "particle_q_object": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/work/robot_rope_tabletop_hero_particle_q_object.npy"
     },
     "history_storage_mode": "memmap",
     "ik_target_blend": 0.2,
-    "impact_speed_before_first_contact_m_s": 0.0003645981269619096,
+    "impact_speed_before_first_contact_m_s": 0.0,
     "ir_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/ir/rope_double_hand/phystwin_ir_v2_bf_strict.npz",
-    "last_contact_frame": 154,
-    "last_contact_time_s": 5.1359,
-    "left_finger_clearance_min_m": -0.01132139191031456,
-    "min_clearance_final_m": 0.08162160962820053,
-    "min_clearance_min_m": -0.01132139377295971,
-    "output_mp4": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/presentation/work/robot_rope_tabletop_hero.mp4",
+    "last_contact_frame": 153,
+    "last_contact_time_s": 5.102550000000001,
+    "left_finger_clearance_min_m": -0.010358985513448715,
+    "min_clearance_final_m": 0.08213714510202408,
+    "min_clearance_min_m": -0.010358987376093864,
+    "output_mp4": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/work/robot_rope_tabletop_hero.mp4",
     "particle_contact_kernel": false,
     "particle_contacts": false,
-    "physics_validation_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/presentation/physics_validation.json",
+    "physics_validation_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/presentation/physics_validation.json",
     "post_release_horizontal_kick_m_s": null,
     "post_release_horizontal_kick_window_s": 0.08,
     "post_release_spring_energy_proxy": null,
     "pre_release_settle_damping_scale": 8.0,
     "pre_release_spring_energy_proxy": null,
-    "preroll_frame_count": 20,
+    "preroll_frame_count": 23,
     "preroll_settle_metrics": {
-      "com_horizontal_speed_max_m_s": 0.0035554314963519573,
+      "com_horizontal_speed_max_m_s": 0.0075069209560751915,
       "com_horizontal_speed_threshold_m_s": 0.05,
-      "particle_speed_mean_max_m_s": 0.018742647022008896,
+      "particle_speed_mean_max_m_s": 0.02027733623981476,
       "particle_speed_mean_threshold_m_s": 0.08,
-      "support_patch_speed_mean_max_m_s": 0.014434638433158398,
+      "support_patch_speed_mean_max_m_s": 0.004358586855232716,
       "support_patch_speed_threshold_m_s": 0.02,
       "window_duration_s": 0.20010000000000003,
-      "window_end_frame": 19,
-      "window_start_frame": 14
+      "window_end_frame": 22,
+      "window_start_frame": 17
     },
     "preroll_settle_pass": true,
-    "preroll_settle_time_s": 0.63365,
+    "preroll_settle_time_s": 0.7337000000000001,
     "recommended_hero_camera": {
       "fov": 33.0,
-      "pitch": -18.0,
+      "pitch": -24.0,
       "pos": [
-        1.039743423461914,
-        -1.0204944610595703,
-        0.718804121017456
+        0.9308223724365234,
+        -1.1416003704071045,
+        0.9019702672958374
       ],
       "target": [
-        0.03612615540623665,
-        -0.11683344095945358,
-        0.2800000011920929
+        0.026126153767108917,
+        -0.13683344423770905,
+        0.30000001192092896
       ],
-      "yaw": 138.0
+      "yaw": 132.0
     },
     "recommended_validation_camera": {
-      "fov": 42.0,
-      "pitch": -17.0,
+      "fov": 38.0,
+      "pitch": -23.0,
       "pos": [
-        1.4406031370162964,
-        -0.9792555570602417,
-        0.7828793525695801
+        1.4288767576217651,
+        -0.7858306169509888,
+        0.9464282989501953
       ],
       "target": [
         0.016126153990626335,
         -0.1568334400653839,
-        0.2800000011920929
+        0.2900000214576721
       ],
-      "yaw": 150.0
+      "yaw": 156.0
     },
     "release_frame": null,
     "release_time_s": null,
     "render_mode": "presentation",
     "replay_source": null,
-    "right_finger_clearance_min_m": 0.0011114180088043213,
+    "right_finger_clearance_min_m": 0.0015353374183177948,
     "robot_geometry": "native_franka",
     "robot_motion_mode": "ik",
-    "rope_com_displacement_m": 0.030267786234617233,
+    "rope_com_displacement_m": 0.03772112354636192,
     "rope_com_horizontal_speed_mean_pre_release_m_s": null,
-    "rope_com_z_min_m": 0.2364291101694107,
-    "rope_mid_segment_final_z_delta_m": 0.0007488131523132324,
-    "rope_mid_segment_peak_frame": 169,
-    "rope_mid_segment_peak_z_delta_m": 0.0008237212896347046,
-    "rope_min_z_m": 0.22169111669063568,
+    "rope_com_z_min_m": 0.23675760626792908,
+    "rope_mid_segment_final_z_delta_m": -0.006384208798408508,
+    "rope_mid_segment_peak_frame": 0,
+    "rope_mid_segment_peak_z_delta_m": 0.0012526363134384155,
+    "rope_min_z_m": 0.22157612442970276,
     "rope_particle_speed_mean_pre_release_m_s": null,
-    "rope_surface_clearance_min_m": 0.19568873941898346,
-    "rope_surface_clearance_to_table_min_m": -0.004311263561248779,
+    "rope_surface_clearance_min_m": 0.19557374715805054,
+    "rope_surface_clearance_to_table_min_m": -0.004426255822181702,
     "rope_total_mass": 3.0,
     "settle_gate_frame": null,
     "settle_gate_metrics": {},
@@ -142,15 +142,15 @@
     "settle_window_seconds": 0.08,
     "sim_dt": 5e-05,
     "substeps": 667,
-    "support_contact_active_frames": 78,
-    "support_contact_duration_s": 2.6013,
-    "support_contact_peak_frame": 120,
+    "support_contact_active_frames": 88,
+    "support_contact_duration_s": 2.9348000000000005,
+    "support_contact_peak_frame": 103,
     "support_contact_proxy_counts": {
-      "finger_span": 78
+      "finger_span": 88
     },
     "support_contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
-    "support_first_contact_frame": 77,
-    "support_last_contact_frame": 154,
+    "support_first_contact_frame": 66,
+    "support_last_contact_frame": 153,
     "support_patch_center_m": [
       -0.00045183487236499786,
       0.0005746865645051003,
@@ -166,7 +166,7 @@
     "t_release_s": null,
     "table_contact_active_frames": 187,
     "table_contact_duration_s": 6.2364500000000005,
-    "table_contact_peak_frame": 128,
+    "table_contact_peak_frame": 58,
     "table_top_z_m": 0.2,
     "task": "tabletop_push_hero",
     "task_duration_s": 6.2,
@@ -183,23 +183,23 @@
       0.0005746865645051003,
       0.24505753815174103
     ],
-    "wall_time_sec": 81.50667096598772
+    "wall_time_sec": 79.96515235400875
   },
-  "summary_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/summary.json",
+  "summary_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/summary.json",
   "videos": [
     {
-      "decode_log_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/qa/hero_presentation_decode.log",
+      "decode_log_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/qa/hero_presentation_decode.log",
       "ffprobe": {
         "format": {
-          "bit_rate": "919135",
+          "bit_rate": "1011051",
           "duration": "6.200000",
-          "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_presentation.mp4",
+          "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_presentation.mp4",
           "format_long_name": "QuickTime / MOV",
           "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
           "nb_programs": 0,
           "nb_streams": 1,
           "probe_score": 100,
-          "size": "712330",
+          "size": "783565",
           "start_time": "0.000000",
           "tags": {
             "compatible_brands": "isomiso2avc1mp41",
@@ -211,7 +211,7 @@
         "streams": [
           {
             "avg_frame_rate": "30/1",
-            "bit_rate": "915157",
+            "bit_rate": "1007083",
             "bits_per_raw_sample": "8",
             "chroma_location": "left",
             "closed_captions": 0,
@@ -272,42 +272,42 @@
           }
         ]
       },
-      "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe/hero_presentation.json",
+      "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe/hero_presentation.json",
       "metrics": {
         "black_frame_fraction": 0.0,
-        "contact_sheet_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/contact_sheets/hero_presentation.png",
+        "contact_sheet_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/contact_sheets/hero_presentation.png",
         "decode_pass": true,
         "decoded_frame_count": 186,
         "duration_pass": true,
         "duration_s": 6.2,
         "encoded_fps": 30.0,
-        "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe/hero_presentation.json",
+        "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe/hero_presentation.json",
         "fps_pass": true,
         "keyframe_paths": [
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_01_frame_000000.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_02_frame_000062.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_03_frame_000123.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_04_frame_000185.png"
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_01_frame_000000.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_02_frame_000062.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_03_frame_000123.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_04_frame_000185.png"
         ],
-        "max_pair_diff": 1.082534670829773,
+        "max_pair_diff": 1.1915451288223267,
         "max_static_run": 24,
-        "mean_pair_diff": 0.4278283593974806,
-        "median_pair_diff": 0.4437847137451172,
-        "min_pair_diff": 0.0064062499441206455,
+        "mean_pair_diff": 0.43529307370929904,
+        "median_pair_diff": 0.4659374952316284,
+        "min_pair_diff": 0.0023090278264135122,
         "motion_pass": true,
         "name": "hero_presentation",
         "nb_frames": 186,
         "near_exact_repeat_fraction": 0.1945945945945946,
         "overall_pass": true,
-        "path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_presentation.mp4",
+        "path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_presentation.mp4",
         "resolution_height": 720,
         "resolution_pass": true,
         "resolution_width": 1280,
         "sample_paths": [
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_01_frame_000000.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_02_frame_000062.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_03_frame_000123.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_presentation_sample_04_frame_000185.png"
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_01_frame_000000.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_02_frame_000062.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_03_frame_000123.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_presentation_sample_04_frame_000185.png"
         ],
         "sampled_indices": [
           0,
@@ -318,21 +318,21 @@
         "scene_readable_pass": true
       },
       "name": "hero_presentation",
-      "video_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_presentation.mp4"
+      "video_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_presentation.mp4"
     },
     {
-      "decode_log_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/qa/hero_debug_decode.log",
+      "decode_log_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/qa/hero_debug_decode.log",
       "ffprobe": {
         "format": {
-          "bit_rate": "893081",
+          "bit_rate": "955412",
           "duration": "6.200000",
-          "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_debug.mp4",
+          "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_debug.mp4",
           "format_long_name": "QuickTime / MOV",
           "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
           "nb_programs": 0,
           "nb_streams": 1,
           "probe_score": 100,
-          "size": "692138",
+          "size": "740445",
           "start_time": "0.000000",
           "tags": {
             "compatible_brands": "isomiso2avc1mp41",
@@ -344,7 +344,7 @@
         "streams": [
           {
             "avg_frame_rate": "30/1",
-            "bit_rate": "889134",
+            "bit_rate": "951434",
             "bits_per_raw_sample": "8",
             "chroma_location": "left",
             "closed_captions": 0,
@@ -405,42 +405,42 @@
           }
         ]
       },
-      "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe/hero_debug.json",
+      "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe/hero_debug.json",
       "metrics": {
         "black_frame_fraction": 0.0,
-        "contact_sheet_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/contact_sheets/hero_debug.png",
+        "contact_sheet_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/contact_sheets/hero_debug.png",
         "decode_pass": true,
         "decoded_frame_count": 186,
         "duration_pass": true,
         "duration_s": 6.2,
         "encoded_fps": 30.0,
-        "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe/hero_debug.json",
+        "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe/hero_debug.json",
         "fps_pass": true,
         "keyframe_paths": [
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_01_frame_000000.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_02_frame_000062.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_03_frame_000123.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_04_frame_000185.png"
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_01_frame_000000.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_02_frame_000062.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_03_frame_000123.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_04_frame_000185.png"
         ],
-        "max_pair_diff": 2.319444417953491,
+        "max_pair_diff": 2.252847194671631,
         "max_static_run": 23,
-        "mean_pair_diff": 0.4383623305028556,
-        "median_pair_diff": 0.4038541615009308,
-        "min_pair_diff": 0.0024826389271765947,
+        "mean_pair_diff": 0.441915258590283,
+        "median_pair_diff": 0.43998265266418457,
+        "min_pair_diff": 0.002968749962747097,
         "motion_pass": true,
         "name": "hero_debug",
         "nb_frames": 186,
         "near_exact_repeat_fraction": 0.1837837837837838,
         "overall_pass": true,
-        "path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_debug.mp4",
+        "path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_debug.mp4",
         "resolution_height": 720,
         "resolution_pass": true,
         "resolution_width": 1280,
         "sample_paths": [
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_01_frame_000000.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_02_frame_000062.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_03_frame_000123.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/hero_debug_sample_04_frame_000185.png"
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_01_frame_000000.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_02_frame_000062.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_03_frame_000123.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/hero_debug_sample_04_frame_000185.png"
         ],
         "sampled_indices": [
           0,
@@ -451,21 +451,21 @@
         "scene_readable_pass": true
       },
       "name": "hero_debug",
-      "video_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_debug.mp4"
+      "video_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_debug.mp4"
     },
     {
-      "decode_log_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/qa/validation_camera_decode.log",
+      "decode_log_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/qa/validation_camera_decode.log",
       "ffprobe": {
         "format": {
-          "bit_rate": "743770",
+          "bit_rate": "823593",
           "duration": "6.200000",
-          "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/validation_camera.mp4",
+          "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/validation_camera.mp4",
           "format_long_name": "QuickTime / MOV",
           "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
           "nb_programs": 0,
           "nb_streams": 1,
           "probe_score": 100,
-          "size": "576422",
+          "size": "638285",
           "start_time": "0.000000",
           "tags": {
             "compatible_brands": "isomiso2avc1mp41",
@@ -477,7 +477,7 @@
         "streams": [
           {
             "avg_frame_rate": "30/1",
-            "bit_rate": "739781",
+            "bit_rate": "819636",
             "bits_per_raw_sample": "8",
             "chroma_location": "left",
             "closed_captions": 0,
@@ -538,42 +538,42 @@
           }
         ]
       },
-      "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe/validation_camera.json",
+      "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe/validation_camera.json",
       "metrics": {
         "black_frame_fraction": 0.0,
-        "contact_sheet_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/contact_sheets/validation_camera.png",
+        "contact_sheet_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/contact_sheets/validation_camera.png",
         "decode_pass": true,
         "decoded_frame_count": 186,
         "duration_pass": true,
         "duration_s": 6.2,
         "encoded_fps": 30.0,
-        "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe/validation_camera.json",
+        "ffprobe_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe/validation_camera.json",
         "fps_pass": true,
         "keyframe_paths": [
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_01_frame_000000.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_02_frame_000062.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_03_frame_000123.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_04_frame_000185.png"
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_01_frame_000000.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_02_frame_000062.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_03_frame_000123.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_04_frame_000185.png"
         ],
-        "max_pair_diff": 0.5736979246139526,
+        "max_pair_diff": 0.722621500492096,
         "max_static_run": 24,
-        "mean_pair_diff": 0.29127064505403205,
-        "median_pair_diff": 0.3300173580646515,
-        "min_pair_diff": 0.0013888889225199819,
+        "mean_pair_diff": 0.3450639080677836,
+        "median_pair_diff": 0.3748264014720917,
+        "min_pair_diff": 0.0016145833069458604,
         "motion_pass": true,
         "name": "validation_camera",
         "nb_frames": 186,
         "near_exact_repeat_fraction": 0.1945945945945946,
         "overall_pass": true,
-        "path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/validation_camera.mp4",
+        "path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/validation_camera.mp4",
         "resolution_height": 720,
         "resolution_pass": true,
         "resolution_width": 1280,
         "sample_paths": [
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_01_frame_000000.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_02_frame_000062.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_03_frame_000123.png",
-          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes/validation_camera_sample_04_frame_000185.png"
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_01_frame_000000.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_02_frame_000062.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_03_frame_000123.png",
+          "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes/validation_camera_sample_04_frame_000185.png"
         ],
         "sampled_indices": [
           0,
@@ -584,7 +584,7 @@
         "scene_readable_pass": true
       },
       "name": "validation_camera",
-      "video_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/validation_camera.mp4"
+      "video_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/validation_camera.mp4"
     }
   ]
 }

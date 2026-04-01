@@ -12,7 +12,7 @@
 - `hero_presentation` resolution: 1280x720
 - `hero_presentation` fps: 30.000
 - `hero_presentation` black_frame_fraction: 0.000
-- `hero_presentation` mean_pair_diff: 0.428
+- `hero_presentation` mean_pair_diff: 0.435
 - `hero_debug` present: YES
 - `hero_debug` decode: YES
 - `hero_debug` duration in range: YES
@@ -24,7 +24,7 @@
 - `hero_debug` resolution: 1280x720
 - `hero_debug` fps: 30.000
 - `hero_debug` black_frame_fraction: 0.000
-- `hero_debug` mean_pair_diff: 0.438
+- `hero_debug` mean_pair_diff: 0.442
 - `validation_camera` present: YES
 - `validation_camera` decode: YES
 - `validation_camera` duration in range: YES
@@ -36,7 +36,7 @@
 - `validation_camera` resolution: 1280x720
 - `validation_camera` fps: 30.000
 - `validation_camera` black_frame_fraction: 0.000
-- `validation_camera` mean_pair_diff: 0.291
+- `validation_camera` mean_pair_diff: 0.345
 
 ## Visual QA
 - Output complete: YES
@@ -51,12 +51,12 @@
 - Presentation ready: YES
 
 ## Files
-- ffprobe: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/ffprobe.json`
-- metrics: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/metrics.json`
-- validation: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/validation.md`
-- contact sheet: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/contact_sheet.png`
-- keyframes: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/keyframes`
-- command pointer: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/run_command.txt`
+- ffprobe: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe.json`
+- metrics: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/metrics.json`
+- validation: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/validation.md`
+- contact sheet: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/contact_sheet.png`
+- keyframes: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes`
+- command pointer: `/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/run_command.txt`
 
 ## Verdict
 - Objective pass: YES

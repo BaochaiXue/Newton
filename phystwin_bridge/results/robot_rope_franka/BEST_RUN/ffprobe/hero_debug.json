@@ -1,14 +1,14 @@
 {
   "format": {
-    "bit_rate": "893081",
+    "bit_rate": "955412",
     "duration": "6.200000",
-    "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_081639_fixeddt_c08_gatepass/hero_debug.mp4",
+    "filename": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_debug.mp4",
     "format_long_name": "QuickTime / MOV",
     "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
     "nb_programs": 0,
     "nb_streams": 1,
     "probe_score": 100,
-    "size": "692138",
+    "size": "740445",
     "start_time": "0.000000",
     "tags": {
       "compatible_brands": "isomiso2avc1mp41",
@@ -20,7 +20,7 @@
   "streams": [
     {
       "avg_frame_rate": "30/1",
-      "bit_rate": "889134",
+      "bit_rate": "951434",
       "bits_per_raw_sample": "8",
       "chroma_location": "left",
       "closed_captions": 0,

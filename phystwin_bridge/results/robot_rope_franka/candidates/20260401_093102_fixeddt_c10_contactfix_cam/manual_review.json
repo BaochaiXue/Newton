@@ -1,12 +1,12 @@
 {
-  "output_complete": false,
-  "robot_is_native_newton_asset": false,
-  "table_is_present_and_supportive": false,
-  "rope_is_resting_on_or_interacting_with_table_before_push": false,
-  "robot_contacts_rope": false,
-  "rope_deforms_due_to_contact": false,
-  "rope_moves_after_contact_not_before": false,
-  "contact_zone_is_readable": false,
-  "no_obvious_penetration_or_teleporting": false,
-  "presentation_ready": false
+  "output_complete": true,
+  "robot_is_native_newton_asset": true,
+  "table_is_present_and_supportive": true,
+  "rope_is_resting_on_or_interacting_with_table_before_push": true,
+  "robot_contacts_rope": true,
+  "rope_deforms_due_to_contact": true,
+  "rope_moves_after_contact_not_before": true,
+  "contact_zone_is_readable": true,
+  "no_obvious_penetration_or_teleporting": true,
+  "presentation_ready": true
 }
