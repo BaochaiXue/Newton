@@ -1,0 +1,22 @@
+{
+  "run_id": "20260401_202952_remotefix_visradius_c11",
+  "rope_collision_radius_m": 0.02600238099694252,
+  "rope_render_radius_m": 0.026,
+  "rope_render_to_physical_radius_ratio": 0.9999084315800618,
+  "ee_contact_radius_arg_m": 0.055,
+  "diagnostic_proxy_radius_m": 0.033,
+  "rope_diameter_m": 0.05200476199388504,
+  "rope_render_diameter_m": 0.052,
+  "diagnostic_proxy_diameter_m": 0.066,
+  "left_tip_box_size_m": [
+    0.017500000074505806,
+    0.015200000256299973,
+    0.01850000023841858
+  ],
+  "right_tip_box_size_m": [
+    0.017500000074505806,
+    0.015200000256299973,
+    0.01850000023841858
+  ],
+  "rope_total_mass_kg": 3.0
+}

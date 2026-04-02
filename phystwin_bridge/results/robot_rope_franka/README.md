@@ -63,11 +63,11 @@ scripts/run_robot_rope_franka_tabletop_hero.sh --tag <short_tag> [extra demo arg
 
 Current committed promoted run id:
 
-- `20260401_093102_fixeddt_c10_contactfix_cam`
+- `20260401_203416_remotefix_truthcam_c12`
 
 Local candidate directory:
 
-- `candidates/20260401_093102_fixeddt_c10_contactfix_cam/`
+- `candidates/20260401_203416_remotefix_truthcam_c12/`
 
 Local convenience mirror:
 
@@ -80,7 +80,8 @@ Claim boundary mirrored from the committed registry:
 - PhysTwin rope resting on the tabletop
 - readable slow lateral push
 - readable robot-caused rope deformation / sliding
-- strict validator + truthful manual review both pass
+- rope render thickness now matches the physical contact thickness
+- strict validator + truthful manual review + fail-closed full-video review pass
 
 Implementation note kept for reruns:
 
@@ -88,5 +89,6 @@ Implementation note kept for reruns:
   inside `demo_robot_rope_franka.py` because the earlier tabletop IK path did
   not reliably reach the contact line under fixed `sim_dt = 5e-5`,
   `substeps = 667`
-- the promoted contact-fix update starts contact earlier in the visible push,
-  improving the finger-to-rope causal readability
+- the promoted c12 fix removes the stand-off impression by aligning rope render
+  thickness with the physical rope collision thickness and grounding contact
+  reporting in actual finger-box contact

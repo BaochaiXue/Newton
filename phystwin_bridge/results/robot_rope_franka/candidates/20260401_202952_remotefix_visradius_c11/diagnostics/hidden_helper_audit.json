@@ -1,0 +1,18 @@
+{
+  "run_id": "20260401_202952_remotefix_visradius_c11",
+  "hidden_helper_exists": false,
+  "hidden_helper_affects_visible_clip": false,
+  "scene_physical_entities": [
+    "rope_particles_and_springs_from_ir",
+    "native_franka_urdf_collision_shapes",
+    "native_table_box"
+  ],
+  "viewer_only_entities": [
+    "hero pedestal / base decoration",
+    "table legs / stage decorations"
+  ],
+  "notes": [
+    "Tabletop task does not deactivate rope endpoints because the deactivation path is guarded by `if not tabletop_task`.",
+    "Hero pedestal hiding is a presentation-only viewer toggle and does not add/remove physics shapes."
+  ]
+}

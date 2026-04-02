@@ -1,0 +1,22 @@
+{
+  "run_id": "20260401_202952_remotefix_visradius_c11",
+  "tabletop_control_mode": "joint_trajectory",
+  "ee_body_index": 6,
+  "ee_body_label": "fr3/fr3_link7",
+  "left_finger_index": 7,
+  "left_finger_label": "fr3/fr3_leftfinger",
+  "right_finger_index": 8,
+  "right_finger_label": "fr3/fr3_rightfinger",
+  "ee_offset_local": [
+    0.0,
+    0.0,
+    0.2199999988079071
+  ],
+  "target_point_semantics": "joint_trajectory_fk_gripper_center",
+  "target_to_left_finger_center_mean_m": 0.040000416338443756,
+  "target_to_right_finger_center_mean_m": 0.039999574422836304,
+  "target_to_gripper_center_mean_m": 2.638633532114909e-06,
+  "target_to_left_finger_center_min_m": 0.03999805822968483,
+  "target_to_right_finger_center_min_m": 0.03999629616737366,
+  "target_to_gripper_center_min_m": 0.0
+}

@@ -18,6 +18,6 @@
     "candidates": "candidates/"
   },
   "authoritative_source": "results_meta/tasks/robot_rope_franka_tabletop_push_hero.json",
-  "current_local_mirror_run_id": "20260401_081639_fixeddt_c08_gatepass",
+  "current_local_mirror_run_id": "20260401_203416_remotefix_truthcam_c12",
   "notes": "Local bundle-root metadata only. Committed promoted-run meaning lives in results_meta."
 }

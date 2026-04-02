@@ -17,36 +17,38 @@ Committed authority for current/promoted run meaning lives in:
 
 Current committed promoted run id:
 
-- `20260401_093102_fixeddt_c10_contactfix_cam`
+- `20260401_203416_remotefix_truthcam_c12`
 
 Local source candidate:
 
-- `../candidates/20260401_093102_fixeddt_c10_contactfix_cam`
+- `../candidates/20260401_203416_remotefix_truthcam_c12`
 
 Why this local mirror points here:
 
-- native Newton Franka remains visible in all three views
-- rope is visibly resting on a native Newton tabletop before the push
-- contact is readable in the hero view without pedestal occlusion
-- validation view still shows the honest full geometry
-- rope moves after visible robot contact, not before
-- visible contact starts earlier than in the older `c08` cut, reducing the impression that the rope moves before the finger arrives
-- strict validator + truthful manual review both pass
+- the rope is now rendered at a thickness consistent with its physical contact radius
+- the visible Franka finger itself is clearly the contactor in the hero view
+- debug contact reporting is grounded in actual finger-box contact rather than `finger_span`
+- validation view preserves the honest full geometry while still showing readable contact
+- strict validator + truthful manual review + fail-closed full-video review all pass
 
 Key summary numbers:
 
 - `duration_s = 6.2`
-- `first_contact_time_s = 2.2011`
-- `contact_duration_s = 2.9348`
-- `contact_started = true`
-- `gripper_center_path_length_m = 0.3289980292`
-- `min_clearance_min_m = -0.0103589874`
+- `first_contact_time_s = 1.6675`
+- `actual_finger_box_first_contact_time_s = 1.6675`
+- `contact_duration_s = 2.96815`
+- `contact_peak_proxy = right_tip_box`
+- `min_clearance_min_m = -0.0128063839`
+- `rope_surface_clearance_to_table_min_m = -0.0048188120`
 - `preroll_settle_pass = true`
 
 Implementation note:
 
 - the accepted tabletop hero keeps the robot native to Newton and the rope on
-  the PhysTwin -> Newton bridge path, but uses a tabletop-only native
-  joint-space waypoint controller because the bridge-layer tabletop IK path did
-  not reliably hit the contact line under fixed `sim_dt = 5e-5`,
+  the PhysTwin -> Newton bridge path, while still using the tabletop-only
+  native joint-space waypoint controller under fixed `sim_dt = 5e-5`,
   `substeps = 667`
+- the remote-interaction fix is a truth fix, not a hidden-helper trick:
+  - honest rope render thickness
+  - actual finger-box contact reporting
+  - tighter hero framing around the real contact patch

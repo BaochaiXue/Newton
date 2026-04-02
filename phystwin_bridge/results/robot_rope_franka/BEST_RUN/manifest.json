@@ -1,16 +1,17 @@
 {
   "artifacts": {
-    "contact_sheet": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/contact_sheet.png",
-    "contact_sheets_dir": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/contact_sheets",
-    "ffprobe_json": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/ffprobe.json",
-    "keyframes_dir": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/keyframes",
-    "metrics_json": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/metrics.json",
-    "validation_md": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/validation.md"
+    "contact_sheet": "../candidates/20260401_203416_remotefix_truthcam_c12/contact_sheet.png",
+    "contact_sheets_dir": "../candidates/20260401_203416_remotefix_truthcam_c12/contact_sheets",
+    "ffprobe_json": "../candidates/20260401_203416_remotefix_truthcam_c12/ffprobe.json",
+    "keyframes_dir": "../candidates/20260401_203416_remotefix_truthcam_c12/keyframes",
+    "metrics_json": "../candidates/20260401_203416_remotefix_truthcam_c12/metrics.json",
+    "validation_md": "../candidates/20260401_203416_remotefix_truthcam_c12/validation.md"
   },
-  "output_root": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam",
-  "run_id": "20260401_093102_fixeddt_c10_contactfix_cam",
-  "status": "promoted_best_run",
+  "output_root": "../candidates/20260401_203416_remotefix_truthcam_c12",
+  "run_id": "20260401_203416_remotefix_truthcam_c12",
+  "status": "local_only_best_run_mirror",
   "task": "robot_rope_franka_tabletop_push_hero",
+  "authoritative_source": "results_meta/tasks/robot_rope_franka_tabletop_push_hero.json",
   "validation": {
     "contact_sheet": "contact_sheet.png",
     "ffprobe_json": "ffprobe.json",
@@ -19,9 +20,9 @@
     "validation_md": "validation.md"
   },
   "videos": {
-    "hero_debug": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_debug.mp4",
-    "hero_presentation": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/hero_presentation.mp4",
-    "validation_camera": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam/validation_camera.mp4"
+    "hero_debug": "../candidates/20260401_203416_remotefix_truthcam_c12/hero_debug.mp4",
+    "hero_presentation": "../candidates/20260401_203416_remotefix_truthcam_c12/hero_presentation.mp4",
+    "validation_camera": "../candidates/20260401_203416_remotefix_truthcam_c12/validation_camera.mp4"
   },
-  "accepted_from_candidate": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260401_093102_fixeddt_c10_contactfix_cam"
+  "accepted_from_candidate": "../candidates/20260401_203416_remotefix_truthcam_c12"
 }

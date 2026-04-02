@@ -838,6 +838,107 @@ def _min_gripper_proxy_clearance(
     return best_clearance, best_name, per_proxy_min
 
 
+def _combine_world_transform(body_q_row: np.ndarray, local_tf_row: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    body_q_row = np.asarray(body_q_row, dtype=np.float32)
+    local_tf_row = np.asarray(local_tf_row, dtype=np.float32)
+    body_pos = body_q_row[:3]
+    body_quat = body_q_row[3:7]
+    local_pos = local_tf_row[:3]
+    local_quat = local_tf_row[3:7]
+    world_pos = body_pos + _quat_rotate_vector(body_quat, local_pos)
+    world_quat = _quat_multiply(body_quat, local_quat)
+    return world_pos.astype(np.float32, copy=False), world_quat.astype(np.float32, copy=False)
+
+
+def _signed_distance_points_to_box(points: np.ndarray, center: np.ndarray, quat: np.ndarray, half_extents: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32)
+    center = np.asarray(center, dtype=np.float32)
+    quat = np.asarray(quat, dtype=np.float32)
+    half_extents = np.asarray(half_extents, dtype=np.float32)
+    rel = points - center[None, :]
+    local = np.stack([_quat_inverse_rotate_vector(quat, row) for row in rel], axis=0)
+    q = np.abs(local) - half_extents[None, :]
+    outside = np.linalg.norm(np.maximum(q, 0.0), axis=1)
+    inside = np.minimum(np.max(q, axis=1), 0.0)
+    return (outside + inside).astype(np.float32, copy=False)
+
+
+def _finger_box_entries(model: newton.Model, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    shape_body = model.shape_body.numpy() if hasattr(model.shape_body, "numpy") else np.asarray(model.shape_body)
+    shape_type = model.shape_type.numpy() if hasattr(model.shape_type, "numpy") else np.asarray(model.shape_type)
+    shape_scale = model.shape_scale.numpy() if hasattr(model.shape_scale, "numpy") else np.asarray(model.shape_scale)
+    shape_transform = model.shape_transform.numpy() if hasattr(model.shape_transform, "numpy") else np.asarray(model.shape_transform)
+    left_idx = int(meta["left_finger_index"])
+    right_idx = int(meta["right_finger_index"])
+    entries: list[dict[str, Any]] = []
+    for shape_idx in range(int(model.shape_count)):
+        body_idx = int(shape_body[shape_idx])
+        if body_idx not in {left_idx, right_idx}:
+            continue
+        if int(shape_type[shape_idx]) != int(newton.GeoType.BOX):
+            continue
+        side = "left" if body_idx == left_idx else "right"
+        entries.append(
+            {
+                "shape_index": int(shape_idx),
+                "body_index": int(body_idx),
+                "side": side,
+                "name": f"{side}_box_{len([e for e in entries if e['side'] == side])}",
+                "half_extents": np.asarray(shape_scale[shape_idx], dtype=np.float32),
+                "local_transform": np.asarray(shape_transform[shape_idx], dtype=np.float32),
+            }
+        )
+    side_groups = {"left": [], "right": []}
+    for entry in entries:
+        side_groups[entry["side"]].append(entry)
+    for side, group in side_groups.items():
+        if not group:
+            continue
+        tip_entry = max(group, key=lambda item: float(item["local_transform"][2]))
+        tip_entry["name"] = f"{side}_tip_box"
+        tip_entry["is_tip"] = True
+    return entries
+
+
+def _min_finger_box_clearance(
+    particle_q: np.ndarray,
+    particle_radius: np.ndarray,
+    body_q_row: np.ndarray,
+    finger_box_entries: list[dict[str, Any]],
+) -> tuple[float, str, dict[str, float]]:
+    best_name = "none"
+    best_clearance = float("inf")
+    per_name: dict[str, float] = {}
+    left_best = float("inf")
+    right_best = float("inf")
+    for entry in finger_box_entries:
+        center_w, quat_w = _combine_world_transform(
+            body_q_row[int(entry["body_index"])],
+            np.asarray(entry["local_transform"], dtype=np.float32),
+        )
+        sdf = _signed_distance_points_to_box(
+            particle_q,
+            center_w,
+            quat_w,
+            np.asarray(entry["half_extents"], dtype=np.float32),
+        )
+        clearance = float(np.min(sdf - particle_radius))
+        per_name[str(entry["name"])] = clearance
+        if str(entry["side"]) == "left":
+            left_best = min(left_best, clearance)
+        else:
+            right_best = min(right_best, clearance)
+        if clearance < best_clearance:
+            best_clearance = clearance
+            best_name = str(entry["name"])
+    if left_best < float("inf"):
+        per_name["left_any_box"] = float(left_best)
+    if right_best < float("inf"):
+        per_name["right_any_box"] = float(right_best)
+    per_name["any_finger_box"] = float(best_clearance)
+    return float(best_clearance), best_name, per_name
+
+
 def _fit_quadratic_acceleration(times: np.ndarray, values: np.ndarray) -> float | None:
     times = np.asarray(times, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
@@ -971,13 +1072,13 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
         push_focus = np.asarray(meta.get("tabletop_push_focus", rope_center), dtype=np.float32)
         hero_target = np.asarray(
             [
-                float(0.10 * table_center[0] + 0.90 * push_focus[0] + 0.01),
-                float(0.10 * table_center[1] + 0.90 * push_focus[1] + 0.02),
-                float(max(table_center[2] + 0.12, rope_center[2] + 0.05)),
+                float(push_focus[0] + 0.004),
+                float(push_focus[1] + 0.012),
+                float(max(table_center[2] + 0.11, rope_center[2] + 0.045)),
             ],
             dtype=np.float32,
         )
-        hero_pos = camera_position(hero_target, yaw_deg=132.0, pitch_deg=-24.0, distance=1.48)
+        hero_pos = camera_position(hero_target, yaw_deg=148.0, pitch_deg=-22.0, distance=1.42)
 
         validation_target = np.asarray(
             [
@@ -992,9 +1093,9 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
         return {
             "hero": {
                 "pos": hero_pos.astype(np.float32, copy=False).tolist(),
-                "pitch": -24.0,
-                "yaw": 132.0,
-                "fov": 33.0,
+                "pitch": -22.0,
+                "yaw": 148.0,
+                "fov": 36.0,
                 "target": hero_target.astype(np.float32, copy=False).tolist(),
             },
             "validation": {
@@ -2328,6 +2429,7 @@ def render_video(
         )
         left_finger_idx = int(meta["left_finger_index"])
         right_finger_idx = int(meta["right_finger_index"])
+        finger_box_entries = _finger_box_entries(model, meta) if tabletop_task else []
         stage_center = np.asarray(meta["stage_center"], dtype=np.float32)
         stage_scale = np.asarray(meta["stage_scale"], dtype=np.float32)
         robot_base_center = np.asarray(meta["robot_base_center"], dtype=np.float32)
@@ -2387,7 +2489,35 @@ def render_video(
                     sim_data["body_q"][sim_idx], left_finger_idx, right_finger_idx
                 )
                 gripper_center = gripper_proxies["gripper_center"].astype(np.float32, copy=False)
+                q_obj = sim_data["particle_q_object"][sim_idx]
+                particle_radius = particle_radius_sim[: q_obj.shape[0]]
                 if str(args.render_mode) == "debug":
+                    actual_min_clearance = None
+                    actual_contact_source = None
+                    if tabletop_task and finger_box_entries:
+                        actual_min_clearance, actual_contact_source, _ = _min_finger_box_clearance(
+                            q_obj,
+                            particle_radius,
+                            sim_data["body_q"][sim_idx],
+                            finger_box_entries,
+                        )
+                        tip_xforms = []
+                        for entry in finger_box_entries:
+                            if not bool(entry.get("is_tip", False)):
+                                continue
+                            center_w, _ = _combine_world_transform(
+                                sim_data["body_q"][sim_idx][int(entry["body_index"])],
+                                np.asarray(entry["local_transform"], dtype=np.float32),
+                            )
+                            tip_xforms.append(wp.transform(wp.vec3(*center_w.tolist()), wp.quat_identity()))
+                        if tip_xforms:
+                            viewer.log_shapes(
+                                "/demo/finger_tip_boxes",
+                                newton.GeoType.SPHERE,
+                                0.006,
+                                wp.array(tip_xforms, dtype=wp.transform, device=device),
+                                wp.array([wp.vec3(1.0, 0.40, 0.92) for _ in tip_xforms], dtype=wp.vec3, device=device),
+                            )
                     viewer.log_shapes(
                         "/demo/ee_target",
                         newton.GeoType.SPHERE,
@@ -2619,15 +2749,22 @@ def render_video(
                         speed = float(np.linalg.norm(gripper_center - prev_gripper_center) / sim_frame_dt)
                     else:
                         speed = 0.0
-                    q_obj = sim_data["particle_q_object"][sim_idx]
-                    particle_radius = particle_radius_sim[: q_obj.shape[0]]
                     min_clearance, min_proxy_name, _ = _min_gripper_proxy_clearance(
                         q_obj,
                         particle_radius,
                         gripper_proxies,
                         float(args.ee_contact_radius),
                     )
-                    contact_state = "ON" if min_clearance <= 0.0 else "OFF"
+                    if tabletop_task and actual_min_clearance is not None:
+                        contact_state = "ON" if float(actual_min_clearance) <= 0.0 else "OFF"
+                        contact_line = (
+                            f"contact: {contact_state} via {actual_contact_source} | actual finger-box clearance: {1000.0 * float(actual_min_clearance):.1f} mm"
+                        )
+                    else:
+                        contact_state = "ON" if min_clearance <= 0.0 else "OFF"
+                        contact_line = (
+                            f"contact: {contact_state} via {min_proxy_name} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm"
+                        )
                     tracking_line = f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s"
                     if release_time_s is not None:
                         tracking_line += f" | t_release: {float(release_time_s):.3f}s"
@@ -2641,7 +2778,7 @@ def render_video(
                                 else "Native Newton Franka Panda + rope drop baseline | yellow=target, cyan=gripper center"
                             ),
                             tracking_line,
-                            f"contact: {contact_state} via {min_proxy_name} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm",
+                            contact_line,
                         ],
                         font_size=int(args.label_font_size),
                     )
@@ -2675,6 +2812,7 @@ def build_summary(
     body_vel = np.asarray(sim_data["body_vel"], dtype=np.float32)
     target_pos = np.asarray(sim_data["ee_target_pos"], dtype=np.float32)
     particle_radius = model.particle_radius.numpy().astype(np.float32)[: particle_q.shape[1]]
+    finger_box_entries = _finger_box_entries(model, meta) if tabletop_task else []
 
     left_finger_idx = int(meta["left_finger_index"])
     right_finger_idx = int(meta["right_finger_index"])
@@ -2725,6 +2863,12 @@ def build_summary(
     left_finger_clearance = []
     right_finger_clearance = []
     finger_span_clearance = []
+    actual_finger_box_clearance = []
+    actual_finger_box_source = []
+    actual_left_finger_box_clearance = []
+    actual_right_finger_box_clearance = []
+    actual_left_tip_box_clearance = []
+    actual_right_tip_box_clearance = []
     for frame_idx in range(particle_q.shape[0]):
         min_d, min_source, per_proxy_min = _min_gripper_proxy_clearance(
             particle_q[frame_idx],
@@ -2742,17 +2886,39 @@ def build_summary(
         left_finger_clearance.append(float(per_proxy_min["left_finger"]))
         right_finger_clearance.append(float(per_proxy_min["right_finger"]))
         finger_span_clearance.append(float(per_proxy_min.get("finger_span", min_d)))
-        if min_d <= 0.0:
-            contact_frames.append(frame_idx)
+        actual_min_d = None
+        actual_source = None
+        if tabletop_task and finger_box_entries:
+            actual_min_d, actual_source, per_box_min = _min_finger_box_clearance(
+                particle_q[frame_idx],
+                particle_radius,
+                body_q[frame_idx],
+                finger_box_entries,
+            )
+            actual_finger_box_clearance.append(float(actual_min_d))
+            actual_finger_box_source.append(str(actual_source))
+            actual_left_finger_box_clearance.append(float(per_box_min.get("left_any_box", np.inf)))
+            actual_right_finger_box_clearance.append(float(per_box_min.get("right_any_box", np.inf)))
+            actual_left_tip_box_clearance.append(float(per_box_min.get("left_tip_box", np.inf)))
+            actual_right_tip_box_clearance.append(float(per_box_min.get("right_tip_box", np.inf)))
+            if actual_min_d <= 0.0:
+                contact_frames.append(frame_idx)
+        else:
+            if min_d <= 0.0:
+                contact_frames.append(frame_idx)
 
     support_contact_frames = list(contact_frames)
-    support_contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
+    if tabletop_task and actual_finger_box_clearance:
+        support_contact_mask = np.asarray([m <= 0.0 for m in actual_finger_box_clearance], dtype=bool)
+    else:
+        support_contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
     support_contact_duration_s = float(np.count_nonzero(support_contact_mask) * frame_dt)
     support_first_contact_frame = int(support_contact_frames[0]) if support_contact_frames else None
     support_last_contact_frame = int(support_contact_frames[-1]) if support_contact_frames else None
-    support_contact_peak_frame = (
-        int(np.argmin(np.asarray(min_clearance, dtype=np.float32))) if min_clearance else None
-    )
+    if tabletop_task and actual_finger_box_clearance:
+        support_contact_peak_frame = int(np.argmin(np.asarray(actual_finger_box_clearance, dtype=np.float32)))
+    else:
+        support_contact_peak_frame = int(np.argmin(np.asarray(min_clearance, dtype=np.float32))) if min_clearance else None
 
     ground_contact_mask = np.asarray(rope_surface_clearance_to_ground <= 0.0, dtype=bool)
     ground_contact_frames = np.flatnonzero(ground_contact_mask).tolist()
@@ -2815,7 +2981,8 @@ def build_summary(
             unique_phase_sequence.append(name)
 
     support_source_counts: dict[str, int] = {}
-    for name, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False):
+    support_source_series = actual_finger_box_source if tabletop_task and actual_finger_box_source else min_clearance_source
+    for name, active in zip(support_source_series, support_contact_mask.tolist(), strict=False):
         if not active:
             continue
         support_source_counts[name] = int(support_source_counts.get(name, 0) + 1)
@@ -2825,8 +2992,21 @@ def build_summary(
     left_finger_clearance_np = np.asarray(left_finger_clearance, dtype=np.float32)
     right_finger_clearance_np = np.asarray(right_finger_clearance, dtype=np.float32)
     finger_span_clearance_np = np.asarray(finger_span_clearance, dtype=np.float32)
+    actual_finger_box_clearance_np = np.asarray(actual_finger_box_clearance, dtype=np.float32)
+    actual_left_finger_box_clearance_np = np.asarray(actual_left_finger_box_clearance, dtype=np.float32)
+    actual_right_finger_box_clearance_np = np.asarray(actual_right_finger_box_clearance, dtype=np.float32)
+    actual_left_tip_box_clearance_np = np.asarray(actual_left_tip_box_clearance, dtype=np.float32)
+    actual_right_tip_box_clearance_np = np.asarray(actual_right_tip_box_clearance, dtype=np.float32)
     contact_peak_source = (
-        None if contact_peak_frame is None else str(min_clearance_source[int(contact_peak_frame)])
+        None
+        if contact_peak_frame is None
+        else str(
+            (
+                actual_finger_box_source[int(contact_peak_frame)]
+                if tabletop_task and actual_finger_box_source
+                else min_clearance_source[int(contact_peak_frame)]
+            )
+        )
     )
     if drop_release_task:
         contact_peak_source = "ground_plane"
@@ -2937,7 +3117,11 @@ def build_summary(
         "support_first_contact_frame": support_first_contact_frame,
         "support_last_contact_frame": support_last_contact_frame,
         "support_contact_peak_frame": support_contact_peak_frame,
-        "support_contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
+        "support_contact_proxy_mode": (
+            "actual_finger_boxes"
+            if tabletop_task and actual_finger_box_clearance
+            else "min(gripper_center,left_finger,right_finger,finger_span)"
+        ),
         "support_contact_proxy_counts": support_source_counts,
         "support_patch_indices": np.asarray(meta.get("support_patch_indices", meta["anchor_indices"]), dtype=np.int32).astype(int).tolist(),
         "support_patch_center_m": np.asarray(meta.get("support_patch_center_m", meta["anchor_positions"].mean(axis=0)), dtype=np.float32).astype(float).tolist(),
@@ -3012,6 +3196,42 @@ def build_summary(
             else support_source_counts
         ),
         "contact_peak_proxy": contact_peak_source,
+        "proxy_contact_counts": (
+            {"ground_plane": int(np.count_nonzero(contact_mask))}
+            if drop_release_task
+            else {
+                name: int(sum(1 for src, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False) if active and src == name))
+                for name in sorted(set(min_clearance_source))
+                if any(active and src == name for src, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False))
+            }
+        ),
+        "actual_finger_box_contact_started": bool(tabletop_task and actual_finger_box_clearance and support_first_contact_frame is not None),
+        "actual_finger_box_first_contact_frame": (
+            support_first_contact_frame if tabletop_task and actual_finger_box_clearance else None
+        ),
+        "actual_finger_box_first_contact_time_s": (
+            None
+            if not (tabletop_task and actual_finger_box_clearance and support_first_contact_frame is not None)
+            else float(support_first_contact_frame * frame_dt)
+        ),
+        "actual_finger_box_peak_source": (
+            contact_peak_source if tabletop_task and actual_finger_box_clearance else None
+        ),
+        "actual_finger_box_clearance_min_m": (
+            None if actual_finger_box_clearance_np.size == 0 else float(np.min(actual_finger_box_clearance_np))
+        ),
+        "actual_left_finger_box_clearance_min_m": (
+            None if actual_left_finger_box_clearance_np.size == 0 else float(np.min(actual_left_finger_box_clearance_np))
+        ),
+        "actual_right_finger_box_clearance_min_m": (
+            None if actual_right_finger_box_clearance_np.size == 0 else float(np.min(actual_right_finger_box_clearance_np))
+        ),
+        "actual_left_tip_box_clearance_min_m": (
+            None if actual_left_tip_box_clearance_np.size == 0 else float(np.min(actual_left_tip_box_clearance_np))
+        ),
+        "actual_right_tip_box_clearance_min_m": (
+            None if actual_right_tip_box_clearance_np.size == 0 else float(np.min(actual_right_tip_box_clearance_np))
+        ),
         "drag_phase_gating": (
             "pre_approach + release_retract"
             if str(args.task) == "lift_release"

@@ -1,0 +1,22 @@
+{
+  "run_id": "20260401_202952_remotefix_visradius_c11",
+  "summary_first_contact_frame": 66,
+  "summary_first_contact_time_s": 2.2011000000000003,
+  "summary_contact_proxy_counts": {
+    "finger_span": 88
+  },
+  "summary_contact_peak_proxy": "finger_span",
+  "proxy_finger_span_first_contact_frame": 66,
+  "proxy_finger_span_first_contact_time_s": 2.2011000000000003,
+  "actual_any_finger_box_first_contact_frame": 51,
+  "actual_any_finger_box_first_contact_time_s": 1.7008500000000002,
+  "actual_left_tip_first_contact_frame": 51,
+  "actual_left_tip_first_contact_time_s": 1.7008500000000002,
+  "rope_lateral_motion_frame": 3,
+  "rope_lateral_motion_time_s": 0.10005000000000001,
+  "rope_deformation_frame": 2,
+  "rope_deformation_time_s": 0.06670000000000001,
+  "rope_motion_threshold_m": 0.003,
+  "rope_deformation_threshold_m": 0.005,
+  "dominant_proxy_issue": "finger_span"
+}
