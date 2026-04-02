@@ -606,8 +606,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera-pitch", type=float, default=None)
     p.add_argument("--camera-yaw", type=float, default=None)
     p.add_argument("--camera-fov", type=float, default=None)
-    p.add_argument("--particle-radius-vis-scale", type=float, default=2.5)
-    p.add_argument("--particle-radius-vis-min", type=float, default=0.004)
+    p.add_argument(
+        "--particle-radius-vis-scale",
+        type=float,
+        default=None,
+        help="Optional render-only particle radius scale. If omitted, render the true physical particle radius.",
+    )
+    p.add_argument(
+        "--particle-radius-vis-min",
+        type=float,
+        default=None,
+        help="Optional render-only particle radius cap. If omitted, no radius cap is applied.",
+    )
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument(
         "--tabletop-hero-hide-pedestal",

@@ -164,20 +164,24 @@ def _pair_penalty_contact_force(
 def compute_visual_particle_radii(
     particle_radius: np.ndarray,
     *,
-    radius_scale: float,
-    radius_cap: float,
+    radius_scale: float | None,
+    radius_cap: float | None,
 ) -> np.ndarray:
     """Builds render-only radii from physical radii.
 
     The physics model keeps using the original ``particle_radius`` values.
-    Rendering intentionally caps the on-screen radius so thin cloth/rope
-    remains visible without changing the contact geometry used in simulation.
+    If no render override is requested, rendering uses the physical particle
+    radius directly. Optional scale/cap overrides still remain available for
+    cases that intentionally want a different visual thickness.
     """
 
     radii = np.array(particle_radius, dtype=np.float32, copy=False)
-    return np.minimum(radii * float(radius_scale), float(radius_cap)).astype(
-        np.float32, copy=False
-    )
+    if radius_scale is None and radius_cap is None:
+        return radii.astype(np.float32, copy=False)
+    scaled = radii * (1.0 if radius_scale is None else float(radius_scale))
+    if radius_cap is None:
+        return scaled.astype(np.float32, copy=False)
+    return np.minimum(scaled, float(radius_cap)).astype(np.float32, copy=False)
 
 
 @contextmanager
