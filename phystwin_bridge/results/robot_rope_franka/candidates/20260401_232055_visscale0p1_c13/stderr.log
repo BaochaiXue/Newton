@@ -1,0 +1,13 @@
+/home/xinjie/Newton_Connection/Newton/phystwin_bridge/tools/core/newton_import_ir.py:1209: UserWarning: tabletop_table_box: PhysTwin ground collide_elas is present in IR, but native Newton SemiImplicit has no direct 1-to-1 restitution field for particle-vs-shape contacts. Ground bounce will therefore use native Newton ground ke/kd/kf defaults unless --ground-restitution-mode=approximate-native is selected.
+  warnings.warn(message)
+Traceback (most recent call last):
+  File "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py", line 3435, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py", line 3420, in main
+    out_mp4 = render_video(model, sim_data, meta, args, device)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py", line 2418, in render_video
+    radius_cap=float(args.particle_radius_vis_min),
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: float() argument must be a string or a real number, not 'NoneType'

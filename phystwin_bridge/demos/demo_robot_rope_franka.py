@@ -609,8 +609,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--particle-radius-vis-scale",
         type=float,
-        default=None,
-        help="Optional render-only particle radius scale. If omitted, render the true physical particle radius.",
+        default=0.1,
+        help="Render-only particle radius scale. Defaults to 0.1x the physical particle radius for presentation readability.",
     )
     p.add_argument(
         "--particle-radius-vis-min",
@@ -2414,8 +2414,12 @@ def render_video(
         particle_radius_sim = model.particle_radius.numpy().astype(np.float32)
         render_radii = compute_visual_particle_radii(
             particle_radius_sim,
-            radius_scale=float(args.particle_radius_vis_scale),
-            radius_cap=float(args.particle_radius_vis_min),
+            radius_scale=(
+                None if args.particle_radius_vis_scale is None else float(args.particle_radius_vis_scale)
+            ),
+            radius_cap=(
+                None if args.particle_radius_vis_min is None else float(args.particle_radius_vis_min)
+            ),
         )
 
         rope_edges = np.asarray(meta["render_edges"], dtype=np.int32)
