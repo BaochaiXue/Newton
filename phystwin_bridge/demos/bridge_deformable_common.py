@@ -205,7 +205,23 @@ def _copy_object_only_ir(ir: dict[str, np.ndarray], args: argparse.Namespace) ->
     ir_demo["weight_scale"] = float(weight_scale)
     ir_demo["original_total_object_mass"] = float(original_mass.sum())
     ir_demo["current_total_object_mass"] = float(mass.sum())
-    ir_demo["collision_radius"] = np.asarray(ir_demo["collision_radius"], dtype=np.float32).copy()[:n_obj]
+    particle_radius_scale = float(getattr(args, "particle_radius_scale", 1.0))
+    if particle_radius_scale <= 0.0:
+        raise ValueError(f"--particle-radius-scale must be > 0, got {particle_radius_scale}")
+    ir_demo["collision_radius"] = (
+        np.asarray(ir_demo["collision_radius"], dtype=np.float32).copy()[:n_obj] * particle_radius_scale
+    )
+    if "contact_collision_dist" in ir_demo:
+        contact_collision_dist = np.asarray(ir_demo["contact_collision_dist"], dtype=np.float32).copy()
+        if contact_collision_dist.size == 1:
+            ir_demo["contact_collision_dist"] = np.asarray(
+                float(contact_collision_dist.reshape(-1)[0]) * particle_radius_scale,
+                dtype=np.float32,
+            )
+        else:
+            ir_demo["contact_collision_dist"] = (
+                np.asarray(contact_collision_dist, dtype=np.float32).reshape(-1)[:n_obj] * particle_radius_scale
+            )
     ir_demo["num_object_points"] = np.asarray(n_obj, dtype=np.int32)
     ir_demo["reverse_z"] = np.asarray(False)
 

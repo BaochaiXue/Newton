@@ -276,6 +276,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--spring-ke-scale", type=float, default=1.0)
     p.add_argument("--spring-kd-scale", type=float, default=1.0)
+    p.add_argument(
+        "--particle-radius-scale",
+        type=float,
+        default=0.1,
+        help="Scale factor applied to the rope's physical collision/contact radius fields before building the Newton model.",
+    )
     p.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--drag-damping-scale", type=float, default=1.0)
     p.add_argument(
@@ -609,8 +615,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--particle-radius-vis-scale",
         type=float,
-        default=0.1,
-        help="Render-only particle radius scale. Defaults to 0.1x the physical particle radius for presentation readability.",
+        default=None,
+        help="Optional render-only particle radius scale. If omitted, render the true physical particle radius.",
     )
     p.add_argument(
         "--particle-radius-vis-min",
