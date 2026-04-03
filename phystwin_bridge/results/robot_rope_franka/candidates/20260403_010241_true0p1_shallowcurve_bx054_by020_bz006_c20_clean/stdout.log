@@ -1,0 +1,843 @@
+[run_robot_rope_franka_tabletop_hero] run_dir=/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean
+[run_robot_rope_franka_tabletop_hero] presentation=python /home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py --out-dir /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work --prefix robot_rope_tabletop_hero --render-mode presentation --camera-profile hero --task tabletop_push_hero --sim-dt 5.0e-5 --substeps 667 --slowdown 1.0 --render-fps 30 --screen-width 1280 --screen-height 720 --viewer-headless --no-make-gif --anchor-count-per-end 2 --tabletop-control-mode joint_trajectory --ik-target-blend 0.20 --auto-set-weight 3.0 --tabletop-initial-pose tabletop_curve --tabletop-hero-hide-pedestal --tabletop-preroll-settle-seconds 2.0 --tabletop-preroll-damping-scale 6.0 --tabletop-settle-seconds 0.8 --tabletop-approach-seconds 1.4 --tabletop-push-seconds 2.4 --tabletop-hold-seconds 0.4 --tabletop-retract-seconds 1.2 --tabletop-rope-height 0.156 --tabletop-table-top-z 0.200 --tabletop-table-hx 0.42 --tabletop-table-hy 0.24 --tabletop-table-hz 0.020 --tabletop-robot-base-offset -0.56 -0.22 0.10 --tabletop-push-start-offset -0.09 -0.01 0.0 --tabletop-push-contact-offset -0.04 -0.03 0.0 --tabletop-push-end-offset 0.03 -0.04 0.0 --tabletop-retract-offset -0.02 -0.02 0.0 --tabletop-approach-clearance-z 0.10 --tabletop-contact-clearance-z 0.010 --tabletop-push-clearance-z 0.008 --tabletop-retract-clearance-z 0.05 --tabletop-ee-offset-z 0.22 --rope-line-width 0.024 --particle-radius-scale 0.1 --tabletop-initial-pose tabletop_shallow_curve --tabletop-preroll-settle-seconds 3.5 --tabletop-preroll-damping-scale 2.5 --tabletop-robot-base-offset -0.54 -0.20 0.06
+[run_robot_rope_franka_tabletop_hero] debug=python /home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py --out-dir /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work --prefix robot_rope_tabletop_hero_debug --render-mode debug --camera-profile hero --overlay-label --task tabletop_push_hero --sim-dt 5.0e-5 --substeps 667 --slowdown 1.0 --render-fps 30 --screen-width 1280 --screen-height 720 --viewer-headless --no-make-gif --anchor-count-per-end 2 --tabletop-control-mode joint_trajectory --ik-target-blend 0.20 --auto-set-weight 3.0 --tabletop-initial-pose tabletop_curve --tabletop-hero-hide-pedestal --tabletop-preroll-settle-seconds 2.0 --tabletop-preroll-damping-scale 6.0 --tabletop-settle-seconds 0.8 --tabletop-approach-seconds 1.4 --tabletop-push-seconds 2.4 --tabletop-hold-seconds 0.4 --tabletop-retract-seconds 1.2 --tabletop-rope-height 0.156 --tabletop-table-top-z 0.200 --tabletop-table-hx 0.42 --tabletop-table-hy 0.24 --tabletop-table-hz 0.020 --tabletop-robot-base-offset -0.56 -0.22 0.10 --tabletop-push-start-offset -0.09 -0.01 0.0 --tabletop-push-contact-offset -0.04 -0.03 0.0 --tabletop-push-end-offset 0.03 -0.04 0.0 --tabletop-retract-offset -0.02 -0.02 0.0 --tabletop-approach-clearance-z 0.10 --tabletop-contact-clearance-z 0.010 --tabletop-push-clearance-z 0.008 --tabletop-retract-clearance-z 0.05 --tabletop-ee-offset-z 0.22 --rope-line-width 0.024 --particle-radius-scale 0.1 --tabletop-initial-pose tabletop_shallow_curve --tabletop-preroll-settle-seconds 3.5 --tabletop-preroll-damping-scale 2.5 --tabletop-robot-base-offset -0.54 -0.20 0.06
+[run_robot_rope_franka_tabletop_hero] validation=python /home/xinjie/Newton_Connection/Newton/phystwin_bridge/demos/demo_robot_rope_franka.py --out-dir /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work --prefix robot_rope_tabletop_hero_validation --render-mode presentation --camera-profile validation --task tabletop_push_hero --sim-dt 5.0e-5 --substeps 667 --slowdown 1.0 --render-fps 30 --screen-width 1280 --screen-height 720 --viewer-headless --no-make-gif --anchor-count-per-end 2 --tabletop-control-mode joint_trajectory --ik-target-blend 0.20 --auto-set-weight 3.0 --tabletop-initial-pose tabletop_curve --tabletop-hero-hide-pedestal --tabletop-preroll-settle-seconds 2.0 --tabletop-preroll-damping-scale 6.0 --tabletop-settle-seconds 0.8 --tabletop-approach-seconds 1.4 --tabletop-push-seconds 2.4 --tabletop-hold-seconds 0.4 --tabletop-retract-seconds 1.2 --tabletop-rope-height 0.156 --tabletop-table-top-z 0.200 --tabletop-table-hx 0.42 --tabletop-table-hy 0.24 --tabletop-table-hz 0.020 --tabletop-robot-base-offset -0.56 -0.22 0.10 --tabletop-push-start-offset -0.09 -0.01 0.0 --tabletop-push-contact-offset -0.04 -0.03 0.0 --tabletop-push-end-offset 0.03 -0.04 0.0 --tabletop-retract-offset -0.02 -0.02 0.0 --tabletop-approach-clearance-z 0.10 --tabletop-contact-clearance-z 0.010 --tabletop-push-clearance-z 0.008 --tabletop-retract-clearance-z 0.05 --tabletop-ee-offset-z 0.22 --rope-line-width 0.024 --particle-radius-scale 0.1 --tabletop-initial-pose tabletop_shallow_curve --tabletop-preroll-settle-seconds 3.5 --tabletop-preroll-damping-scale 2.5 --tabletop-robot-base-offset -0.54 -0.20 0.06
+Warp 1.12.0.dev20260218 initialized:
+   Git commit: 3d888595a61128dd17de0dbb9eb8d80391e81424
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4090" (23 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/xinjie/.cache/warp/1.12.0.dev20260218
+Module newton._src.geometry.inertia 2bd8c78 load on device 'cuda:0' took 0.72 ms  (cached)
+Module newton._src.utils.mesh bced167 load on device 'cpu' took 0.59 ms  (cached)
+Module validate_and_correct_inertia_kernel_0c7bfa66 0c7bfa6 load on device 'cuda:0' took 0.28 ms  (cached)
+Module newton._src.sim.articulation 2109b59 load on device 'cuda:0' took 2.61 ms  (cached)
+Module newton._src.sim.collide 452004c load on device 'cuda:0' took 0.53 ms  (cached)
+Module newton._src.geometry.broad_phase_nxn dcff895 load on device 'cuda:0' took 0.33 ms  (cached)
+Module create_narrow_phase_primitive_kernel__locals__narrow_phase_primitive_kernel_ac59d7a0 640833f load on device 'cuda:0' took 1.17 ms  (cached)
+Module create_narrow_phase_kernel_gjk_mpr__locals__narrow_phase_kernel_gjk_mpr_46eb548d 1d6e16f load on device 'cuda:0' took 0.88 ms  (cached)
+Module newton._src.geometry.narrow_phase 0593107 load on device 'cuda:0' took 4.93 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 3a7a18f load on device 'cuda:0' took 0.36 ms  (cached)
+Module newton._src.geometry.narrow_phase 931370b load on device 'cuda:0' took 0.56 ms  (cached)
+Module create_narrow_phase_process_mesh_plane_contacts_kernel__locals__narrow_phase_process_mesh_plane_contacts_reduce_kernel_930923b3 4c09d6b load on device 'cuda:0' took 0.27 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_8060ca9c d5135d2 load on device 'cuda:0' took 1.10 ms  (cached)
+Module newton._src.geometry.contact_reduction_global d2f9fc3 load on device 'cuda:0' took 0.41 ms  (cached)
+Module newton._src.geometry.sdf_contact e671631 load on device 'cuda:0' took 0.23 ms  (cached)
+Module create_narrow_phase_process_mesh_mesh_contacts_kernel__locals__mesh_sdf_collision_global_reduce_kernel_f46f3252 f46f325 load on device 'cuda:0' took 0.72 ms  (cached)
+Module create_export_reduced_contacts_kernel__locals__export_reduced_contacts_kernel_ef09b9a0 6e4cf74 load on device 'cuda:0' took 0.63 ms  (cached)
+Module newton._src.geometry.kernels 55ed1b0 load on device 'cuda:0' took 1.24 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_particle 0e0d871 load on device 'cuda:0' took 0.62 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 483b8fe load on device 'cuda:0' took 1.18 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_contact d558900 load on device 'cuda:0' took 0.85 ms  (cached)
+Module newton._src.solvers.solver 16aecb3 load on device 'cuda:0' took 1.12 ms  (cached)
+Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.21 ms  (cached)
+  frame 25/187 phase=approach target_err=0.0000m min_clearance=0.0628m
+  frame 50/187 phase=approach target_err=0.0000m min_clearance=0.0066m
+  frame 75/187 phase=push target_err=0.0000m min_clearance=-0.0285m
+  frame 100/187 phase=push target_err=0.0000m min_clearance=-0.0233m
+  frame 125/187 phase=push target_err=0.0000m min_clearance=-0.0211m
+  frame 150/187 phase=hold target_err=0.0000m min_clearance=-0.0202m
+  frame 175/187 phase=retract target_err=0.0000m min_clearance=0.0331m
+  frame 187/187 phase=retract target_err=0.0000m min_clearance=0.0668m
+  Simulation done: 187 frames in 78.4s
+Module newton._src.viewer.gl.opengl 7724bb3 load on device 'cuda:0' took 0.32 ms  (cached)
+Module newton._src.viewer.kernels 773c4cf load on device 'cuda:0' took 1.14 ms  (cached)
+Module newton._src.geometry.raycast 23dd4e1 load on device 'cuda:0' took 1.95 ms  (cached)
+Module newton._src.viewer.viewer_gl 2219863 load on device 'cuda:0' took 0.46 ms  (cached)
+Module newton._src.utils.render 145677d load on device 'cuda:0' took 0.27 ms  (cached)
+  rendered 30/186 frames
+  rendered 60/186 frames
+  rendered 90/186 frames
+  rendered 120/186 frames
+  rendered 150/186 frames
+  rendered 180/186 frames
+  Summary: /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work/robot_rope_tabletop_hero_summary.json
+{
+  "ir_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/ir/rope_double_hand/phystwin_ir_v2_bf_strict.npz",
+  "output_mp4": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work/robot_rope_tabletop_hero.mp4",
+  "frames": 187,
+  "sim_dt": 5e-05,
+  "substeps": 667,
+  "frame_dt": 0.033350000000000005,
+  "video_slowdown": 1.0,
+  "task_duration_s": 6.2,
+  "wall_time_sec": 78.43625935299497,
+  "rope_total_mass": 3.0,
+  "anchor_count": 4,
+  "anchor_constraint_mode": "free_tabletop_rope",
+  "anchor_mass_mode": "preserve",
+  "task": "tabletop_push_hero",
+  "render_mode": "presentation",
+  "camera_profile": "hero",
+  "recommended_hero_camera": {
+    "pos": [
+      1.1366671323776245,
+      -0.842525839805603,
+      0.8219413757324219
+    ],
+    "pitch": -22.0,
+    "yaw": 148.0,
+    "fov": 36.0,
+    "target": [
+      0.020126154646277428,
+      -0.1448335349559784,
+      0.2900000214576721
+    ]
+  },
+  "recommended_validation_camera": {
+    "pos": [
+      1.4288767576217651,
+      -0.7858306765556335,
+      0.9464282989501953
+    ],
+    "pitch": -23.0,
+    "yaw": 156.0,
+    "fov": 38.0,
+    "target": [
+      0.016126153990626335,
+      -0.15683352947235107,
+      0.2900000214576721
+    ]
+  },
+  "particle_contacts": false,
+  "particle_contact_kernel": false,
+  "particle_radius_scale": 0.1,
+  "particle_radius_mean_m": 0.002600237959995866,
+  "particle_radius_render_mean_m": 0.002600237959995866,
+  "particle_radius_vis_scale": null,
+  "particle_radius_vis_min": null,
+  "robot_motion_mode": "ik",
+  "replay_source": null,
+  "history_storage_mode": "memmap",
+  "history_storage_files": {
+    "particle_q_all": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work/robot_rope_tabletop_hero_particle_q_all.npy",
+    "particle_q_object": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work/robot_rope_tabletop_hero_particle_q_object.npy",
+    "body_q": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work/robot_rope_tabletop_hero_body_q.npy",
+    "body_vel": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work/robot_rope_tabletop_hero_body_vel.npy",
+    "ee_target_pos": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/work/robot_rope_tabletop_hero_ee_target_pos.npy"
+  },
+  "apply_drag": true,
+  "drag_ignore_gravity_axis": true,
+  "gravity_mag_m_s2": 9.8,
+  "pre_release_settle_damping_scale": 8.0,
+  "robot_geometry": "native_franka",
+  "ee_body_index": 6,
+  "ik_target_blend": 0.2,
+  "tabletop_control_mode": "joint_trajectory",
+  "tabletop_initial_pose": "tabletop_shallow_curve",
+  "tabletop_robot_base_offset": [
+    -0.5400000214576721,
+    -0.20000000298023224,
+    0.05999999865889549
+  ],
+  "tabletop_rope_height": 0.156,
+  "tabletop_approach_clearance_z": 0.1,
+  "tabletop_contact_clearance_z": 0.01,
+  "tabletop_push_clearance_z": 0.008,
+  "tabletop_retract_clearance_z": 0.05,
+  "tabletop_ee_offset_z": 0.22,
+  "tabletop_target_z": {
+    "settle": 0.3092004759199918,
+    "contact_ready": 0.21920047591999176,
+    "push": 0.21720047591999175,
+    "retract": 0.25920047591999174
+  },
+  "tabletop_rope_top_z": 0.20920047591999175,
+  "gripper_center_tracking_error_mean_m": 2.6392904146632645e-06,
+  "gripper_center_tracking_error_max_m": 5.115313342685113e-06,
+  "gripper_center_tracking_error_pre_contact_mean_m": null,
+  "gripper_center_tracking_error_during_contact_mean_m": 2.0357963421702152e-06,
+  "gripper_center_tracking_error_release_mean_m": null,
+  "gripper_center_speed_max_m_s": 0.10055078566074371,
+  "gripper_center_speed_pre_contact_mean_m_s": null,
+  "gripper_center_speed_during_contact_mean_m_s": 0.04102053493261337,
+  "gripper_center_speed_release_mean_m_s": null,
+  "gripper_center_path_length_m": 0.32899805903434753,
+  "ground_z_m": 0.0,
+  "table_top_z_m": 0.2,
+  "rope_min_z_m": 0.19868482649326324,
+  "rope_surface_clearance_min_m": 0.19608458876609802,
+  "rope_surface_clearance_to_table_min_m": -0.003915414214134216,
+  "table_contact_active_frames": 187,
+  "table_contact_duration_s": 6.2364500000000005,
+  "table_contact_peak_frame": 71,
+  "support_contact_active_frames": 68,
+  "support_contact_duration_s": 2.2678000000000003,
+  "support_first_contact_frame": 85,
+  "support_last_contact_frame": 152,
+  "support_contact_peak_frame": 123,
+  "support_contact_proxy_mode": "actual_finger_boxes",
+  "support_contact_proxy_counts": {
+    "right_box_0": 20,
+    "right_box_2": 8,
+    "right_tip_box": 40
+  },
+  "support_patch_indices": [
+    0,
+    9,
+    207,
+    1752
+  ],
+  "support_patch_center_m": [
+    0.0004427209496498108,
+    -0.022535452619194984,
+    0.20672878623008728
+  ],
+  "visible_support_center_m": [
+    0.0004427209496498108,
+    -0.022535452619194984,
+    0.20672878623008728
+  ],
+  "contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
+  "contact_proxy_radius_m": 0.033,
+  "contact_proxy_radii_m": {
+    "gripper_center": 0.033,
+    "left_finger": 0.033,
+    "right_finger": 0.033,
+    "finger_span": 0.033
+  },
+  "rope_com_displacement_m": 0.07784422487020493,
+  "rope_com_z_min_m": 0.21049372851848602,
+  "rope_mid_segment_peak_z_delta_m": 0.00033645331859588623,
+  "rope_mid_segment_final_z_delta_m": -0.002190887928009033,
+  "rope_mid_segment_peak_frame": 29,
+  "contact_started": true,
+  "first_contact_frame": 85,
+  "first_contact_time_s": 2.8347500000000005,
+  "first_ground_contact_frame": 85,
+  "first_ground_contact_time_s": 2.8347500000000005,
+  "last_contact_frame": 152,
+  "last_contact_time_s": 5.0692,
+  "first_contact_phase": "push",
+  "contact_peak_frame": 83,
+  "release_frame": null,
+  "release_time_s": null,
+  "t_release_s": null,
+  "impact_speed_before_first_contact_m_s": 0.0006871959794943835,
+  "early_fall_acceleration_estimate_m_s2": null,
+  "early_fall_com_horizontal_velocity_m_s": null,
+  "post_release_horizontal_kick_window_s": 0.08,
+  "post_release_horizontal_kick_m_s": null,
+  "contact_duration_s": 2.2678000000000003,
+  "contact_active_frames": 68,
+  "contact_phase_count": 68,
+  "task_phase_sequence": [
+    "settle",
+    "approach",
+    "push",
+    "hold",
+    "retract"
+  ],
+  "rope_com_horizontal_speed_mean_pre_release_m_s": null,
+  "rope_particle_speed_mean_pre_release_m_s": null,
+  "support_patch_speed_mean_pre_release_m_s": null,
+  "pre_release_spring_energy_proxy": null,
+  "post_release_spring_energy_proxy": null,
+  "settle_window_seconds": 0.08,
+  "settle_gate_pass": null,
+  "settle_gate_frame": null,
+  "settle_gate_metrics": {},
+  "preroll_settle_pass": true,
+  "preroll_settle_time_s": 0.7337000000000001,
+  "preroll_settle_metrics": {
+    "window_start_frame": 17,
+    "window_end_frame": 22,
+    "window_duration_s": 0.20010000000000003,
+    "particle_speed_mean_max_m_s": 0.018317732959985733,
+    "com_horizontal_speed_max_m_s": 0.005959124770015478,
+    "support_patch_speed_mean_max_m_s": 0.019308658316731453,
+    "particle_speed_mean_threshold_m_s": 0.08,
+    "com_horizontal_speed_threshold_m_s": 0.05,
+    "support_patch_speed_threshold_m_s": 0.02
+  },
+  "preroll_frame_count": 23,
+  "min_clearance_min_m": -0.029854651540517807,
+  "min_clearance_final_m": 0.06675820052623749,
+  "gripper_center_clearance_min_m": -0.028068704530596733,
+  "left_finger_clearance_min_m": -0.015591243281960487,
+  "right_finger_clearance_min_m": -0.018344568088650703,
+  "finger_span_clearance_min_m": -0.029854651540517807,
+  "contact_proxy_counts": {
+    "right_box_0": 20,
+    "right_box_2": 8,
+    "right_tip_box": 40
+  },
+  "contact_peak_proxy": "right_box_0",
+  "proxy_contact_counts": {
+    "finger_span": 68
+  },
+  "actual_finger_box_contact_started": true,
+  "actual_finger_box_first_contact_frame": 85,
+  "actual_finger_box_first_contact_time_s": 2.8347500000000005,
+  "actual_finger_box_peak_source": "right_box_0",
+  "actual_finger_box_clearance_min_m": -0.005103996954858303,
+  "actual_left_finger_box_clearance_min_m": 0.006888618692755699,
+  "actual_right_finger_box_clearance_min_m": -0.005103996954858303,
+  "actual_left_tip_box_clearance_min_m": 0.006888618692755699,
+  "actual_right_tip_box_clearance_min_m": -0.005103996954858303,
+  "drag_phase_gating": "always_on_quasi_static",
+  "physics_validation_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/presentation/physics_validation.json"
+}
+Warp 1.12.0.dev20260218 initialized:
+   Git commit: 3d888595a61128dd17de0dbb9eb8d80391e81424
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4090" (23 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/xinjie/.cache/warp/1.12.0.dev20260218
+Module newton._src.geometry.inertia 2bd8c78 load on device 'cuda:0' took 0.70 ms  (cached)
+Module newton._src.utils.mesh bced167 load on device 'cpu' took 0.61 ms  (cached)
+Module validate_and_correct_inertia_kernel_0c7bfa66 0c7bfa6 load on device 'cuda:0' took 0.47 ms  (cached)
+Module newton._src.sim.articulation 2109b59 load on device 'cuda:0' took 2.63 ms  (cached)
+Module newton._src.sim.collide 452004c load on device 'cuda:0' took 0.51 ms  (cached)
+Module newton._src.geometry.broad_phase_nxn dcff895 load on device 'cuda:0' took 0.34 ms  (cached)
+Module create_narrow_phase_primitive_kernel__locals__narrow_phase_primitive_kernel_ac59d7a0 640833f load on device 'cuda:0' took 0.52 ms  (cached)
+Module create_narrow_phase_kernel_gjk_mpr__locals__narrow_phase_kernel_gjk_mpr_46eb548d 1d6e16f load on device 'cuda:0' took 0.92 ms  (cached)
+Module newton._src.geometry.narrow_phase 0593107 load on device 'cuda:0' took 5.41 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 3a7a18f load on device 'cuda:0' took 0.37 ms  (cached)
+Module newton._src.geometry.narrow_phase 931370b load on device 'cuda:0' took 0.61 ms  (cached)
+Module create_narrow_phase_process_mesh_plane_contacts_kernel__locals__narrow_phase_process_mesh_plane_contacts_reduce_kernel_930923b3 4c09d6b load on device 'cuda:0' took 0.89 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_8060ca9c d5135d2 load on device 'cuda:0' took 1.55 ms  (cached)
+Module newton._src.geometry.contact_reduction_global d2f9fc3 load on device 'cuda:0' took 0.35 ms  (cached)
+Module newton._src.geometry.sdf_contact e671631 load on device 'cuda:0' took 0.20 ms  (cached)
+Module create_narrow_phase_process_mesh_mesh_contacts_kernel__locals__mesh_sdf_collision_global_reduce_kernel_f46f3252 f46f325 load on device 'cuda:0' took 0.73 ms  (cached)
+Module create_export_reduced_contacts_kernel__locals__export_reduced_contacts_kernel_ef09b9a0 6e4cf74 load on device 'cuda:0' took 0.79 ms  (cached)
+Module newton._src.geometry.kernels 55ed1b0 load on device 'cuda:0' took 1.47 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_particle 0e0d871 load on device 'cuda:0' took 0.61 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 483b8fe load on device 'cuda:0' took 1.20 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_contact d558900 load on device 'cuda:0' took 0.85 ms  (cached)
+Module newton._src.solvers.solver 16aecb3 load on device 'cuda:0' took 0.42 ms  (cached)
+Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.24 ms  (cached)
+  frame 25/187 phase=approach target_err=0.0000m min_clearance=0.0634m
+  frame 50/187 phase=approach target_err=0.0000m min_clearance=0.0054m
+  frame 75/187 phase=push target_err=0.0000m min_clearance=-0.0162m
+  frame 100/187 phase=push target_err=0.0000m min_clearance=-0.0195m
+  frame 125/187 phase=push target_err=0.0000m min_clearance=-0.0264m
+  frame 150/187 phase=hold target_err=0.0000m min_clearance=-0.0270m
+  frame 175/187 phase=retract target_err=0.0000m min_clearance=0.0355m
+  frame 187/187 phase=retract target_err=0.0000m min_clearance=0.0673m
+  Simulation done: 187 frames in 78.2s
+Module newton._src.viewer.gl.opengl 7724bb3 load on device 'cuda:0' took 0.33 ms  (cached)
+Module newton._src.viewer.kernels 773c4cf load on device 'cuda:0' took 1.22 ms  (cached)
+Module newton._src.geometry.raycast 23dd4e1 load on device 'cuda:0' took 1.70 ms  (cached)
+Module newton._src.viewer.viewer_gl 2219863 load on device 'cuda:0' took 0.44 ms  (cached)
+Module newton._src.utils.render 145677d load on device 'cuda:0' took 0.36 ms  (cached)
+  rendered 30/186 frames
+  rendered 60/186 frames
+  rendered 90/186 frames
+  rendered 120/186 frames
+  rendered 150/186 frames
+  rendered 180/186 frames
+  Summary: /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work/robot_rope_tabletop_hero_debug_summary.json
+{
+  "ir_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/ir/rope_double_hand/phystwin_ir_v2_bf_strict.npz",
+  "output_mp4": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work/robot_rope_tabletop_hero_debug.mp4",
+  "frames": 187,
+  "sim_dt": 5e-05,
+  "substeps": 667,
+  "frame_dt": 0.033350000000000005,
+  "video_slowdown": 1.0,
+  "task_duration_s": 6.2,
+  "wall_time_sec": 78.15155408800638,
+  "rope_total_mass": 3.0,
+  "anchor_count": 4,
+  "anchor_constraint_mode": "free_tabletop_rope",
+  "anchor_mass_mode": "preserve",
+  "task": "tabletop_push_hero",
+  "render_mode": "debug",
+  "camera_profile": "hero",
+  "recommended_hero_camera": {
+    "pos": [
+      1.1366671323776245,
+      -0.842525839805603,
+      0.8219413757324219
+    ],
+    "pitch": -22.0,
+    "yaw": 148.0,
+    "fov": 36.0,
+    "target": [
+      0.020126154646277428,
+      -0.1448335349559784,
+      0.2900000214576721
+    ]
+  },
+  "recommended_validation_camera": {
+    "pos": [
+      1.4288767576217651,
+      -0.7858306765556335,
+      0.9464282989501953
+    ],
+    "pitch": -23.0,
+    "yaw": 156.0,
+    "fov": 38.0,
+    "target": [
+      0.016126153990626335,
+      -0.15683352947235107,
+      0.2900000214576721
+    ]
+  },
+  "particle_contacts": false,
+  "particle_contact_kernel": false,
+  "particle_radius_scale": 0.1,
+  "particle_radius_mean_m": 0.002600237959995866,
+  "particle_radius_render_mean_m": 0.002600237959995866,
+  "particle_radius_vis_scale": null,
+  "particle_radius_vis_min": null,
+  "robot_motion_mode": "ik",
+  "replay_source": null,
+  "history_storage_mode": "memmap",
+  "history_storage_files": {
+    "particle_q_all": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work/robot_rope_tabletop_hero_debug_particle_q_all.npy",
+    "particle_q_object": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work/robot_rope_tabletop_hero_debug_particle_q_object.npy",
+    "body_q": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work/robot_rope_tabletop_hero_debug_body_q.npy",
+    "body_vel": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work/robot_rope_tabletop_hero_debug_body_vel.npy",
+    "ee_target_pos": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/work/robot_rope_tabletop_hero_debug_ee_target_pos.npy"
+  },
+  "apply_drag": true,
+  "drag_ignore_gravity_axis": true,
+  "gravity_mag_m_s2": 9.8,
+  "pre_release_settle_damping_scale": 8.0,
+  "robot_geometry": "native_franka",
+  "ee_body_index": 6,
+  "ik_target_blend": 0.2,
+  "tabletop_control_mode": "joint_trajectory",
+  "tabletop_initial_pose": "tabletop_shallow_curve",
+  "tabletop_robot_base_offset": [
+    -0.5400000214576721,
+    -0.20000000298023224,
+    0.05999999865889549
+  ],
+  "tabletop_rope_height": 0.156,
+  "tabletop_approach_clearance_z": 0.1,
+  "tabletop_contact_clearance_z": 0.01,
+  "tabletop_push_clearance_z": 0.008,
+  "tabletop_retract_clearance_z": 0.05,
+  "tabletop_ee_offset_z": 0.22,
+  "tabletop_target_z": {
+    "settle": 0.3092004759199918,
+    "contact_ready": 0.21920047591999176,
+    "push": 0.21720047591999175,
+    "retract": 0.25920047591999174
+  },
+  "tabletop_rope_top_z": 0.20920047591999175,
+  "gripper_center_tracking_error_mean_m": 2.6392904146632645e-06,
+  "gripper_center_tracking_error_max_m": 5.115313342685113e-06,
+  "gripper_center_tracking_error_pre_contact_mean_m": null,
+  "gripper_center_tracking_error_during_contact_mean_m": 2.388836492173141e-06,
+  "gripper_center_tracking_error_release_mean_m": null,
+  "gripper_center_speed_max_m_s": 0.10055078566074371,
+  "gripper_center_speed_pre_contact_mean_m_s": null,
+  "gripper_center_speed_during_contact_mean_m_s": 0.04748059809207916,
+  "gripper_center_speed_release_mean_m_s": null,
+  "gripper_center_path_length_m": 0.32899805903434753,
+  "ground_z_m": 0.0,
+  "table_top_z_m": 0.2,
+  "rope_min_z_m": 0.19877192378044128,
+  "rope_surface_clearance_min_m": 0.19617168605327606,
+  "rope_surface_clearance_to_table_min_m": -0.0038283169269561768,
+  "table_contact_active_frames": 187,
+  "table_contact_duration_s": 6.2364500000000005,
+  "table_contact_peak_frame": 105,
+  "support_contact_active_frames": 51,
+  "support_contact_duration_s": 1.7008500000000002,
+  "support_first_contact_frame": 46,
+  "support_last_contact_frame": 152,
+  "support_contact_peak_frame": 129,
+  "support_contact_proxy_mode": "actual_finger_boxes",
+  "support_contact_proxy_counts": {
+    "left_tip_box": 8,
+    "left_box_0": 2,
+    "right_box_0": 7,
+    "right_box_2": 10,
+    "right_tip_box": 24
+  },
+  "support_patch_indices": [
+    0,
+    9,
+    207,
+    1752
+  ],
+  "support_patch_center_m": [
+    0.0004427209496498108,
+    -0.022535452619194984,
+    0.20672878623008728
+  ],
+  "visible_support_center_m": [
+    0.0004427209496498108,
+    -0.022535452619194984,
+    0.20672878623008728
+  ],
+  "contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
+  "contact_proxy_radius_m": 0.033,
+  "contact_proxy_radii_m": {
+    "gripper_center": 0.033,
+    "left_finger": 0.033,
+    "right_finger": 0.033,
+    "finger_span": 0.033
+  },
+  "rope_com_displacement_m": 0.0765538364648819,
+  "rope_com_z_min_m": 0.2113061547279358,
+  "rope_mid_segment_peak_z_delta_m": 0.0020019561052322388,
+  "rope_mid_segment_final_z_delta_m": 0.0015293657779693604,
+  "rope_mid_segment_peak_frame": 155,
+  "contact_started": true,
+  "first_contact_frame": 46,
+  "first_contact_time_s": 1.5341000000000002,
+  "first_ground_contact_frame": 46,
+  "first_ground_contact_time_s": 1.5341000000000002,
+  "last_contact_frame": 152,
+  "last_contact_time_s": 5.0692,
+  "first_contact_phase": "approach",
+  "contact_peak_frame": 128,
+  "release_frame": null,
+  "release_time_s": null,
+  "t_release_s": null,
+  "impact_speed_before_first_contact_m_s": 0.00010902198894449258,
+  "early_fall_acceleration_estimate_m_s2": null,
+  "early_fall_com_horizontal_velocity_m_s": null,
+  "post_release_horizontal_kick_window_s": 0.08,
+  "post_release_horizontal_kick_m_s": null,
+  "contact_duration_s": 1.7008500000000002,
+  "contact_active_frames": 51,
+  "contact_phase_count": 51,
+  "task_phase_sequence": [
+    "settle",
+    "approach",
+    "push",
+    "hold",
+    "retract"
+  ],
+  "rope_com_horizontal_speed_mean_pre_release_m_s": null,
+  "rope_particle_speed_mean_pre_release_m_s": null,
+  "support_patch_speed_mean_pre_release_m_s": null,
+  "pre_release_spring_energy_proxy": null,
+  "post_release_spring_energy_proxy": null,
+  "settle_window_seconds": 0.08,
+  "settle_gate_pass": null,
+  "settle_gate_frame": null,
+  "settle_gate_metrics": {},
+  "preroll_settle_pass": true,
+  "preroll_settle_time_s": 0.7337000000000001,
+  "preroll_settle_metrics": {
+    "window_start_frame": 17,
+    "window_end_frame": 22,
+    "window_duration_s": 0.20010000000000003,
+    "particle_speed_mean_max_m_s": 0.032295841723680496,
+    "com_horizontal_speed_max_m_s": 0.013842087239027023,
+    "support_patch_speed_mean_max_m_s": 0.0186652522534132,
+    "particle_speed_mean_threshold_m_s": 0.08,
+    "com_horizontal_speed_threshold_m_s": 0.05,
+    "support_patch_speed_threshold_m_s": 0.02
+  },
+  "preroll_frame_count": 23,
+  "min_clearance_min_m": -0.02792333997786045,
+  "min_clearance_final_m": 0.06734596192836761,
+  "gripper_center_clearance_min_m": -0.01895786076784134,
+  "left_finger_clearance_min_m": -0.01640806533396244,
+  "right_finger_clearance_min_m": -0.01947372406721115,
+  "finger_span_clearance_min_m": -0.02792333997786045,
+  "contact_proxy_counts": {
+    "left_tip_box": 8,
+    "left_box_0": 2,
+    "right_box_0": 7,
+    "right_box_2": 10,
+    "right_tip_box": 24
+  },
+  "contact_peak_proxy": "right_tip_box",
+  "proxy_contact_counts": {
+    "finger_span": 51
+  },
+  "actual_finger_box_contact_started": true,
+  "actual_finger_box_first_contact_frame": 46,
+  "actual_finger_box_first_contact_time_s": 1.5341000000000002,
+  "actual_finger_box_peak_source": "right_tip_box",
+  "actual_finger_box_clearance_min_m": -0.005041925236582756,
+  "actual_left_finger_box_clearance_min_m": -0.0021644190419465303,
+  "actual_right_finger_box_clearance_min_m": -0.005041925236582756,
+  "actual_left_tip_box_clearance_min_m": -0.0021644190419465303,
+  "actual_right_tip_box_clearance_min_m": -0.005041925236582756,
+  "drag_phase_gating": "always_on_quasi_static",
+  "physics_validation_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/debug/physics_validation.json"
+}
+Warp 1.12.0.dev20260218 initialized:
+   Git commit: 3d888595a61128dd17de0dbb9eb8d80391e81424
+   CUDA Toolkit 12.9, Driver 13.0
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4090" (23 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/xinjie/.cache/warp/1.12.0.dev20260218
+Module newton._src.geometry.inertia 2bd8c78 load on device 'cuda:0' took 1.14 ms  (cached)
+Module newton._src.utils.mesh bced167 load on device 'cpu' took 0.89 ms  (cached)
+Module validate_and_correct_inertia_kernel_0c7bfa66 0c7bfa6 load on device 'cuda:0' took 0.32 ms  (cached)
+Module newton._src.sim.articulation 2109b59 load on device 'cuda:0' took 2.62 ms  (cached)
+Module newton._src.sim.collide 452004c load on device 'cuda:0' took 0.51 ms  (cached)
+Module newton._src.geometry.broad_phase_nxn dcff895 load on device 'cuda:0' took 0.31 ms  (cached)
+Module create_narrow_phase_primitive_kernel__locals__narrow_phase_primitive_kernel_ac59d7a0 640833f load on device 'cuda:0' took 0.49 ms  (cached)
+Module create_narrow_phase_kernel_gjk_mpr__locals__narrow_phase_kernel_gjk_mpr_46eb548d 1d6e16f load on device 'cuda:0' took 0.89 ms  (cached)
+Module newton._src.geometry.narrow_phase 0593107 load on device 'cuda:0' took 4.93 ms  (cached)
+Module newton._src.geometry.contact_reduction_global 3a7a18f load on device 'cuda:0' took 0.34 ms  (cached)
+Module newton._src.geometry.narrow_phase 931370b load on device 'cuda:0' took 0.55 ms  (cached)
+Module create_narrow_phase_process_mesh_plane_contacts_kernel__locals__narrow_phase_process_mesh_plane_contacts_reduce_kernel_930923b3 4c09d6b load on device 'cuda:0' took 0.26 ms  (cached)
+Module mesh_triangle_contacts_to_reducer_kernel_8060ca9c d5135d2 load on device 'cuda:0' took 1.12 ms  (cached)
+Module newton._src.geometry.contact_reduction_global d2f9fc3 load on device 'cuda:0' took 0.31 ms  (cached)
+Module newton._src.geometry.sdf_contact e671631 load on device 'cuda:0' took 0.20 ms  (cached)
+Module create_narrow_phase_process_mesh_mesh_contacts_kernel__locals__mesh_sdf_collision_global_reduce_kernel_f46f3252 f46f325 load on device 'cuda:0' took 0.70 ms  (cached)
+Module create_export_reduced_contacts_kernel__locals__export_reduced_contacts_kernel_ef09b9a0 6e4cf74 load on device 'cuda:0' took 0.26 ms  (cached)
+Module newton._src.geometry.kernels 55ed1b0 load on device 'cuda:0' took 1.24 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_particle 0e0d871 load on device 'cuda:0' took 0.57 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_body 483b8fe load on device 'cuda:0' took 1.21 ms  (cached)
+Module newton._src.solvers.semi_implicit.kernels_contact d558900 load on device 'cuda:0' took 0.81 ms  (cached)
+Module newton._src.solvers.solver 16aecb3 load on device 'cuda:0' took 0.42 ms  (cached)
+Module bridge_deformable_common 87b0596 load on device 'cuda:0' took 0.21 ms  (cached)
+  frame 25/187 phase=approach target_err=0.0000m min_clearance=0.0597m
+  frame 50/187 phase=approach target_err=0.0000m min_clearance=0.0072m
+  frame 75/187 phase=push target_err=0.0000m min_clearance=-0.0142m
+  frame 100/187 phase=push target_err=0.0000m min_clearance=-0.0173m
+  frame 125/187 phase=push target_err=0.0000m min_clearance=-0.0204m
+  frame 150/187 phase=hold target_err=0.0000m min_clearance=-0.0180m
+  frame 175/187 phase=retract target_err=0.0000m min_clearance=0.0266m
+  frame 187/187 phase=retract target_err=0.0000m min_clearance=0.0615m
+  Simulation done: 187 frames in 77.0s
+Module newton._src.viewer.gl.opengl 7724bb3 load on device 'cuda:0' took 0.30 ms  (cached)
+Module newton._src.viewer.kernels 773c4cf load on device 'cuda:0' took 0.97 ms  (cached)
+Module newton._src.geometry.raycast 23dd4e1 load on device 'cuda:0' took 1.70 ms  (cached)
+Module newton._src.viewer.viewer_gl 2219863 load on device 'cuda:0' took 0.44 ms  (cached)
+Module newton._src.utils.render 145677d load on device 'cuda:0' took 0.25 ms  (cached)
+  rendered 30/186 frames
+  rendered 60/186 frames
+  rendered 90/186 frames
+  rendered 120/186 frames
+  rendered 150/186 frames
+  rendered 180/186 frames
+  Summary: /home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work/robot_rope_tabletop_hero_validation_summary.json
+{
+  "ir_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/ir/rope_double_hand/phystwin_ir_v2_bf_strict.npz",
+  "output_mp4": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work/robot_rope_tabletop_hero_validation.mp4",
+  "frames": 187,
+  "sim_dt": 5e-05,
+  "substeps": 667,
+  "frame_dt": 0.033350000000000005,
+  "video_slowdown": 1.0,
+  "task_duration_s": 6.2,
+  "wall_time_sec": 76.97414568200475,
+  "rope_total_mass": 3.0,
+  "anchor_count": 4,
+  "anchor_constraint_mode": "free_tabletop_rope",
+  "anchor_mass_mode": "preserve",
+  "task": "tabletop_push_hero",
+  "render_mode": "presentation",
+  "camera_profile": "validation",
+  "recommended_hero_camera": {
+    "pos": [
+      1.1366671323776245,
+      -0.842525839805603,
+      0.8219413757324219
+    ],
+    "pitch": -22.0,
+    "yaw": 148.0,
+    "fov": 36.0,
+    "target": [
+      0.020126154646277428,
+      -0.1448335349559784,
+      0.2900000214576721
+    ]
+  },
+  "recommended_validation_camera": {
+    "pos": [
+      1.4288767576217651,
+      -0.7858306765556335,
+      0.9464282989501953
+    ],
+    "pitch": -23.0,
+    "yaw": 156.0,
+    "fov": 38.0,
+    "target": [
+      0.016126153990626335,
+      -0.15683352947235107,
+      0.2900000214576721
+    ]
+  },
+  "particle_contacts": false,
+  "particle_contact_kernel": false,
+  "particle_radius_scale": 0.1,
+  "particle_radius_mean_m": 0.002600237959995866,
+  "particle_radius_render_mean_m": 0.002600237959995866,
+  "particle_radius_vis_scale": null,
+  "particle_radius_vis_min": null,
+  "robot_motion_mode": "ik",
+  "replay_source": null,
+  "history_storage_mode": "memmap",
+  "history_storage_files": {
+    "particle_q_all": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work/robot_rope_tabletop_hero_validation_particle_q_all.npy",
+    "particle_q_object": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work/robot_rope_tabletop_hero_validation_particle_q_object.npy",
+    "body_q": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work/robot_rope_tabletop_hero_validation_body_q.npy",
+    "body_vel": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work/robot_rope_tabletop_hero_validation_body_vel.npy",
+    "ee_target_pos": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/work/robot_rope_tabletop_hero_validation_ee_target_pos.npy"
+  },
+  "apply_drag": true,
+  "drag_ignore_gravity_axis": true,
+  "gravity_mag_m_s2": 9.8,
+  "pre_release_settle_damping_scale": 8.0,
+  "robot_geometry": "native_franka",
+  "ee_body_index": 6,
+  "ik_target_blend": 0.2,
+  "tabletop_control_mode": "joint_trajectory",
+  "tabletop_initial_pose": "tabletop_shallow_curve",
+  "tabletop_robot_base_offset": [
+    -0.5400000214576721,
+    -0.20000000298023224,
+    0.05999999865889549
+  ],
+  "tabletop_rope_height": 0.156,
+  "tabletop_approach_clearance_z": 0.1,
+  "tabletop_contact_clearance_z": 0.01,
+  "tabletop_push_clearance_z": 0.008,
+  "tabletop_retract_clearance_z": 0.05,
+  "tabletop_ee_offset_z": 0.22,
+  "tabletop_target_z": {
+    "settle": 0.3092004759199918,
+    "contact_ready": 0.21920047591999176,
+    "push": 0.21720047591999175,
+    "retract": 0.25920047591999174
+  },
+  "tabletop_rope_top_z": 0.20920047591999175,
+  "gripper_center_tracking_error_mean_m": 2.6392904146632645e-06,
+  "gripper_center_tracking_error_max_m": 5.115313342685113e-06,
+  "gripper_center_tracking_error_pre_contact_mean_m": null,
+  "gripper_center_tracking_error_during_contact_mean_m": 2.3318241346714785e-06,
+  "gripper_center_tracking_error_release_mean_m": null,
+  "gripper_center_speed_max_m_s": 0.10055078566074371,
+  "gripper_center_speed_pre_contact_mean_m_s": null,
+  "gripper_center_speed_during_contact_mean_m_s": 0.04690522700548172,
+  "gripper_center_speed_release_mean_m_s": null,
+  "gripper_center_path_length_m": 0.32899805903434753,
+  "ground_z_m": 0.0,
+  "table_top_z_m": 0.2,
+  "rope_min_z_m": 0.19469726085662842,
+  "rope_surface_clearance_min_m": 0.1920970231294632,
+  "rope_surface_clearance_to_table_min_m": -0.007902979850769043,
+  "table_contact_active_frames": 187,
+  "table_contact_duration_s": 6.2364500000000005,
+  "table_contact_peak_frame": 70,
+  "support_contact_active_frames": 68,
+  "support_contact_duration_s": 2.2678000000000003,
+  "support_first_contact_frame": 42,
+  "support_last_contact_frame": 170,
+  "support_contact_peak_frame": 119,
+  "support_contact_proxy_mode": "actual_finger_boxes",
+  "support_contact_proxy_counts": {
+    "left_tip_box": 10,
+    "right_box_0": 56,
+    "right_tip_box": 2
+  },
+  "support_patch_indices": [
+    0,
+    9,
+    207,
+    1752
+  ],
+  "support_patch_center_m": [
+    0.0004427209496498108,
+    -0.022535452619194984,
+    0.20672878623008728
+  ],
+  "visible_support_center_m": [
+    0.0004427209496498108,
+    -0.022535452619194984,
+    0.20672878623008728
+  ],
+  "contact_proxy_mode": "min(gripper_center,left_finger,right_finger,finger_span)",
+  "contact_proxy_radius_m": 0.033,
+  "contact_proxy_radii_m": {
+    "gripper_center": 0.033,
+    "left_finger": 0.033,
+    "right_finger": 0.033,
+    "finger_span": 0.033
+  },
+  "rope_com_displacement_m": 0.08302877098321915,
+  "rope_com_z_min_m": 0.21219822764396667,
+  "rope_mid_segment_peak_z_delta_m": 0.0002044886350631714,
+  "rope_mid_segment_final_z_delta_m": -0.0014211982488632202,
+  "rope_mid_segment_peak_frame": 81,
+  "contact_started": true,
+  "first_contact_frame": 42,
+  "first_contact_time_s": 1.4007000000000003,
+  "first_ground_contact_frame": 42,
+  "first_ground_contact_time_s": 1.4007000000000003,
+  "last_contact_frame": 170,
+  "last_contact_time_s": 5.669500000000001,
+  "first_contact_phase": "approach",
+  "contact_peak_frame": 126,
+  "release_frame": null,
+  "release_time_s": null,
+  "t_release_s": null,
+  "impact_speed_before_first_contact_m_s": 0.001119709443831551,
+  "early_fall_acceleration_estimate_m_s2": null,
+  "early_fall_com_horizontal_velocity_m_s": null,
+  "post_release_horizontal_kick_window_s": 0.08,
+  "post_release_horizontal_kick_m_s": null,
+  "contact_duration_s": 2.2678000000000003,
+  "contact_active_frames": 68,
+  "contact_phase_count": 68,
+  "task_phase_sequence": [
+    "settle",
+    "approach",
+    "push",
+    "hold",
+    "retract"
+  ],
+  "rope_com_horizontal_speed_mean_pre_release_m_s": null,
+  "rope_particle_speed_mean_pre_release_m_s": null,
+  "support_patch_speed_mean_pre_release_m_s": null,
+  "pre_release_spring_energy_proxy": null,
+  "post_release_spring_energy_proxy": null,
+  "settle_window_seconds": 0.08,
+  "settle_gate_pass": null,
+  "settle_gate_frame": null,
+  "settle_gate_metrics": {},
+  "preroll_settle_pass": true,
+  "preroll_settle_time_s": 0.667,
+  "preroll_settle_metrics": {
+    "window_start_frame": 15,
+    "window_end_frame": 20,
+    "window_duration_s": 0.20010000000000003,
+    "particle_speed_mean_max_m_s": 0.032769300043582916,
+    "com_horizontal_speed_max_m_s": 0.013478752225637436,
+    "support_patch_speed_mean_max_m_s": 0.006956438533961773,
+    "particle_speed_mean_threshold_m_s": 0.08,
+    "com_horizontal_speed_threshold_m_s": 0.05,
+    "support_patch_speed_threshold_m_s": 0.02
+  },
+  "preroll_frame_count": 21,
+  "min_clearance_min_m": -0.020432187244296074,
+  "min_clearance_final_m": 0.06147134304046631,
+  "gripper_center_clearance_min_m": -0.01918858103454113,
+  "left_finger_clearance_min_m": -0.014084972441196442,
+  "right_finger_clearance_min_m": -0.0182926245033741,
+  "finger_span_clearance_min_m": -0.020432187244296074,
+  "contact_proxy_counts": {
+    "left_tip_box": 10,
+    "right_box_0": 56,
+    "right_tip_box": 2
+  },
+  "contact_peak_proxy": "right_box_0",
+  "proxy_contact_counts": {
+    "finger_span": 67,
+    "right_finger": 1
+  },
+  "actual_finger_box_contact_started": true,
+  "actual_finger_box_first_contact_frame": 42,
+  "actual_finger_box_first_contact_time_s": 1.4007000000000003,
+  "actual_finger_box_peak_source": "right_box_0",
+  "actual_finger_box_clearance_min_m": -0.0038783515337854624,
+  "actual_left_finger_box_clearance_min_m": -0.0037026696372777224,
+  "actual_right_finger_box_clearance_min_m": -0.0038783515337854624,
+  "actual_left_tip_box_clearance_min_m": -0.0037026696372777224,
+  "actual_right_tip_box_clearance_min_m": -0.002372244605794549,
+  "drag_phase_gating": "always_on_quasi_static",
+  "physics_validation_path": "/home/xinjie/Newton_Connection/Newton/phystwin_bridge/results/robot_rope_franka/candidates/20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean/validation/physics_validation.json"
+}

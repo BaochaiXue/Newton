@@ -1,0 +1,26 @@
+{
+  "run_id": "20260403_005533_true0p1_shallowcurve_bx054_by020_bz006_c19",
+  "summary_first_contact_frame": 37,
+  "summary_first_contact_time_s": 1.23395,
+  "summary_contact_proxy_counts": {
+    "left_tip_box": 16,
+    "left_box_0": 1,
+    "right_box_2": 34,
+    "right_box_0": 17,
+    "right_tip_box": 2
+  },
+  "summary_contact_peak_proxy": "right_box_0",
+  "proxy_finger_span_first_contact_frame": 50,
+  "proxy_finger_span_first_contact_time_s": 1.6675000000000002,
+  "actual_any_finger_box_first_contact_frame": 37,
+  "actual_any_finger_box_first_contact_time_s": 1.23395,
+  "actual_left_tip_first_contact_frame": 37,
+  "actual_left_tip_first_contact_time_s": 1.23395,
+  "rope_lateral_motion_frame": 42,
+  "rope_lateral_motion_time_s": 1.4007000000000003,
+  "rope_deformation_frame": 43,
+  "rope_deformation_time_s": 1.4340500000000003,
+  "rope_motion_threshold_m": 0.003,
+  "rope_deformation_threshold_m": 0.005,
+  "dominant_proxy_issue": null
+}

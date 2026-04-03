@@ -570,7 +570,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--tabletop-initial-pose",
-        choices=["ir_shifted", "tabletop_curve"],
+        choices=["ir_shifted", "tabletop_curve", "tabletop_shallow_curve"],
         default="tabletop_curve",
         help="Initial rope pose for the tabletop hero: preserve the shifted IR shape or apply a hand-shaped tabletop curve.",
     )
@@ -1205,6 +1205,7 @@ def _reshape_rope_for_tabletop(
     *,
     table_top_z: float,
     particle_radius: float,
+    pose_mode: str = "tabletop_curve",
 ) -> np.ndarray:
     points = np.asarray(points, dtype=np.float32).copy()
     n = points.shape[0]
@@ -1212,10 +1213,30 @@ def _reshape_rope_for_tabletop(
         return points
     u = np.linspace(0.0, 1.0, n, dtype=np.float32)
     surface_z = float(table_top_z) + float(particle_radius) + 0.004
-    arch = 0.016 * np.square(2.0 * u - 1.0)
-    s_curve = 0.028 * np.sin(2.0 * np.pi * u)
-    points[:, 1] = points[:, 1] + s_curve.astype(np.float32, copy=False)
-    points[:, 2] = (surface_z + arch).astype(np.float32, copy=False)
+    if str(pose_mode) == "tabletop_shallow_curve":
+        x_span = float(np.max(points[:, 0]) - np.min(points[:, 0]))
+        lateral_amp = float(np.clip(max(3.0 * float(particle_radius), 0.04 * x_span), 0.006, 0.010))
+        arch_amp = float(np.clip(max(1.5 * float(particle_radius), 0.015 * x_span), 0.002, 0.005))
+        # Use a low-amplitude S curve with zero offset at both ends.
+        s_curve = lateral_amp * np.sin(2.0 * np.pi * u) * np.sin(np.pi * u)
+        # Keep endpoints near the tabletop while giving the middle a mild crown.
+        arch = arch_amp * np.sin(np.pi * u) ** 2
+        points[:, 1] = points[:, 1] + s_curve.astype(np.float32, copy=False)
+        points[:, 2] = (surface_z + arch).astype(np.float32, copy=False)
+        # Light smoothing suppresses high-frequency kinks when the rope radius is small.
+        if n >= 5:
+            kernel = np.asarray([0.2, 0.6, 0.2], dtype=np.float32)
+            y = np.convolve(points[:, 1], kernel, mode="same")
+            z = np.convolve(points[:, 2], kernel, mode="same")
+            points[:, 1] = y.astype(np.float32, copy=False)
+            points[:, 2] = z.astype(np.float32, copy=False)
+            points[0, 2] = surface_z
+            points[-1, 2] = surface_z
+    else:
+        arch = 0.016 * np.square(2.0 * u - 1.0)
+        s_curve = 0.028 * np.sin(2.0 * np.pi * u)
+        points[:, 1] = points[:, 1] + s_curve.astype(np.float32, copy=False)
+        points[:, 2] = (surface_z + arch).astype(np.float32, copy=False)
     return points
 
 
@@ -1454,11 +1475,12 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         dtype=np.float32,
     )
     shifted_q = x0 + shift
-    if tabletop_task and str(args.tabletop_initial_pose) == "tabletop_curve":
+    if tabletop_task and str(args.tabletop_initial_pose) in {"tabletop_curve", "tabletop_shallow_curve"}:
         shifted_q[:n_obj] = _reshape_rope_for_tabletop(
             shifted_q[:n_obj],
             table_top_z=float(args.tabletop_table_top_z),
             particle_radius=particle_radius_ref,
+            pose_mode=str(args.tabletop_initial_pose),
         )
     rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
     if drop_release_task:
@@ -3017,6 +3039,16 @@ def build_summary(
     actual_right_finger_box_clearance_np = np.asarray(actual_right_finger_box_clearance, dtype=np.float32)
     actual_left_tip_box_clearance_np = np.asarray(actual_left_tip_box_clearance, dtype=np.float32)
     actual_right_tip_box_clearance_np = np.asarray(actual_right_tip_box_clearance, dtype=np.float32)
+    particle_radius_sim = model.particle_radius.numpy().astype(np.float32)
+    render_radii = compute_visual_particle_radii(
+        particle_radius_sim,
+        radius_scale=(
+            None if args.particle_radius_vis_scale is None else float(args.particle_radius_vis_scale)
+        ),
+        radius_cap=(
+            None if args.particle_radius_vis_min is None else float(args.particle_radius_vis_min)
+        ),
+    )
     contact_peak_source = (
         None
         if contact_peak_frame is None
@@ -3099,6 +3131,15 @@ def build_summary(
         "recommended_validation_camera": meta["camera_presets"]["validation"],
         "particle_contacts": bool(meta["particle_contacts"]),
         "particle_contact_kernel": bool(meta["particle_contact_kernel"]),
+        "particle_radius_scale": float(args.particle_radius_scale),
+        "particle_radius_mean_m": float(np.mean(particle_radius_sim)) if particle_radius_sim.size else None,
+        "particle_radius_render_mean_m": float(np.mean(render_radii)) if render_radii.size else None,
+        "particle_radius_vis_scale": (
+            None if args.particle_radius_vis_scale is None else float(args.particle_radius_vis_scale)
+        ),
+        "particle_radius_vis_min": (
+            None if args.particle_radius_vis_min is None else float(args.particle_radius_vis_min)
+        ),
         "robot_motion_mode": str(sim_data.get("robot_motion_mode", meta.get("robot_motion_mode", "ik"))),
         "replay_source": sim_data.get("replay_source"),
         "history_storage_mode": str(sim_data["history_storage_mode"]),
@@ -3110,6 +3151,27 @@ def build_summary(
         "robot_geometry": "native_franka",
         "ee_body_index": int(meta["ee_body_index"]),
         "ik_target_blend": float(args.ik_target_blend),
+        "tabletop_control_mode": (None if not tabletop_task else str(args.tabletop_control_mode)),
+        "tabletop_initial_pose": (None if not tabletop_task else str(args.tabletop_initial_pose)),
+        "tabletop_robot_base_offset": (
+            None if not tabletop_task else [float(v) for v in np.asarray(args.tabletop_robot_base_offset, dtype=np.float32)]
+        ),
+        "tabletop_rope_height": (None if not tabletop_task else float(args.tabletop_rope_height)),
+        "tabletop_approach_clearance_z": (
+            None if not tabletop_task else float(args.tabletop_approach_clearance_z)
+        ),
+        "tabletop_contact_clearance_z": (
+            None if not tabletop_task else float(args.tabletop_contact_clearance_z)
+        ),
+        "tabletop_push_clearance_z": (
+            None if not tabletop_task else float(args.tabletop_push_clearance_z)
+        ),
+        "tabletop_retract_clearance_z": (
+            None if not tabletop_task else float(args.tabletop_retract_clearance_z)
+        ),
+        "tabletop_ee_offset_z": (None if not tabletop_task else float(args.tabletop_ee_offset_z)),
+        "tabletop_target_z": meta.get("tabletop_target_z"),
+        "tabletop_rope_top_z": meta.get("tabletop_rope_top_z"),
         "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),
         "gripper_center_tracking_error_max_m": float(np.max(tracking_error)),
         "gripper_center_tracking_error_pre_contact_mean_m": pre_tracking_mean,

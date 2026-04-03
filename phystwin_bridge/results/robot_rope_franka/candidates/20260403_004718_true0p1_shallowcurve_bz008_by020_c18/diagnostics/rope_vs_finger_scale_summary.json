@@ -1,0 +1,22 @@
+{
+  "run_id": "20260403_004718_true0p1_shallowcurve_bz008_by020_c18",
+  "rope_collision_radius_m": 0.002600237959995866,
+  "rope_render_radius_m": 0.002600237959995866,
+  "rope_render_to_physical_radius_ratio": 1.0,
+  "ee_contact_radius_arg_m": 0.055,
+  "diagnostic_proxy_radius_m": 0.033,
+  "rope_diameter_m": 0.005200475919991732,
+  "rope_render_diameter_m": 0.005200475919991732,
+  "diagnostic_proxy_diameter_m": 0.066,
+  "left_tip_box_size_m": [
+    0.017500000074505806,
+    0.015200000256299973,
+    0.01850000023841858
+  ],
+  "right_tip_box_size_m": [
+    0.017500000074505806,
+    0.015200000256299973,
+    0.01850000023841858
+  ],
+  "rope_total_mass_kg": 3.0
+}
