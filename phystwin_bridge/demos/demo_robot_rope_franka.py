@@ -243,6 +243,23 @@ def parse_args() -> argparse.Namespace:
             "`--robot-motion-mode replay`."
         ),
     )
+    p.add_argument(
+        "--load-history-from-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional directory containing previously saved rollout arrays. When set, "
+            "skip simulation and render/validate from the loaded history instead."
+        ),
+    )
+    p.add_argument(
+        "--load-history-prefix",
+        default=None,
+        help=(
+            "Prefix used when loading saved rollout arrays from --load-history-from-dir. "
+            "If omitted, fall back to the current --prefix."
+        ),
+    )
 
     p.add_argument("--frames", type=int, default=None)
     p.add_argument("--sim-dt", type=float, default=1.0e-4)
@@ -3889,6 +3906,75 @@ def build_physics_validation(
     }
 
 
+def _load_saved_history(
+    history_dir: Path,
+    *,
+    prefix: str,
+    args: argparse.Namespace,
+    meta: dict[str, Any],
+) -> dict[str, Any]:
+    history_dir = history_dir.expanduser().resolve()
+    if not history_dir.exists():
+        raise FileNotFoundError(history_dir)
+
+    def _load_required(name: str) -> np.ndarray:
+        path = history_dir / f"{prefix}_{name}.npy"
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return np.load(path).astype(np.float32, copy=False)
+
+    particle_q_all = _load_required("particle_q_all")
+    particle_q_object = _load_required("particle_q_object")
+    body_q = _load_required("body_q")
+    body_vel = _load_required("body_vel")
+    ee_target_pos = _load_required("ee_target_pos")
+    n_frames = int(particle_q_all.shape[0])
+
+    summary_path = history_dir / f"{prefix}_summary.json"
+    loaded_summary: dict[str, Any] = {}
+    if summary_path.exists():
+        loaded_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    zero_series = np.zeros((n_frames,), dtype=np.float32)
+    history_files = {
+        "particle_q_all": str(history_dir / f"{prefix}_particle_q_all.npy"),
+        "particle_q_object": str(history_dir / f"{prefix}_particle_q_object.npy"),
+        "body_q": str(history_dir / f"{prefix}_body_q.npy"),
+        "body_vel": str(history_dir / f"{prefix}_body_vel.npy"),
+        "ee_target_pos": str(history_dir / f"{prefix}_ee_target_pos.npy"),
+    }
+    return {
+        "particle_q_all": particle_q_all,
+        "particle_q_object": particle_q_object,
+        "body_q": body_q,
+        "body_vel": body_vel,
+        "ee_target_pos": ee_target_pos,
+        "sim_dt": float(args.sim_dt),
+        "substeps": int(args.substeps),
+        "wall_time": float(loaded_summary.get("wall_time_sec", 0.0)),
+        "history_storage_mode": "loaded_history",
+        "history_storage_files": history_files,
+        "robot_motion_mode": str(loaded_summary.get("robot_motion_mode", meta.get("robot_motion_mode", "ik"))),
+        "replay_source": loaded_summary.get("replay_source"),
+        "release_frame_actual": loaded_summary.get("release_frame"),
+        "settle_gate_metrics": loaded_summary.get("settle_gate_metrics"),
+        "settle_gate_pass": loaded_summary.get("settle_gate_pass"),
+        "settle_gate_frame": loaded_summary.get("settle_gate_frame"),
+        "pre_release_settle_damping_scale": float(
+            loaded_summary.get("pre_release_settle_damping_scale", args.pre_release_settle_damping_scale)
+        ),
+        "preroll_settle_pass": loaded_summary.get("preroll_settle_pass"),
+        "preroll_settle_time_s": loaded_summary.get("preroll_settle_time_s"),
+        "preroll_settle_metrics": loaded_summary.get("preroll_settle_metrics"),
+        "preroll_frame_count": loaded_summary.get("preroll_frame_count"),
+        "particle_speed_mean_series": zero_series.copy(),
+        "support_patch_speed_mean_series": zero_series.copy(),
+        "rope_com_horizontal_speed_series": zero_series.copy(),
+        "rope_com_vertical_speed_series": zero_series.copy(),
+        "rope_spring_energy_proxy_series": zero_series.copy(),
+    }
+
+
 def save_physics_validation_json(args: argparse.Namespace, payload: dict[str, Any]) -> Path:
     run_root = args.out_dir.parent if args.out_dir.name == "work" else args.out_dir
     out_path = run_root / "physics_validation.json"
@@ -3965,7 +4051,16 @@ def main() -> int:
 
     model, ir_obj, meta, n_obj = build_model(args, device)
     _resolve_camera_defaults(args, meta)
-    sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
+    if args.load_history_from_dir is not None:
+        history_prefix = str(args.load_history_prefix or args.prefix)
+        sim_data = _load_saved_history(
+            Path(args.load_history_from_dir),
+            prefix=history_prefix,
+            args=args,
+            meta=meta,
+        )
+    else:
+        sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
     out_mp4 = render_video(model, sim_data, meta, args, device)
     out_gif = make_gif(args, out_mp4)
     summary = build_summary(model, sim_data, meta, args, out_mp4)
