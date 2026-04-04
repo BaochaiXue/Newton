@@ -3975,6 +3975,26 @@ def _load_saved_history(
     }
 
 
+def _materialize_loaded_history(args: argparse.Namespace, sim_data: dict[str, Any]) -> None:
+    history_names = [
+        "particle_q_all",
+        "particle_q_object",
+        "body_q",
+        "body_vel",
+        "ee_target_pos",
+    ]
+    files: dict[str, str] = {}
+    for name in history_names:
+        value = sim_data.get(name)
+        if value is None:
+            continue
+        path = args.out_dir / f"{args.prefix}_{name}.npy"
+        np.save(path, np.asarray(value, dtype=np.float32))
+        files[name] = str(path)
+    sim_data["history_storage_mode"] = "loaded_history_materialized"
+    sim_data["history_storage_files"] = files
+
+
 def save_physics_validation_json(args: argparse.Namespace, payload: dict[str, Any]) -> Path:
     run_root = args.out_dir.parent if args.out_dir.name == "work" else args.out_dir
     out_path = run_root / "physics_validation.json"
@@ -4059,6 +4079,7 @@ def main() -> int:
             args=args,
             meta=meta,
         )
+        _materialize_loaded_history(args, sim_data)
     else:
         sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
     out_mp4 = render_video(model, sim_data, meta, args, device)
