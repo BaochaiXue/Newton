@@ -1,0 +1,23 @@
+{
+  "run_id": "20260403_005533_true0p1_shallowcurve_bx054_by020_bz006_c19",
+  "table_box_shape_index": 54,
+  "table_top_z_m": 0.20000000298023224,
+  "robot_table_first_contact_frame": 50,
+  "robot_table_first_contact_time_s": 1.6675000000000002,
+  "robot_table_contact_duration_s": 3.7685500000000007,
+  "robot_table_penetration_min_m": -0.01999959722161293,
+  "robot_table_worst_penetration_frame": 101,
+  "robot_table_worst_penetration_time_s": 3.3683500000000004,
+  "robot_table_worst_penetration_box": "left_box_47",
+  "left_finger_table_penetration_min_m": -0.01999959722161293,
+  "right_finger_table_penetration_min_m": -0.019997183233499527,
+  "ee_body_table_penetration_min_m": null,
+  "ee_target_to_actual_error_during_block_mean_m": 2.5122469651250867e-06,
+  "ee_target_to_actual_error_during_block_max_m": 4.6442164602922276e-06,
+  "normal_speed_into_table_after_contact_mean_m_s": 0.01011337898671627,
+  "normal_speed_into_table_after_contact_max_m_s": 0.06829289346933365,
+  "target_normal_speed_into_table_after_contact_mean_m_s": 0.009945619851350784,
+  "target_normal_speed_into_table_after_contact_max_m_s": 0.06665264815092087,
+  "hand_physically_blocked": false,
+  "hidden_helper_detected": false
+}

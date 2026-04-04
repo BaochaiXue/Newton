@@ -1,0 +1,13 @@
+{
+  "run_id": "20260403_010241_true0p1_shallowcurve_bx054_by020_bz006_c20_clean",
+  "robot_table_first_contact_time_s": 1.6675000000000002,
+  "robot_table_contact_duration_s": 3.7685500000000007,
+  "robot_table_penetration_min_m": -0.03799894079566002,
+  "left_finger_table_penetration_min_m": -0.03799894079566002,
+  "right_finger_table_penetration_min_m": -0.023897405713796616,
+  "ee_target_to_actual_error_during_block_mean_m": 2.5122469651250867e-06,
+  "ee_target_to_actual_error_during_block_max_m": 4.6442164602922276e-06,
+  "normal_speed_into_table_after_contact_mean_m_s": 0.008692807517945766,
+  "normal_speed_into_table_after_contact_max_m_s": 0.0700332298874855,
+  "hidden_helper_detected": false
+}

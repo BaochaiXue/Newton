@@ -221,9 +221,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--tabletop-control-mode",
-        choices=["ik", "joint_trajectory"],
+        choices=["ik", "joint_trajectory", "joint_target_drive"],
         default="joint_trajectory",
-        help="Controller used only for tabletop_push_hero. `joint_trajectory` is the current promoted path; `ik` remains available for bounded tabletop contact experiments.",
+        help="Controller used only for tabletop_push_hero. `joint_trajectory` is the current promoted path, `joint_target_drive` sends the same desired path through articulation targets so rigid contact can create tracking error, and `ik` remains available for bounded tabletop contact experiments.",
     )
     p.add_argument(
         "--ik-target-blend",
@@ -1444,7 +1444,10 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     raw_ir = load_ir(args.ir)
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
-    tabletop_joint_mode = tabletop_task and str(args.tabletop_control_mode) == "joint_trajectory"
+    tabletop_joint_path_mode = tabletop_task and str(args.tabletop_control_mode) in {
+        "joint_trajectory",
+        "joint_target_drive",
+    }
     _validate_scaling_args(args)
     _maybe_autoset_mass_spring_scale(args, raw_ir)
     ir_obj = _copy_object_only_ir(raw_ir, args)
@@ -1546,7 +1549,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         force_show_colliders=False,
     )
 
-    robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_joint_mode else FRANKA_INIT_Q.copy()
+    robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_joint_path_mode else FRANKA_INIT_Q.copy()
     builder.joint_q[:9] = robot_joint_init.tolist()
     builder.joint_target_pos[:9] = robot_joint_init.tolist()
     builder.joint_target_ke[:7] = [float(args.joint_target_ke)] * 7
@@ -1846,7 +1849,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
                 }
                 for pos_phase, joint_phase in zip(task_phases, _tabletop_joint_phase_waypoints(), strict=True)
             ]
-            if tabletop_joint_mode
+            if tabletop_joint_path_mode
             else None
         ),
         "endpoint_indices": endpoint_indices.astype(np.int32),
@@ -1885,7 +1888,8 @@ def simulate(
 ) -> dict[str, Any]:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
-    tabletop_joint_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_trajectory"
+    tabletop_joint_override_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_trajectory"
+    tabletop_joint_drive_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_target_drive"
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
@@ -1916,6 +1920,9 @@ def simulate(
         friction_smoothing=cfg.friction_smoothing,
         enable_tri_contact=cfg.enable_tri_contact,
     )
+    control = model.control() if tabletop_joint_drive_mode else None
+    control_joint_target_pos = None
+    control_joint_target_vel = None
     state_in = model.state()
     state_out = model.state()
     contacts = model.contacts() if newton_import_ir._use_collision_pipeline(cfg, ir_obj) else None
@@ -1923,6 +1930,18 @@ def simulate(
     state_in.joint_q.assign(prev_joint_q)
     state_in.joint_qd.zero_()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    if control is not None and getattr(control, "joint_target_pos", None) is not None:
+        control_joint_target_pos = wp.zeros(control.joint_target_pos.shape, dtype=wp.float32, device=device)
+    if control is not None and getattr(control, "joint_target_vel", None) is not None:
+        control_joint_target_vel = wp.zeros(control.joint_target_vel.shape, dtype=wp.float32, device=device)
+    if control is not None and getattr(control, "joint_target_pos", None) is not None:
+        control_joint_target_pos.assign(prev_joint_q.astype(np.float32))
+        wp.copy(dest=control.joint_target_pos, src=control_joint_target_pos)
+    if control is not None and getattr(control, "joint_target_vel", None) is not None:
+        control_joint_target_vel.zero_()
+        wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
+    if control is not None and getattr(control, "joint_f", None) is not None:
+        control.joint_f.zero_()
 
     sim_dt = float(args.sim_dt) if args.sim_dt is not None else float(newton_import_ir.ir_scalar(ir_obj, "sim_dt"))
     substeps = max(1, int(args.substeps))
@@ -1945,7 +1964,7 @@ def simulate(
     pos_obj = None
     rot_obj = None
     ik_solver = None
-    if not tabletop_joint_mode:
+    if not (tabletop_joint_override_mode or tabletop_joint_drive_mode):
         ik_joint_q = wp.array(np.asarray(meta["joint_q_init"], dtype=np.float32).reshape(1, -1), dtype=wp.float32, device=device)
         pos_obj = ik.IKObjectivePosition(
             link_index=int(meta["ee_body_index"]),
@@ -2030,7 +2049,7 @@ def simulate(
         preroll_target_pos = np.asarray(meta["task_phases"][0]["end"], dtype=np.float32)
         preroll_target_quat = np.asarray(meta["ee_target_quat"], dtype=np.float32)
         tabletop_preroll_joint_q = None
-        if tabletop_joint_mode:
+        if tabletop_joint_override_mode or tabletop_joint_drive_mode:
             _, tabletop_preroll_joint_q = _joint_phase_state(0.0, meta)
         for preroll_frame in range(preroll_max_frames):
             q_obj_preroll = state_in.particle_q.numpy().astype(np.float32)[:n_obj]
@@ -2077,7 +2096,7 @@ def simulate(
 
             for _ in range(substeps):
                 state_in.clear_forces()
-                if tabletop_joint_mode:
+                if tabletop_joint_override_mode:
                     joint_target_np = np.asarray(tabletop_preroll_joint_q, dtype=np.float32).copy()
                     joint_target_np[7:9] = float(args.gripper_open)
                     joint_target_qd = np.zeros_like(joint_target_np, dtype=np.float32)
@@ -2085,6 +2104,18 @@ def simulate(
                     state_in.joint_q.assign(joint_target_np)
                     state_in.joint_qd.assign(joint_target_qd)
                     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+                elif tabletop_joint_drive_mode:
+                    joint_target_np = np.asarray(tabletop_preroll_joint_q, dtype=np.float32).copy()
+                    joint_target_np[7:9] = float(args.gripper_open)
+                    prev_joint_q = joint_target_np.copy()
+                    if control is not None and getattr(control, "joint_target_pos", None) is not None:
+                        control_joint_target_pos.assign(joint_target_np)
+                        wp.copy(dest=control.joint_target_pos, src=control_joint_target_pos)
+                    if control is not None and getattr(control, "joint_target_vel", None) is not None:
+                        control_joint_target_vel.zero_()
+                        wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
+                    if control is not None and getattr(control, "joint_f", None) is not None:
+                        control.joint_f.zero_()
                 elif tabletop_task:
                     pos_obj.set_target_position(0, wp.vec3(*preroll_target_pos.tolist()))
                     rot_obj.set_target_rotation(0, wp.vec4(*preroll_target_quat.tolist()))
@@ -2101,10 +2132,12 @@ def simulate(
                     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
                 if contacts is not None:
                     model.collide(state_in, contacts)
-                solver.step(state_in, state_out, None, contacts, sim_dt)
-                if tabletop_joint_mode:
+                solver.step(state_in, state_out, control, contacts, sim_dt)
+                if tabletop_joint_override_mode:
                     state_out.joint_q.assign(joint_target_np)
                     state_out.joint_qd.assign(joint_target_qd)
+                    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                elif tabletop_joint_drive_mode:
                     newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
                 elif tabletop_task:
                     state_out.joint_q.assign(joint_target_np)
@@ -2172,7 +2205,7 @@ def simulate(
         body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
         if replay is not None:
             ee_target_pos[frame] = replay["ee_target_pos"][frame]
-        elif tabletop_joint_mode:
+        elif tabletop_joint_override_mode or tabletop_joint_drive_mode:
             _, joint_target_frame = _joint_phase_state(float(frame) * frame_dt, meta)
             joint_target_frame = np.asarray(joint_target_frame, dtype=np.float32).copy()
             joint_target_frame[7:9] = float(args.gripper_open)
@@ -2246,7 +2279,7 @@ def simulate(
                 body_qd_frame = replay["body_qd"][frame]
                 state_in.body_q.assign(body_q_frame)
                 state_in.body_qd.assign(body_qd_frame)
-            elif tabletop_joint_mode:
+            elif tabletop_joint_override_mode:
                 _, joint_target_np = _joint_phase_state(sim_t, meta)
                 joint_target_np = np.asarray(joint_target_np, dtype=np.float32).copy()
                 joint_target_np[7:9] = float(args.gripper_open)
@@ -2256,6 +2289,19 @@ def simulate(
                 state_in.joint_q.assign(joint_target_np)
                 state_in.joint_qd.assign(joint_target_qd)
                 newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            elif tabletop_joint_drive_mode:
+                _, joint_target_np = _joint_phase_state(sim_t, meta)
+                joint_target_np = np.asarray(joint_target_np, dtype=np.float32).copy()
+                joint_target_np[7:9] = float(args.gripper_open)
+                prev_joint_q = joint_target_np.copy()
+                if control is not None and getattr(control, "joint_target_pos", None) is not None:
+                    control_joint_target_pos.assign(joint_target_np)
+                    wp.copy(dest=control.joint_target_pos, src=control_joint_target_pos)
+                if control is not None and getattr(control, "joint_target_vel", None) is not None:
+                    control_joint_target_vel.zero_()
+                    wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
+                if control is not None and getattr(control, "joint_f", None) is not None:
+                    control.joint_f.zero_()
             else:
                 _, target_pos, target_quat = _task_phase_state(sim_t, meta)
                 pos_obj.set_target_position(0, wp.vec3(*target_pos.tolist()))
@@ -2278,13 +2324,15 @@ def simulate(
                 newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             if contacts is not None:
                 model.collide(state_in, contacts)
-            solver.step(state_in, state_out, None, contacts, sim_dt)
+            solver.step(state_in, state_out, control, contacts, sim_dt)
             if replay is not None:
                 state_out.body_q.assign(body_q_frame)
                 state_out.body_qd.assign(body_qd_frame)
-            elif tabletop_joint_mode:
+            elif tabletop_joint_override_mode:
                 state_out.joint_q.assign(joint_target_np)
                 state_out.joint_qd.assign(joint_target_qd)
+                newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+            elif tabletop_joint_drive_mode:
                 newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
             else:
                 state_out.joint_q.assign(joint_target_np)

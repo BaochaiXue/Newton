@@ -1,0 +1,18 @@
+{
+  "run_id": "BEST_RUN",
+  "robot_table_first_contact_frame": null,
+  "robot_table_first_contact_time_s": null,
+  "robot_table_contact_duration_s": 0.0,
+  "robot_table_penetration_min_m": 0.028793632984161377,
+  "left_finger_table_penetration_min_m": 0.028793632984161377,
+  "right_finger_table_penetration_min_m": 0.04289519786834717,
+  "ee_target_to_actual_error_during_block_mean_m": null,
+  "ee_target_to_actual_error_during_block_max_m": null,
+  "normal_speed_into_table_after_contact_mean_m_s": null,
+  "normal_speed_into_table_after_contact_max_m_s": null,
+  "rope_first_contact_time_s": 1.6675000000000002,
+  "rope_contact_duration_s": 2.9681500000000005,
+  "hidden_helper_detected": false,
+  "table_top_z_m": 0.2,
+  "table_bottom_z_m": 0.16
+}
