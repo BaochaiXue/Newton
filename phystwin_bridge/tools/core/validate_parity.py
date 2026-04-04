@@ -128,6 +128,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ground-contact-law",
+        choices=["native", "phystwin"],
+        default=None,
+        help=(
+            "Optional pass-through to importer for controlled bridge-side experiments. "
+            "`native` keeps Newton's ground contact pipeline; "
+            "`phystwin` uses the bridge-side implicit z=0 ground integrator."
+        ),
+    )
+    parser.add_argument(
         "--custom-self-contact-hops",
         type=int,
         default=0,
@@ -540,6 +550,8 @@ def _build_importer_cmd(
         cmd.extend(
             ["--phystwin-collision-table-capacity", str(int(args.phystwin_collision_table_capacity))]
         )
+    if args.ground_contact_law is not None:
+        cmd.extend(["--ground-contact-law", str(args.ground_contact_law)])
     if args.particle_contact_ke is not None:
         cmd.extend(["--particle-contact-ke", str(args.particle_contact_ke)])
     if args.object_contact_radius is not None:

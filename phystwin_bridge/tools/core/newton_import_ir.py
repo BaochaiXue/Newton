@@ -78,6 +78,14 @@ SELF_CONTACT_MODES = (
     SELF_CONTACT_MODE_PHYSTWIN,
 )
 
+# Ground-contact laws for controlled bridge-side experiments
+GROUND_CONTACT_LAW_NATIVE = "native"
+GROUND_CONTACT_LAW_PHYSTWIN = "phystwin"
+GROUND_CONTACT_LAWS = (
+    GROUND_CONTACT_LAW_NATIVE,
+    GROUND_CONTACT_LAW_PHYSTWIN,
+)
+
 
 def _load_self_contact_kernels():
     from self_contact_bridge_kernels import (
@@ -178,6 +186,7 @@ class SimConfig:
     shape_contacts: bool = False
     add_ground_plane: bool = True
     self_contact_mode: str | None = None
+    ground_contact_law: str | None = None
     custom_self_contact_hops: int = 0
     phystwin_freeze_collision_table: bool = True
     phystwin_collision_table_capacity: int = 500
@@ -258,6 +267,7 @@ class SimConfig:
             shape_contacts=args.shape_contacts,
             add_ground_plane=args.add_ground_plane,
             self_contact_mode=args.self_contact_mode,
+            ground_contact_law=args.ground_contact_law,
             custom_self_contact_hops=args.custom_self_contact_hops,
             phystwin_freeze_collision_table=args.phystwin_freeze_collision_table,
             phystwin_collision_table_capacity=args.phystwin_collision_table_capacity,
@@ -309,6 +319,7 @@ class ModelResult:
     radius: np.ndarray
     ir_version: int
     self_contact_mode: str = SELF_CONTACT_MODE_OFF
+    ground_contact_law: str = GROUND_CONTACT_LAW_NATIVE
     bridge_self_contact_grid: Any = None
     bridge_neighbor_table: Any = None
     bridge_neighbor_count: Any = None
@@ -409,6 +420,16 @@ def parse_args() -> argparse.Namespace:
             "`custom` uses bridge-side filtered penalty self-contact, "
             "`phystwin` uses the strict bridge-side PhysTwin contact stack "
             "(pairwise self-collision + implicit z=0 ground plane only)."
+        ),
+    )
+    p.add_argument(
+        "--ground-contact-law",
+        choices=list(GROUND_CONTACT_LAWS),
+        default=None,
+        help=(
+            "Optional explicit ground-contact law for controlled bridge-side experiments. "
+            "`native` keeps Newton's particle-vs-ground contact pipeline; "
+            "`phystwin` uses the bridge-side implicit z=0 PhysTwin-style ground integrator."
         ),
     )
     p.add_argument(
@@ -993,6 +1014,18 @@ def _resolve_self_contact_mode(cfg: SimConfig, ir: dict) -> str:
     return SELF_CONTACT_MODE_OFF
 
 
+def _resolve_ground_contact_law(cfg: SimConfig, ir: dict) -> str:
+    if cfg.ground_contact_law is not None:
+        law = str(cfg.ground_contact_law).lower()
+        if law not in GROUND_CONTACT_LAWS:
+            raise ValueError(f"Unsupported ground_contact_law={cfg.ground_contact_law!r}")
+        return law
+
+    if _resolve_self_contact_mode(cfg, ir) == SELF_CONTACT_MODE_PHYSTWIN:
+        return GROUND_CONTACT_LAW_PHYSTWIN
+    return GROUND_CONTACT_LAW_NATIVE
+
+
 def _use_collision_pipeline(cfg: SimConfig, ir: dict) -> bool:
     """Decide whether to run Newton's shape-collision pipeline this rollout.
 
@@ -1000,9 +1033,9 @@ def _use_collision_pipeline(cfg: SimConfig, ir: dict) -> bool:
     of `self_collision`. To preserve parity, we must run the collision pipeline
     whenever a ground plane is present, not only when self-collision is enabled.
     """
-    if _resolve_self_contact_mode(cfg, ir) == SELF_CONTACT_MODE_PHYSTWIN:
-        # Strict bridge `phystwin` uses its own self-collision + implicit ground
-        # plane handling and does not mix in Newton's shape collision pipeline.
+    if _resolve_ground_contact_law(cfg, ir) == GROUND_CONTACT_LAW_PHYSTWIN:
+        # Bridge-side PhysTwin ground law uses the implicit z=0 integrator and
+        # does not mix in Newton's shape-collision pipeline.
         return False
     return bool(cfg.shape_contacts or cfg.add_ground_plane or _resolve_particle_contacts(cfg, ir))
 
@@ -1340,9 +1373,15 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
     checks = validate_ir_physics(ir, cfg)
     particle_contacts = _resolve_particle_contacts(cfg, ir)
     self_contact_mode = _resolve_self_contact_mode(cfg, ir)
+    ground_contact_law = _resolve_ground_contact_law(cfg, ir)
+    explicit_ground_contact_law = cfg.ground_contact_law is not None
     phystwin_contact_stack = (
         _load_phystwin_contact_stack()
-        if self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN
+        if (
+            self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN
+            or ground_contact_law == GROUND_CONTACT_LAW_PHYSTWIN
+            or explicit_ground_contact_law
+        )
         else None
     )
     if phystwin_contact_stack is not None:
@@ -1356,6 +1395,30 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
         up_axis=newton.Axis.from_any(cfg.up_axis),
         gravity=0.0,
     )
+    native_ground_check_keys = (
+        "ground_restitution_mode",
+        "ground_contact_param_source",
+        "ground_contact_context",
+        "ground_contact_fric_raw",
+        "ground_contact_map_mu",
+        "ground_contact_elas_raw",
+        "ground_contact_elas_effective",
+        "ground_contact_elas_supported",
+        "ground_contact_elas_mapping",
+        "ground_contact_map_zeta",
+        "ground_contact_map_m_eff_ref",
+        "ground_contact_map_ke",
+        "ground_contact_map_kd",
+        "ground_contact_map_kf",
+        "ground_plane_added",
+        "ground_mu",
+        "ground_restitution",
+        "ground_contact_final_ke",
+        "ground_contact_final_kd",
+        "ground_contact_final_kf",
+        "ground_contact_warning",
+    )
+    native_ground_check_snapshot: dict[str, Any] = {}
 
     radius, ver, radius_src = _add_particles(
         builder,
@@ -1364,8 +1427,11 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
         particle_contacts and (self_contact_mode != SELF_CONTACT_MODE_PHYSTWIN),
     )
     _add_springs(builder, ir, cfg, checks)
-    if self_contact_mode != SELF_CONTACT_MODE_PHYSTWIN:
+    if ground_contact_law != GROUND_CONTACT_LAW_PHYSTWIN:
         _add_ground_plane(builder, ir, cfg, checks)
+        native_ground_check_snapshot = {
+            key: checks[key] for key in native_ground_check_keys if key in checks
+        }
 
     # ── Extension point ──
     # Add new objects here: builder.add_body(), builder.add_shape_mesh(), etc.
@@ -1375,7 +1441,9 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
 
     # Particle contact kernel in SemiImplicit relies on a HashGrid being built each substep.
     # An explicit bridge self-contact mode overrides the legacy particle-contact flags.
-    particle_contact_kernel = self_contact_mode == SELF_CONTACT_MODE_NATIVE
+    particle_contact_kernel = (
+        self_contact_mode == SELF_CONTACT_MODE_NATIVE and not explicit_ground_contact_law
+    )
     bridge_self_contact_grid = None
     bridge_neighbor_table = None
     bridge_neighbor_count = None
@@ -1406,13 +1474,43 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
                 "excluded_pair_count": float(exclusion_summary["excluded_pair_count"]),
             }
         )
-    elif self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN:
+    elif phystwin_contact_stack is not None:
         model.particle_grid = None
-        assert phystwin_contact_stack is not None
         phystwin_contact_context, phystwin_checks = phystwin_contact_stack[
             "build_strict_phystwin_contact_context"
         ](model, ir, cfg, device=device)
         checks.update(phystwin_checks)
+        if ground_contact_law != GROUND_CONTACT_LAW_PHYSTWIN:
+            for key in (
+                "phystwin_ground_contact_semantics",
+                "ground_contact_param_source",
+                "ground_contact_context",
+                "ground_contact_elas_supported",
+                "ground_contact_elas_mapping",
+                "ground_contact_elas_raw",
+                "ground_contact_fric_raw",
+                "ground_contact_elas_effective",
+                "ground_contact_map_mu",
+                "ground_plane_added",
+                "ground_mu",
+                "ground_restitution",
+                "ground_contact_final_ke",
+                "ground_contact_final_kd",
+                "ground_contact_final_kf",
+            ):
+                checks.pop(key, None)
+            checks.update(native_ground_check_snapshot)
+        if self_contact_mode != SELF_CONTACT_MODE_PHYSTWIN:
+            for key in (
+                "phystwin_self_contact_semantics",
+                "phystwin_collision_dist",
+                "phystwin_collide_elas",
+                "phystwin_collide_fric",
+                "phystwin_collision_candidate_mode",
+                "phystwin_collision_table_capacity",
+                "phystwin_collision_runtime_object_only",
+            ):
+                checks.pop(key, None)
     elif not particle_contact_kernel:
         model.particle_grid = None
 
@@ -1450,6 +1548,7 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
         checks["particle_contact_final_mu"] = float(model.particle_mu)
     checks["particle_contacts_enabled"] = particle_contact_kernel
     checks["self_contact_mode"] = self_contact_mode
+    checks["ground_contact_law"] = ground_contact_law
     checks["collision_radius_source"] = radius_src
 
     return ModelResult(
@@ -1457,6 +1556,7 @@ def build_model(ir: dict, cfg: SimConfig, device: str) -> ModelResult:
         radius=radius,
         ir_version=ver,
         self_contact_mode=self_contact_mode,
+        ground_contact_law=ground_contact_law,
         bridge_self_contact_grid=bridge_self_contact_grid,
         bridge_neighbor_table=bridge_neighbor_table,
         bridge_neighbor_count=bridge_neighbor_count,
@@ -1549,13 +1649,19 @@ def simulate(
     self_contact_mode = (
         model_result.self_contact_mode if model_result is not None else _resolve_self_contact_mode(cfg, ir)
     )
+    ground_contact_law = (
+        model_result.ground_contact_law if model_result is not None else _resolve_ground_contact_law(cfg, ir)
+    )
+    explicit_ground_contact_law = cfg.ground_contact_law is not None
     use_native_self_contact = self_contact_mode == SELF_CONTACT_MODE_NATIVE
     use_custom_self_contact = self_contact_mode == SELF_CONTACT_MODE_CUSTOM
     use_phystwin_self_contact = self_contact_mode == SELF_CONTACT_MODE_PHYSTWIN
-    use_manual_force_path = use_custom_self_contact or use_phystwin_self_contact
+    use_bridge_law_matrix = explicit_ground_contact_law
+    use_bridge_phystwin_stack = use_bridge_law_matrix or use_phystwin_self_contact
+    use_manual_force_path = use_custom_self_contact or use_bridge_phystwin_stack
     self_contact_kernels = _load_self_contact_kernels() if use_custom_self_contact else {}
     semiimplicit_kernels = _load_semiimplicit_bridge_kernels() if use_custom_self_contact else {}
-    phystwin_contact_stack = _load_phystwin_contact_stack() if use_phystwin_self_contact else {}
+    phystwin_contact_stack = _load_phystwin_contact_stack() if use_bridge_phystwin_stack else {}
 
     particle_grid = (
         model.particle_grid
@@ -1588,15 +1694,16 @@ def simulate(
     # Main loop
     t0 = time.perf_counter()
     for frame in frame_range:
-        if use_phystwin_self_contact:
+        if use_bridge_phystwin_stack:
             if model_result is None or model_result.phystwin_contact_context is None:
                 raise RuntimeError(
-                    "Strict bridge `phystwin` mode requires a shared PhysTwin contact context."
+                    "Bridge-side contact-law experiments require a shared PhysTwin contact context."
                 )
             phystwin_contact_stack["prepare_strict_phystwin_contact_frame"](
                 model,
                 state_in,
                 model_result.phystwin_contact_context,
+                enable_self_collision=use_phystwin_self_contact,
             )
         for sub in range(substeps):
             # Newton state stores force accumulators; clear them every substep so forces
@@ -1635,16 +1742,22 @@ def simulate(
 
             if not use_manual_force_path:
                 solver.step(state_in, state_out, control, contacts, sim_dt)
-            elif use_phystwin_self_contact:
+            elif use_bridge_phystwin_stack:
                 phystwin_contact_stack["step_strict_phystwin_contact_stack"](
                     model,
                     state_in,
                     state_out,
                     control,
                     model_result.phystwin_contact_context,
+                    solver=solver,
+                    contacts=contacts,
                     sim_dt=sim_dt,
                     joint_attach_ke=solver.joint_attach_ke,
                     joint_attach_kd=solver.joint_attach_kd,
+                    friction_smoothing=solver.friction_smoothing,
+                    angular_damping=solver.angular_damping,
+                    enable_self_collision=use_phystwin_self_contact,
+                    ground_contact_law=ground_contact_law,
                 )
             else:
                 particle_f = state_in.particle_f if state_in.particle_count else None
@@ -1670,7 +1783,7 @@ def simulate(
 
             state_in, state_out = state_out, state_in
 
-            if drag > 0.0 and not use_phystwin_self_contact:
+            if drag > 0.0 and ground_contact_law == GROUND_CONTACT_LAW_NATIVE:
                 # PhysTwin drag is a post-step velocity damping; Newton doesn't have
                 # an equivalent built-in knob, so we apply it explicitly here.
                 # Important: this is limited to the first n_obj spring-mass object
@@ -1762,6 +1875,7 @@ def save_results(
     )
 
     gravity_scalar, gravity_vec = resolve_gravity(cfg, ir)
+    all_particle_positions_finite = bool(np.isfinite(sim_result.particle_q_all).all())
     summary = {
         "ir_path": str(cfg.ir_path),
         "output_npz": str(npz_path),
@@ -1781,6 +1895,7 @@ def save_results(
             "shape_contacts": cfg.shape_contacts,
             "add_ground_plane": cfg.add_ground_plane,
             "self_contact_mode": cfg.self_contact_mode,
+            "ground_contact_law": cfg.ground_contact_law,
             "custom_self_contact_hops": cfg.custom_self_contact_hops,
             "phystwin_freeze_collision_table": cfg.phystwin_freeze_collision_table,
             "phystwin_collision_table_capacity": cfg.phystwin_collision_table_capacity,
@@ -1803,6 +1918,7 @@ def save_results(
             "gravity_scalar": gravity_scalar,
             "gravity_vector": list(gravity_vec),
             "wall_time_sec": sim_result.wall_time_sec,
+            "all_particle_positions_finite": all_particle_positions_finite,
         },
         "particles": {
             "total": int(sim_result.particle_q_all.shape[1]),
@@ -1818,6 +1934,9 @@ def save_results(
                 "particle_contacts_enabled", False
             ),
             "self_contact_mode": model_result.checks.get("self_contact_mode", SELF_CONTACT_MODE_OFF),
+            "ground_contact_law": model_result.checks.get(
+                "ground_contact_law", GROUND_CONTACT_LAW_NATIVE
+            ),
         },
         "validation": model_result.checks,
         "baseline": {

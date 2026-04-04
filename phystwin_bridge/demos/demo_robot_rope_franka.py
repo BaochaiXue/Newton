@@ -587,6 +587,44 @@ def parse_args() -> argparse.Namespace:
         help="Extra preroll damping scale used only while settling the tabletop hero before the recorded clip.",
     )
     p.add_argument(
+        "--visible-tool-mode",
+        choices=["none", "short_rod"],
+        default="none",
+        help="Optional visible rigid tool attached to the robot. `short_rod` adds a small capsule tool that is both the visible mesh and the physical contactor.",
+    )
+    p.add_argument(
+        "--visible-tool-body",
+        choices=["right_finger", "left_finger", "link7"],
+        default="right_finger",
+        help="Robot body the visible rigid tool is attached to.",
+    )
+    p.add_argument(
+        "--visible-tool-radius",
+        type=float,
+        default=0.0055,
+        help="Radius of the visible rigid tool capsule [m].",
+    )
+    p.add_argument(
+        "--visible-tool-half-height",
+        type=float,
+        default=0.0050,
+        help="Half-height of the visible rigid tool capsule cylinder section [m].",
+    )
+    p.add_argument(
+        "--visible-tool-offset",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0076, 0.0535),
+        metavar=("X", "Y", "Z"),
+        help="Local offset of the visible rigid tool center in the attachment body frame [m].",
+    )
+    p.add_argument(
+        "--visible-tool-axis",
+        choices=["x", "y", "z"],
+        default="z",
+        help="Local axis along which the visible rigid tool capsule extends.",
+    )
+    p.add_argument(
         "--pre-release-settle-damping-scale",
         type=float,
         default=8.0,
@@ -683,6 +721,29 @@ def _quat_inverse_rotate_vector(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     vec_quat = np.asarray([v[0], v[1], v[2], 0.0], dtype=np.float32)
     rotated = _quat_multiply(_quat_multiply(_quat_conjugate(q), vec_quat), q)
     return rotated[:3]
+
+
+def _quat_from_axis_angle_np(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    axis = np.asarray(axis, dtype=np.float32)
+    norm = float(np.linalg.norm(axis))
+    if norm <= 1.0e-8:
+        return np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    axis = axis / norm
+    half = 0.5 * float(angle_rad)
+    s = float(np.sin(half))
+    c = float(np.cos(half))
+    return np.asarray([axis[0] * s, axis[1] * s, axis[2] * s, c], dtype=np.float32)
+
+
+def _visible_tool_local_quat(axis_name: str) -> np.ndarray:
+    axis_name = str(axis_name).lower()
+    if axis_name == "z":
+        return np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    if axis_name == "x":
+        return _quat_from_axis_angle_np(np.asarray([0.0, 1.0, 0.0], dtype=np.float32), 0.5 * np.pi)
+    if axis_name == "y":
+        return _quat_from_axis_angle_np(np.asarray([1.0, 0.0, 0.0], dtype=np.float32), -0.5 * np.pi)
+    raise ValueError(f"Unsupported visible-tool axis: {axis_name}")
 
 
 def _ee_world_position(body_q_row: np.ndarray, offset_local: np.ndarray) -> np.ndarray:
@@ -955,6 +1016,79 @@ def _min_finger_box_clearance(
     return float(best_clearance), best_name, per_name
 
 
+def _capsule_segment_endpoints(center: np.ndarray, quat: np.ndarray, half_height: float) -> tuple[np.ndarray, np.ndarray]:
+    center = np.asarray(center, dtype=np.float32)
+    quat = np.asarray(quat, dtype=np.float32)
+    axis_offset = _quat_rotate_vector(quat, np.asarray([0.0, 0.0, float(half_height)], dtype=np.float32))
+    return (
+        (center - axis_offset).astype(np.float32, copy=False),
+        (center + axis_offset).astype(np.float32, copy=False),
+    )
+
+
+def _visible_tool_entry(model: newton.Model, meta: dict[str, Any]) -> dict[str, Any] | None:
+    if not bool(meta.get("visible_tool_enabled", False)):
+        return None
+    shape_idx = meta.get("visible_tool_shape_index")
+    if shape_idx is None:
+        return None
+    shape_idx = int(shape_idx)
+    shape_scale = model.shape_scale.numpy() if hasattr(model.shape_scale, "numpy") else np.asarray(model.shape_scale)
+    shape_transform = model.shape_transform.numpy() if hasattr(model.shape_transform, "numpy") else np.asarray(model.shape_transform)
+    shape_body = model.shape_body.numpy() if hasattr(model.shape_body, "numpy") else np.asarray(model.shape_body)
+    shape_label = getattr(model, "shape_label", None)
+    shape_label_value = None
+    if isinstance(shape_label, list) and 0 <= shape_idx < len(shape_label):
+        shape_label_value = str(shape_label[shape_idx])
+    return {
+        "shape_index": shape_idx,
+        "shape_label": shape_label_value,
+        "name": str(meta.get("visible_tool_label", "visible_tool_capsule")),
+        "body_index": int(shape_body[shape_idx]),
+        "body_label": str(meta.get("visible_tool_body_label")),
+        "radius": float(shape_scale[shape_idx][0]),
+        "half_height": float(shape_scale[shape_idx][1]),
+        "local_transform": np.asarray(shape_transform[shape_idx], dtype=np.float32),
+        "axis": str(meta.get("visible_tool_axis", "z")),
+    }
+
+
+def _tool_world_transform(body_q_frame: np.ndarray, tool_entry: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    return _combine_world_transform(
+        body_q_frame[int(tool_entry["body_index"])],
+        np.asarray(tool_entry["local_transform"], dtype=np.float32),
+    )
+
+
+def _min_capsule_clearance(
+    particle_q: np.ndarray,
+    particle_radius: np.ndarray,
+    body_q_frame: np.ndarray,
+    tool_entry: dict[str, Any] | None,
+) -> tuple[float | None, str | None]:
+    if tool_entry is None:
+        return None, None
+    center_w, quat_w = _tool_world_transform(body_q_frame, tool_entry)
+    seg_a, seg_b = _capsule_segment_endpoints(
+        center_w,
+        quat_w,
+        float(tool_entry["half_height"]),
+    )
+    segment = seg_b - seg_a
+    denom = float(np.dot(segment, segment))
+    if denom <= 1.0e-12:
+        d = np.linalg.norm(particle_q - seg_a[None, :], axis=1) - (
+            particle_radius + float(tool_entry["radius"])
+        )
+    else:
+        t = np.clip(((particle_q - seg_a[None, :]) @ segment) / denom, 0.0, 1.0)
+        proj = seg_a[None, :] + t[:, None] * segment[None, :]
+        d = np.linalg.norm(particle_q - proj, axis=1) - (
+            particle_radius + float(tool_entry["radius"])
+        )
+    return float(np.min(d)), str(tool_entry.get("shape_label") or tool_entry.get("name") or "visible_tool_capsule")
+
+
 def _fit_quadratic_acceleration(times: np.ndarray, values: np.ndarray) -> float | None:
     times = np.asarray(times, dtype=np.float64)
     values = np.asarray(values, dtype=np.float64)
@@ -1086,39 +1220,72 @@ def _camera_presets(meta: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
     if task == TABLETOP_PUSH_TASK:
         push_focus = np.asarray(meta.get("tabletop_push_focus", rope_center), dtype=np.float32)
-        hero_target = np.asarray(
-            [
-                float(push_focus[0] + 0.004),
-                float(push_focus[1] + 0.012),
-                float(max(table_center[2] + 0.11, rope_center[2] + 0.045)),
-            ],
-            dtype=np.float32,
-        )
-        hero_pos = camera_position(hero_target, yaw_deg=148.0, pitch_deg=-22.0, distance=1.42)
+        if bool(meta.get("visible_tool_enabled", False)):
+            hero_target = np.asarray(
+                [
+                    float(push_focus[0] - 0.004),
+                    float(push_focus[1] - 0.006),
+                    float(max(table_center[2] + 0.075, rope_center[2] + 0.020)),
+                ],
+                dtype=np.float32,
+            )
+            hero_pos = camera_position(hero_target, yaw_deg=162.0, pitch_deg=-15.0, distance=1.34)
 
-        validation_target = np.asarray(
-            [
-                float(push_focus[0]),
-                float(push_focus[1]),
-                float(max(table_center[2] + 0.11, rope_center[2] + 0.04)),
-            ],
-            dtype=np.float32,
-        )
-        validation_pos = camera_position(validation_target, yaw_deg=156.0, pitch_deg=-23.0, distance=1.68)
+            validation_target = np.asarray(
+                [
+                    float(push_focus[0] - 0.002),
+                    float(push_focus[1] - 0.004),
+                    float(max(table_center[2] + 0.082, rope_center[2] + 0.025)),
+                ],
+                dtype=np.float32,
+            )
+            validation_pos = camera_position(validation_target, yaw_deg=166.0, pitch_deg=-17.0, distance=1.54)
+            hero_pitch = -15.0
+            hero_yaw = 162.0
+            hero_fov = 34.0
+            validation_pitch = -17.0
+            validation_yaw = 166.0
+            validation_fov = 36.0
+        else:
+            hero_target = np.asarray(
+                [
+                    float(push_focus[0] + 0.004),
+                    float(push_focus[1] + 0.012),
+                    float(max(table_center[2] + 0.11, rope_center[2] + 0.045)),
+                ],
+                dtype=np.float32,
+            )
+            hero_pos = camera_position(hero_target, yaw_deg=148.0, pitch_deg=-22.0, distance=1.42)
+
+            validation_target = np.asarray(
+                [
+                    float(push_focus[0]),
+                    float(push_focus[1]),
+                    float(max(table_center[2] + 0.11, rope_center[2] + 0.04)),
+                ],
+                dtype=np.float32,
+            )
+            validation_pos = camera_position(validation_target, yaw_deg=156.0, pitch_deg=-23.0, distance=1.68)
+            hero_pitch = -22.0
+            hero_yaw = 148.0
+            hero_fov = 36.0
+            validation_pitch = -23.0
+            validation_yaw = 156.0
+            validation_fov = 38.0
 
         return {
             "hero": {
                 "pos": hero_pos.astype(np.float32, copy=False).tolist(),
-                "pitch": -22.0,
-                "yaw": 148.0,
-                "fov": 36.0,
+                "pitch": hero_pitch,
+                "yaw": hero_yaw,
+                "fov": hero_fov,
                 "target": hero_target.astype(np.float32, copy=False).tolist(),
             },
             "validation": {
                 "pos": validation_pos.astype(np.float32, copy=False).tolist(),
-                "pitch": -23.0,
-                "yaw": 156.0,
-                "fov": 38.0,
+                "pitch": validation_pitch,
+                "yaw": validation_yaw,
+                "fov": validation_fov,
                 "target": validation_target.astype(np.float32, copy=False).tolist(),
             },
         }
@@ -1549,7 +1716,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         force_show_colliders=False,
     )
 
-    robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_joint_path_mode else FRANKA_INIT_Q.copy()
+    robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_task else FRANKA_INIT_Q.copy()
     builder.joint_q[:9] = robot_joint_init.tolist()
     builder.joint_target_pos[:9] = robot_joint_init.tolist()
     builder.joint_target_ke[:7] = [float(args.joint_target_ke)] * 7
@@ -1565,10 +1732,44 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     ee_body_index = _find_index_by_suffix(builder.body_label, "/fr3_link7")
     left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
     right_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_rightfinger")
+    visible_tool_enabled = str(args.visible_tool_mode) != "none"
+    visible_tool_body_index = None
+    visible_tool_body_label = None
+    visible_tool_local_quat = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    visible_tool_local_transform = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    if visible_tool_enabled:
+        visible_tool_body_map = {
+            "right_finger": int(right_finger_index),
+            "left_finger": int(left_finger_index),
+            "link7": int(ee_body_index),
+        }
+        visible_tool_body_index = int(visible_tool_body_map[str(args.visible_tool_body)])
+        visible_tool_body_label = str(builder.body_label[visible_tool_body_index])
+        visible_tool_local_quat = _visible_tool_local_quat(str(args.visible_tool_axis))
+        visible_tool_local_transform = np.asarray(
+            [
+                float(args.visible_tool_offset[0]),
+                float(args.visible_tool_offset[1]),
+                float(args.visible_tool_offset[2]),
+                float(visible_tool_local_quat[0]),
+                float(visible_tool_local_quat[1]),
+                float(visible_tool_local_quat[2]),
+                float(visible_tool_local_quat[3]),
+            ],
+            dtype=np.float32,
+        )
+    visible_tool_color = np.asarray([0.98, 0.18, 0.10], dtype=np.float32)
     ee_offset_local = np.asarray(
         [0.0, 0.0, float(args.tabletop_ee_offset_z)] if tabletop_task else [0.0, 0.0, 0.22],
         dtype=np.float32,
     )
+    ik_reference_body_index = int(ee_body_index)
+    ik_reference_offset_local = ee_offset_local.astype(np.float32, copy=True)
+    ik_reference_offset_quat = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    if tabletop_task and visible_tool_enabled and str(args.tabletop_control_mode) == "ik":
+        ik_reference_body_index = int(visible_tool_body_index)
+        ik_reference_offset_local = np.asarray(visible_tool_local_transform[:3], dtype=np.float32)
+        ik_reference_offset_quat = np.asarray(visible_tool_local_transform[3:7], dtype=np.float32)
     floor_z = 0.0
     table_top_z = float(args.tabletop_table_top_z) if tabletop_task else None
     if drop_release_task:
@@ -1738,6 +1939,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             "support_point": support_point,
             "floor_z": float(floor_z),
             "table_top_z": table_top_z,
+            "visible_tool_enabled": bool(visible_tool_enabled),
         }
     )
 
@@ -1777,6 +1979,29 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             cfg=table_cfg,
             label="tabletop_table_box",
         )
+    visible_tool_shape_index = None
+    if visible_tool_enabled:
+        tool_cfg = builder.default_shape_cfg.copy()
+        newton_import_ir._configure_ground_contact_material(
+            tool_cfg,
+            ir_obj,
+            cfg,
+            checks,
+            context="visible_tool_capsule",
+        )
+        visible_tool_shape_index = int(
+            builder.add_shape_capsule(
+                body=visible_tool_body_index,
+                xform=wp.transform(
+                    wp.vec3(*np.asarray(args.visible_tool_offset, dtype=np.float32).tolist()),
+                    wp.quat(*visible_tool_local_quat.tolist()),
+                ),
+                radius=float(args.visible_tool_radius),
+                half_height=float(args.visible_tool_half_height),
+                cfg=tool_cfg,
+                label="visible_tool_capsule",
+            )
+        )
     model = builder.finalize(device=device)
     _ = newton_import_ir._apply_ps_object_collision_mapping(model, ir_obj, cfg, checks)
     if not bool(particle_contact_kernel):
@@ -1792,9 +2017,14 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         ee_target_quat = init_body_q[int(ee_body_index), 3:7].astype(np.float32, copy=False)
         for phase in task_phases:
             phase["quat"] = ee_target_quat.astype(np.float32, copy=False)
-    ee_world_start = _ee_world_position(init_body_q[int(ee_body_index)], ee_offset_local)
+    ee_world_start = _ee_world_position(init_body_q[int(ik_reference_body_index)], ik_reference_offset_local)
     if tabletop_task:
         ee_target_start = np.asarray(task_phases[0]["start"], dtype=np.float32)
+        if visible_tool_enabled and str(args.tabletop_control_mode) == "ik":
+            ee_target_start = ee_world_start.astype(np.float32, copy=False)
+            task_phases[0]["start"] = ee_target_start.astype(np.float32, copy=False)
+            task_phases[0]["end"] = ee_target_start.astype(np.float32, copy=False)
+            task_phases[1]["start"] = ee_target_start.astype(np.float32, copy=False)
         tabletop_push_focus = (
             0.5
             * (
@@ -1818,9 +2048,28 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "left_finger_index": int(left_finger_index),
         "right_finger_index": int(right_finger_index),
         "ee_offset_local": ee_offset_local.astype(np.float32),
+        "ik_reference_body_index": int(ik_reference_body_index),
+        "ik_reference_body_label": str(builder.body_label[int(ik_reference_body_index)]),
+        "ik_reference_offset_local": ik_reference_offset_local.astype(np.float32),
+        "ik_reference_offset_quat": ik_reference_offset_quat.astype(np.float32),
         "ee_target_quat": ee_target_quat.astype(np.float32),
         "ee_target_start": ee_target_start.astype(np.float32),
         "ee_target_end": ee_target_end.astype(np.float32),
+        "ik_reference_body_index": (
+            int(visible_tool_body_index)
+            if tabletop_task and bool(visible_tool_enabled)
+            else int(ee_body_index)
+        ),
+        "ik_reference_offset_local": (
+            np.asarray(visible_tool_local_transform[:3], dtype=np.float32)
+            if tabletop_task and bool(visible_tool_enabled)
+            else ee_offset_local.astype(np.float32)
+        ),
+        "ik_reference_offset_quat": (
+            np.asarray(visible_tool_local_transform[3:7], dtype=np.float32)
+            if tabletop_task and bool(visible_tool_enabled)
+            else np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        ),
         "task": str(args.task),
         "task_phases": task_phases,
         "mid_segment_indices": mid_segment_indices.astype(np.int32),
@@ -1874,6 +2123,23 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             task_phases,
             "release" if drop_release_task else ("retract" if tabletop_task else "release_retract"),
         ),
+        "visible_tool_enabled": bool(visible_tool_enabled),
+        "visible_tool_mode": str(args.visible_tool_mode),
+        "visible_tool_body_index": (None if visible_tool_body_index is None else int(visible_tool_body_index)),
+        "visible_tool_body_label": visible_tool_body_label,
+        "visible_tool_shape_index": visible_tool_shape_index,
+        "visible_tool_shape_label": ("visible_tool_capsule" if visible_tool_enabled else None),
+        "visible_tool_radius": (float(args.visible_tool_radius) if visible_tool_enabled else None),
+        "visible_tool_half_height": (float(args.visible_tool_half_height) if visible_tool_enabled else None),
+        "visible_tool_total_length": (
+            2.0 * float(args.visible_tool_radius) + 2.0 * float(args.visible_tool_half_height)
+            if visible_tool_enabled
+            else None
+        ),
+        "visible_tool_offset_local": np.asarray(args.visible_tool_offset, dtype=np.float32),
+        "visible_tool_local_transform": visible_tool_local_transform.astype(np.float32),
+        "visible_tool_axis": str(args.visible_tool_axis),
+        "visible_tool_color": visible_tool_color.astype(np.float32),
     }
     return model, ir_obj, meta, n_obj
 
@@ -1967,13 +2233,13 @@ def simulate(
     if not (tabletop_joint_override_mode or tabletop_joint_drive_mode):
         ik_joint_q = wp.array(np.asarray(meta["joint_q_init"], dtype=np.float32).reshape(1, -1), dtype=wp.float32, device=device)
         pos_obj = ik.IKObjectivePosition(
-            link_index=int(meta["ee_body_index"]),
-            link_offset=wp.vec3(*np.asarray(meta["ee_offset_local"], dtype=np.float32).tolist()),
+            link_index=int(meta.get("ik_reference_body_index", meta["ee_body_index"])),
+            link_offset=wp.vec3(*np.asarray(meta.get("ik_reference_offset_local", meta["ee_offset_local"]), dtype=np.float32).tolist()),
             target_positions=wp.array([wp.vec3(*np.asarray(meta["ee_target_start"], dtype=np.float32).tolist())], dtype=wp.vec3, device=device),
         )
         rot_obj = ik.IKObjectiveRotation(
-            link_index=int(meta["ee_body_index"]),
-            link_offset_rotation=wp.quat_identity(),
+            link_index=int(meta.get("ik_reference_body_index", meta["ee_body_index"])),
+            link_offset_rotation=wp.quat(*np.asarray(meta.get("ik_reference_offset_quat", [0.0, 0.0, 0.0, 1.0]), dtype=np.float32).tolist()),
             target_rotations=wp.array([wp.vec4(*np.asarray(meta["ee_target_quat"], dtype=np.float32).tolist())], dtype=wp.vec4, device=device),
         )
         joint_limit_obj = ik.IKObjectiveJointLimit(
@@ -2469,7 +2735,16 @@ def render_video(
     try:
         viewer.set_model(model)
         try:
-            apply_viewer_shape_colors(viewer, model)
+            extra_rules = None
+            if bool(meta.get("visible_tool_enabled", False)):
+                tool_color = np.asarray(meta.get("visible_tool_color", [0.96, 0.48, 0.14]), dtype=np.float32)
+                extra_rules = [
+                    (
+                        lambda name: "visible_tool_capsule" in name,
+                        tuple(float(v) for v in tool_color.tolist()),
+                    )
+                ]
+            apply_viewer_shape_colors(viewer, model, extra_rules=extra_rules)
         except Exception:
             pass
         viewer.show_particles = True
@@ -2520,6 +2795,8 @@ def render_video(
         left_finger_idx = int(meta["left_finger_index"])
         right_finger_idx = int(meta["right_finger_index"])
         finger_box_entries = _finger_box_entries(model, meta) if tabletop_task else []
+        visible_tool_entry = _visible_tool_entry(model, meta)
+        visible_tool_color = np.asarray(meta.get("visible_tool_color", [0.96, 0.48, 0.14]), dtype=np.float32)
         stage_center = np.asarray(meta["stage_center"], dtype=np.float32)
         stage_scale = np.asarray(meta["stage_scale"], dtype=np.float32)
         robot_base_center = np.asarray(meta["robot_base_center"], dtype=np.float32)
@@ -2575,15 +2852,55 @@ def render_video(
                 phase_name, _, _ = _task_phase_state(sim_t, meta)
                 viewer.begin_frame(sim_t)
                 viewer.log_state(state)
+                tool_center_w = None
+                tool_quat_w = None
                 gripper_proxies = _gripper_contact_proxies_world(
                     sim_data["body_q"][sim_idx], left_finger_idx, right_finger_idx
                 )
                 gripper_center = gripper_proxies["gripper_center"].astype(np.float32, copy=False)
                 q_obj = sim_data["particle_q_object"][sim_idx]
                 particle_radius = particle_radius_sim[: q_obj.shape[0]]
+                actual_min_clearance = None
+                actual_contact_source = None
+                actual_tool_clearance = None
+                actual_tool_contact_source = None
                 if str(args.render_mode) == "debug":
-                    actual_min_clearance = None
-                    actual_contact_source = None
+                    if visible_tool_entry is not None:
+                        tool_center_w, tool_quat_w = _tool_world_transform(
+                            sim_data["body_q"][sim_idx],
+                            visible_tool_entry,
+                        )
+                    if tabletop_task and visible_tool_entry is not None:
+                        actual_tool_clearance, actual_tool_contact_source = _min_capsule_clearance(
+                            q_obj,
+                            particle_radius,
+                            sim_data["body_q"][sim_idx],
+                            visible_tool_entry,
+                        )
+                        if tool_center_w is not None and tool_quat_w is not None:
+                            tool_a, tool_b = _capsule_segment_endpoints(
+                                tool_center_w,
+                                tool_quat_w,
+                                float(visible_tool_entry["half_height"]),
+                            )
+                            viewer.log_shapes(
+                                "/demo/visible_tool_endpoints",
+                                newton.GeoType.SPHERE,
+                                0.004,
+                                wp.array(
+                                    [
+                                        wp.transform(wp.vec3(*tool_a.tolist()), wp.quat_identity()),
+                                        wp.transform(wp.vec3(*tool_b.tolist()), wp.quat_identity()),
+                                    ],
+                                    dtype=wp.transform,
+                                    device=device,
+                                ),
+                                wp.array(
+                                    [wp.vec3(*visible_tool_color.tolist()), wp.vec3(*visible_tool_color.tolist())],
+                                    dtype=wp.vec3,
+                                    device=device,
+                                ),
+                            )
                     if tabletop_task and finger_box_entries:
                         actual_min_clearance, actual_contact_source, _ = _min_finger_box_clearance(
                             q_obj,
@@ -2845,7 +3162,12 @@ def render_video(
                         gripper_proxies,
                         float(args.ee_contact_radius),
                     )
-                    if tabletop_task and actual_min_clearance is not None:
+                    if tabletop_task and actual_tool_clearance is not None:
+                        contact_state = "ON" if float(actual_tool_clearance) <= 0.0 else "OFF"
+                        contact_line = (
+                            f"contact: {contact_state} via {actual_tool_contact_source} | actual tool clearance: {1000.0 * float(actual_tool_clearance):.1f} mm"
+                        )
+                    elif tabletop_task and actual_min_clearance is not None:
                         contact_state = "ON" if float(actual_min_clearance) <= 0.0 else "OFF"
                         contact_line = (
                             f"contact: {contact_state} via {actual_contact_source} | actual finger-box clearance: {1000.0 * float(actual_min_clearance):.1f} mm"
@@ -2903,6 +3225,8 @@ def build_summary(
     target_pos = np.asarray(sim_data["ee_target_pos"], dtype=np.float32)
     particle_radius = model.particle_radius.numpy().astype(np.float32)[: particle_q.shape[1]]
     finger_box_entries = _finger_box_entries(model, meta) if tabletop_task else []
+    visible_tool_entry = _visible_tool_entry(model, meta)
+    visible_tool_enabled = visible_tool_entry is not None
 
     left_finger_idx = int(meta["left_finger_index"])
     right_finger_idx = int(meta["right_finger_index"])
@@ -2959,6 +3283,8 @@ def build_summary(
     actual_right_finger_box_clearance = []
     actual_left_tip_box_clearance = []
     actual_right_tip_box_clearance = []
+    actual_tool_clearance = []
+    actual_tool_source = []
     for frame_idx in range(particle_q.shape[0]):
         min_d, min_source, per_proxy_min = _min_gripper_proxy_clearance(
             particle_q[frame_idx],
@@ -2991,21 +3317,50 @@ def build_summary(
             actual_right_finger_box_clearance.append(float(per_box_min.get("right_any_box", np.inf)))
             actual_left_tip_box_clearance.append(float(per_box_min.get("left_tip_box", np.inf)))
             actual_right_tip_box_clearance.append(float(per_box_min.get("right_tip_box", np.inf)))
-            if actual_min_d <= 0.0:
-                contact_frames.append(frame_idx)
+        tool_min_d, tool_source = _min_capsule_clearance(
+            particle_q[frame_idx],
+            particle_radius,
+            body_q[frame_idx],
+            visible_tool_entry,
+        )
+        if tool_min_d is not None:
+            actual_tool_clearance.append(float(tool_min_d))
+            actual_tool_source.append(str(tool_source))
+        frame_has_contact = False
+        if tabletop_task and visible_tool_enabled and tool_min_d is not None:
+            frame_has_contact = bool(tool_min_d <= 0.0)
+        elif tabletop_task and actual_min_d is not None:
+            frame_has_contact = bool(actual_min_d <= 0.0)
         else:
-            if min_d <= 0.0:
-                contact_frames.append(frame_idx)
+            frame_has_contact = bool(min_d <= 0.0)
+        if frame_has_contact:
+            contact_frames.append(frame_idx)
 
-    support_contact_frames = list(contact_frames)
-    if tabletop_task and actual_finger_box_clearance:
+    if tabletop_task and visible_tool_enabled and actual_tool_clearance:
+        support_contact_mask = np.asarray([m <= 0.0 for m in actual_tool_clearance], dtype=bool)
+    elif tabletop_task and actual_finger_box_clearance:
         support_contact_mask = np.asarray([m <= 0.0 for m in actual_finger_box_clearance], dtype=bool)
     else:
         support_contact_mask = np.asarray([m <= 0.0 for m in min_clearance], dtype=bool)
+    tool_contact_mask = (
+        np.asarray([m <= 0.0 for m in actual_tool_clearance], dtype=bool)
+        if tabletop_task and visible_tool_enabled and actual_tool_clearance
+        else np.zeros((particle_q.shape[0],), dtype=bool)
+    )
+    finger_box_contact_mask = (
+        np.asarray([m <= 0.0 for m in actual_finger_box_clearance], dtype=bool)
+        if tabletop_task and actual_finger_box_clearance
+        else np.zeros((particle_q.shape[0],), dtype=bool)
+    )
+    support_contact_frames = np.flatnonzero(support_contact_mask).tolist()
+    tool_contact_frames = np.flatnonzero(tool_contact_mask).tolist()
+    finger_box_contact_frames = np.flatnonzero(finger_box_contact_mask).tolist()
     support_contact_duration_s = float(np.count_nonzero(support_contact_mask) * frame_dt)
     support_first_contact_frame = int(support_contact_frames[0]) if support_contact_frames else None
     support_last_contact_frame = int(support_contact_frames[-1]) if support_contact_frames else None
-    if tabletop_task and actual_finger_box_clearance:
+    if tabletop_task and visible_tool_enabled and actual_tool_clearance:
+        support_contact_peak_frame = int(np.argmin(np.asarray(actual_tool_clearance, dtype=np.float32)))
+    elif tabletop_task and actual_finger_box_clearance:
         support_contact_peak_frame = int(np.argmin(np.asarray(actual_finger_box_clearance, dtype=np.float32)))
     else:
         support_contact_peak_frame = int(np.argmin(np.asarray(min_clearance, dtype=np.float32))) if min_clearance else None
@@ -3020,7 +3375,14 @@ def build_summary(
     table_contact_frames = np.flatnonzero(table_contact_mask).tolist()
     contact_mask = ground_contact_mask if drop_release_task else support_contact_mask
     contact_frames = ground_contact_frames if drop_release_task else support_contact_frames
-    primary_clearance = rope_surface_clearance_to_ground if drop_release_task else np.asarray(min_clearance, dtype=np.float32)
+    if drop_release_task:
+        primary_clearance = rope_surface_clearance_to_ground
+    elif tabletop_task and visible_tool_enabled and actual_tool_clearance:
+        primary_clearance = np.asarray(actual_tool_clearance, dtype=np.float32)
+    elif tabletop_task and actual_finger_box_clearance:
+        primary_clearance = np.asarray(actual_finger_box_clearance, dtype=np.float32)
+    else:
+        primary_clearance = np.asarray(min_clearance, dtype=np.float32)
 
     first_contact_frame = int(contact_frames[0]) if contact_frames else None
     last_contact_frame = int(contact_frames[-1]) if contact_frames else None
@@ -3071,7 +3433,12 @@ def build_summary(
             unique_phase_sequence.append(name)
 
     support_source_counts: dict[str, int] = {}
-    support_source_series = actual_finger_box_source if tabletop_task and actual_finger_box_source else min_clearance_source
+    if tabletop_task and visible_tool_enabled and actual_tool_source:
+        support_source_series = actual_tool_source
+    elif tabletop_task and actual_finger_box_source:
+        support_source_series = actual_finger_box_source
+    else:
+        support_source_series = min_clearance_source
     for name, active in zip(support_source_series, support_contact_mask.tolist(), strict=False):
         if not active:
             continue
@@ -3087,6 +3454,7 @@ def build_summary(
     actual_right_finger_box_clearance_np = np.asarray(actual_right_finger_box_clearance, dtype=np.float32)
     actual_left_tip_box_clearance_np = np.asarray(actual_left_tip_box_clearance, dtype=np.float32)
     actual_right_tip_box_clearance_np = np.asarray(actual_right_tip_box_clearance, dtype=np.float32)
+    actual_tool_clearance_np = np.asarray(actual_tool_clearance, dtype=np.float32)
     particle_radius_sim = model.particle_radius.numpy().astype(np.float32)
     render_radii = compute_visual_particle_radii(
         particle_radius_sim,
@@ -3102,9 +3470,13 @@ def build_summary(
         if contact_peak_frame is None
         else str(
             (
-                actual_finger_box_source[int(contact_peak_frame)]
-                if tabletop_task and actual_finger_box_source
-                else min_clearance_source[int(contact_peak_frame)]
+                actual_tool_source[int(contact_peak_frame)]
+                if tabletop_task and visible_tool_enabled and actual_tool_source
+                else (
+                    actual_finger_box_source[int(contact_peak_frame)]
+                    if tabletop_task and actual_finger_box_source
+                    else min_clearance_source[int(contact_peak_frame)]
+                )
             )
         )
     )
@@ -3198,6 +3570,21 @@ def build_summary(
         "pre_release_settle_damping_scale": float(sim_data.get("pre_release_settle_damping_scale", args.pre_release_settle_damping_scale)),
         "robot_geometry": "native_franka",
         "ee_body_index": int(meta["ee_body_index"]),
+        "visible_tool_enabled": bool(visible_tool_enabled),
+        "visible_tool_mode": meta.get("visible_tool_mode"),
+        "visible_tool_body_index": meta.get("visible_tool_body_index"),
+        "visible_tool_body_label": meta.get("visible_tool_body_label"),
+        "visible_tool_shape_index": meta.get("visible_tool_shape_index"),
+        "visible_tool_shape_label": meta.get("visible_tool_shape_label"),
+        "visible_tool_axis": meta.get("visible_tool_axis"),
+        "visible_tool_offset_local": (
+            None
+            if not visible_tool_enabled
+            else np.asarray(meta.get("visible_tool_offset_local"), dtype=np.float32).astype(float).tolist()
+        ),
+        "visible_tool_radius_m": (None if not visible_tool_enabled else float(meta.get("visible_tool_radius"))),
+        "visible_tool_half_height_m": (None if not visible_tool_enabled else float(meta.get("visible_tool_half_height"))),
+        "visible_tool_total_length_m": (None if not visible_tool_enabled else float(meta.get("visible_tool_total_length"))),
         "ik_target_blend": float(args.ik_target_blend),
         "tabletop_control_mode": (None if not tabletop_task else str(args.tabletop_control_mode)),
         "tabletop_initial_pose": (None if not tabletop_task else str(args.tabletop_initial_pose)),
@@ -3248,26 +3635,91 @@ def build_summary(
         "support_last_contact_frame": support_last_contact_frame,
         "support_contact_peak_frame": support_contact_peak_frame,
         "support_contact_proxy_mode": (
-            "actual_finger_boxes"
-            if tabletop_task and actual_finger_box_clearance
-            else "min(gripper_center,left_finger,right_finger,finger_span)"
+            "actual_visible_tool_capsule"
+            if tabletop_task and visible_tool_enabled and actual_tool_clearance
+            else (
+                "actual_finger_boxes"
+                if tabletop_task and actual_finger_box_clearance
+                else "min(gripper_center,left_finger,right_finger,finger_span)"
+            )
         ),
         "support_contact_proxy_counts": support_source_counts,
+        "actual_tool_contact_started": bool(tabletop_task and visible_tool_enabled and tool_contact_frames),
+        "actual_tool_first_contact_frame": (
+            (None if not tool_contact_frames else int(tool_contact_frames[0]))
+            if tabletop_task and visible_tool_enabled
+            else None
+        ),
+        "actual_tool_first_contact_time_s": (
+            None
+            if not (tabletop_task and visible_tool_enabled and tool_contact_frames)
+            else float(int(tool_contact_frames[0]) * frame_dt)
+        ),
+        "actual_tool_clearance_min_m": (
+            None if actual_tool_clearance_np.size == 0 else float(np.min(actual_tool_clearance_np))
+        ),
+        "actual_tool_peak_source": (
+            contact_peak_source if tabletop_task and visible_tool_enabled and actual_tool_clearance else None
+        ),
+        "actual_tool_collider_mode": (
+            None
+            if not visible_tool_enabled
+            else {
+                "shape_type": "capsule",
+                "radius_m": float(meta.get("visible_tool_radius")),
+                "half_height_m": float(meta.get("visible_tool_half_height")),
+            }
+        ),
+        "actual_finger_box_contact_started": bool(tabletop_task and actual_finger_box_clearance and finger_box_contact_frames),
+        "actual_finger_box_first_contact_frame": (
+            (None if not finger_box_contact_frames else int(finger_box_contact_frames[0]))
+            if tabletop_task and actual_finger_box_clearance
+            else None
+        ),
+        "actual_finger_box_first_contact_time_s": (
+            None
+            if not (tabletop_task and actual_finger_box_clearance and finger_box_contact_frames)
+            else float(int(finger_box_contact_frames[0]) * frame_dt)
+        ),
+        "actual_finger_box_peak_source": (
+            contact_peak_source if tabletop_task and actual_finger_box_clearance else None
+        ),
+        "actual_finger_box_clearance_min_m": (
+            None if actual_finger_box_clearance_np.size == 0 else float(np.min(actual_finger_box_clearance_np))
+        ),
+        "actual_left_finger_box_clearance_min_m": (
+            None if actual_left_finger_box_clearance_np.size == 0 else float(np.min(actual_left_finger_box_clearance_np))
+        ),
+        "actual_right_finger_box_clearance_min_m": (
+            None if actual_right_finger_box_clearance_np.size == 0 else float(np.min(actual_right_finger_box_clearance_np))
+        ),
+        "actual_left_tip_box_clearance_min_m": (
+            None if actual_left_tip_box_clearance_np.size == 0 else float(np.min(actual_left_tip_box_clearance_np))
+        ),
+        "actual_right_tip_box_clearance_min_m": (
+            None if actual_right_tip_box_clearance_np.size == 0 else float(np.min(actual_right_tip_box_clearance_np))
+        ),
         "support_patch_indices": np.asarray(meta.get("support_patch_indices", meta["anchor_indices"]), dtype=np.int32).astype(int).tolist(),
         "support_patch_center_m": np.asarray(meta.get("support_patch_center_m", meta["anchor_positions"].mean(axis=0)), dtype=np.float32).astype(float).tolist(),
         "visible_support_center_m": np.asarray(meta.get("visible_support_center_m", meta["anchor_positions"].mean(axis=0)), dtype=np.float32).astype(float).tolist(),
         "contact_proxy_mode": (
             "rope_surface_vs_ground_plane"
             if drop_release_task
-            else "min(gripper_center,left_finger,right_finger,finger_span)"
+            else ("actual_visible_tool_capsule" if tabletop_task and visible_tool_enabled and actual_tool_clearance else "min(gripper_center,left_finger,right_finger,finger_span)")
         ),
         "contact_proxy_radius_m": (
-            0.0 if drop_release_task else float(_gripper_contact_proxy_radii(float(args.ee_contact_radius))["gripper_center"])
+            0.0
+            if drop_release_task
+            else (float(meta.get("visible_tool_radius")) if tabletop_task and visible_tool_enabled else float(_gripper_contact_proxy_radii(float(args.ee_contact_radius))["gripper_center"]))
         ),
         "contact_proxy_radii_m": (
             {"ground_plane": 0.0}
             if drop_release_task
-            else _gripper_contact_proxy_radii(float(args.ee_contact_radius))
+            else (
+                {"visible_tool_capsule": float(meta.get("visible_tool_radius"))}
+                if tabletop_task and visible_tool_enabled and actual_tool_clearance
+                else _gripper_contact_proxy_radii(float(args.ee_contact_radius))
+            )
         ),
         "rope_com_displacement_m": rope_com_disp,
         "rope_com_z_min_m": float(np.min(rope_com[:, 2])),
@@ -3329,38 +3781,15 @@ def build_summary(
         "proxy_contact_counts": (
             {"ground_plane": int(np.count_nonzero(contact_mask))}
             if drop_release_task
-            else {
-                name: int(sum(1 for src, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False) if active and src == name))
-                for name in sorted(set(min_clearance_source))
-                if any(active and src == name for src, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False))
-            }
-        ),
-        "actual_finger_box_contact_started": bool(tabletop_task and actual_finger_box_clearance and support_first_contact_frame is not None),
-        "actual_finger_box_first_contact_frame": (
-            support_first_contact_frame if tabletop_task and actual_finger_box_clearance else None
-        ),
-        "actual_finger_box_first_contact_time_s": (
-            None
-            if not (tabletop_task and actual_finger_box_clearance and support_first_contact_frame is not None)
-            else float(support_first_contact_frame * frame_dt)
-        ),
-        "actual_finger_box_peak_source": (
-            contact_peak_source if tabletop_task and actual_finger_box_clearance else None
-        ),
-        "actual_finger_box_clearance_min_m": (
-            None if actual_finger_box_clearance_np.size == 0 else float(np.min(actual_finger_box_clearance_np))
-        ),
-        "actual_left_finger_box_clearance_min_m": (
-            None if actual_left_finger_box_clearance_np.size == 0 else float(np.min(actual_left_finger_box_clearance_np))
-        ),
-        "actual_right_finger_box_clearance_min_m": (
-            None if actual_right_finger_box_clearance_np.size == 0 else float(np.min(actual_right_finger_box_clearance_np))
-        ),
-        "actual_left_tip_box_clearance_min_m": (
-            None if actual_left_tip_box_clearance_np.size == 0 else float(np.min(actual_left_tip_box_clearance_np))
-        ),
-        "actual_right_tip_box_clearance_min_m": (
-            None if actual_right_tip_box_clearance_np.size == 0 else float(np.min(actual_right_tip_box_clearance_np))
+            else (
+                {"visible_tool_capsule": int(np.count_nonzero(support_contact_mask))}
+                if tabletop_task and visible_tool_enabled and actual_tool_clearance
+                else {
+                    name: int(sum(1 for src, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False) if active and src == name))
+                    for name in sorted(set(min_clearance_source))
+                    if any(active and src == name for src, active in zip(min_clearance_source, support_contact_mask.tolist(), strict=False))
+                }
+            )
         ),
         "drag_phase_gating": (
             "pre_approach + release_retract"
