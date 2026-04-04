@@ -343,7 +343,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ee-start-x-offset", type=float, default=-0.18)
     p.add_argument("--ee-end-x-offset", type=float, default=0.06)
     p.add_argument("--ee-z-offset", type=float, default=-0.02)
-    p.add_argument("--ee-contact-radius", type=float, default=0.055)
+    p.add_argument(
+        "--ee-contact-radius",
+        type=float,
+        default=0.055,
+        help=(
+            "Diagnostic-only proxy radius for gripper-center / left-finger / right-finger / finger-span "
+            "clearance overlays and offline reports. This does NOT change the real finger collider geometry "
+            "and is NOT a valid final contact-proof surface."
+        ),
+    )
     p.add_argument("--ik-iters", type=int, default=24)
     p.add_argument("--joint-target-ke", type=float, default=400.0)
     p.add_argument("--joint-target-kd", type=float, default=40.0)
