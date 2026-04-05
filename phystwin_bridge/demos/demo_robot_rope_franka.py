@@ -2809,7 +2809,7 @@ def render_video(
         viewer.show_triangles = False
         viewer.show_visual = True
         viewer.show_static = True
-        viewer.show_collision = True
+        viewer.show_collision = str(args.render_mode) == "debug"
         viewer.show_contacts = False
         viewer.show_ui = False
         viewer.picking_enabled = False
@@ -2912,6 +2912,11 @@ def render_video(
                 viewer.log_state(state)
                 tool_center_w = None
                 tool_quat_w = None
+                if visible_tool_entry is not None:
+                    tool_center_w, tool_quat_w = _tool_world_transform(
+                        sim_data["body_q"][sim_idx],
+                        visible_tool_entry,
+                    )
                 gripper_proxies = _gripper_contact_proxies_world(
                     sim_data["body_q"][sim_idx], left_finger_idx, right_finger_idx
                 )
@@ -2923,11 +2928,6 @@ def render_video(
                 actual_tool_clearance = None
                 actual_tool_contact_source = None
                 if str(args.render_mode) == "debug":
-                    if visible_tool_entry is not None:
-                        tool_center_w, tool_quat_w = _tool_world_transform(
-                            sim_data["body_q"][sim_idx],
-                            visible_tool_entry,
-                        )
                     if tabletop_task and visible_tool_entry is not None:
                         actual_tool_clearance, actual_tool_contact_source = _min_capsule_clearance(
                             q_obj,
@@ -3188,6 +3188,26 @@ def render_video(
                         width=1.0,
                         hidden=False,
                     )
+                    if visible_tool_entry is not None and tool_center_w is not None and tool_quat_w is not None:
+                        viewer.log_shapes(
+                            "/demo/visible_tool_capsule",
+                            newton.GeoType.CAPSULE,
+                            (
+                                float(visible_tool_entry["radius"]),
+                                float(visible_tool_entry["half_height"]),
+                            ),
+                            wp.array(
+                                [
+                                    wp.transform(
+                                        wp.vec3(*tool_center_w.tolist()),
+                                        wp.quat(*tool_quat_w.tolist()),
+                                    )
+                                ],
+                                dtype=wp.transform,
+                                device=device,
+                            ),
+                            wp.array([wp.vec3(*visible_tool_color.tolist())], dtype=wp.vec3, device=device),
+                        )
 
                 if rope_edges.size and rope_line_starts_wp is not None and rope_line_ends_wp is not None:
                     q_obj = sim_data["particle_q_object"][sim_idx]
