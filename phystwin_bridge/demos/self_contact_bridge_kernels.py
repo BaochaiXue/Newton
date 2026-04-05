@@ -488,6 +488,118 @@ def build_potential_self_collision_table(
     )
 
 
+@wp.kernel(enable_backward=False)
+def _sort_self_collision_table_rows(
+    collision_indices: wp.array2d(dtype=wp.int32),
+    collision_number: wp.array(dtype=wp.int32),
+    capacity: int,
+):
+    tid = wp.tid()
+    count = wp.min(collision_number[tid], capacity)
+    i = int(1)
+    while i < count:
+        key = collision_indices[tid, i]
+        j = i - 1
+        while j >= 0 and collision_indices[tid, j] > key:
+            collision_indices[tid, j + 1] = collision_indices[tid, j]
+            j = j - 1
+        collision_indices[tid, j + 1] = key
+        i = i + 1
+
+
+def sort_self_collision_table_rows(
+    *,
+    device: Any,
+    particle_count: int,
+    collision_indices: Any,
+    collision_number: Any,
+    collision_table_capacity: int,
+) -> None:
+    wp.launch(
+        kernel=_sort_self_collision_table_rows,
+        dim=particle_count,
+        inputs=[
+            collision_indices,
+            collision_number,
+            int(collision_table_capacity),
+        ],
+        device=device,
+    )
+
+
+@wp.kernel(enable_backward=False)
+def _eval_spring_forces_deterministic(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    spring_indices: wp.array(dtype=int),
+    spring_rest_lengths: wp.array(dtype=float),
+    spring_stiffness: wp.array(dtype=float),
+    spring_damping: wp.array(dtype=float),
+    incident_spring_indices: wp.array2d(dtype=wp.int32),
+    incident_spring_count: wp.array(dtype=wp.int32),
+    incident_capacity: int,
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    total = wp.vec3(0.0, 0.0, 0.0)
+    count = wp.min(incident_spring_count[tid], incident_capacity)
+    k = int(0)
+    while k < count:
+        sid = incident_spring_indices[tid, k]
+        if sid >= 0:
+            i = spring_indices[sid * 2 + 0]
+            j = spring_indices[sid * 2 + 1]
+            if i != -1 and j != -1:
+                ke = spring_stiffness[sid]
+                kd = spring_damping[sid]
+                rest = spring_rest_lengths[sid]
+
+                xi = particle_x[i]
+                xj = particle_x[j]
+                vi = particle_qd[i]
+                vj = particle_qd[j]
+
+                xij = xi - xj
+                vij = vi - vj
+                l = wp.length(xij)
+                if l > 1.0e-12:
+                    dir = xij * (1.0 / l)
+                    c = l - rest
+                    dcdt = wp.dot(dir, vij)
+                    fs = dir * (ke * c + kd * dcdt)
+                    total = total + (-fs if tid == i else fs)
+        k = k + 1
+    particle_f[tid] = total
+
+
+def eval_spring_forces_deterministic(
+    model: Any,
+    state: Any,
+    *,
+    incident_spring_indices: Any,
+    incident_spring_count: Any,
+    incident_capacity: int,
+    particle_f: Any,
+) -> None:
+    wp.launch(
+        kernel=_eval_spring_forces_deterministic,
+        dim=model.particle_count,
+        inputs=[
+            state.particle_q,
+            state.particle_qd,
+            model.spring_indices,
+            model.spring_rest_length,
+            model.spring_stiffness,
+            model.spring_damping,
+            incident_spring_indices,
+            incident_spring_count,
+            int(incident_capacity),
+        ],
+        outputs=[particle_f],
+        device=model.device,
+    )
+
+
 @wp.kernel
 def _apply_self_collision_phystwin_from_table(
     particle_x: wp.array(dtype=wp.vec3),

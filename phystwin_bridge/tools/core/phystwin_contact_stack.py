@@ -28,11 +28,13 @@ if str(DEMOS_DIR) not in sys.path:
 
 from self_contact_bridge_kernels import (  # noqa: E402
     apply_velocity_update_from_force,
+    eval_spring_forces_deterministic,
     apply_self_collision_phystwin_velocity_from_table,
     apply_self_collision_phystwin_velocity,
     build_potential_self_collision_table,
     build_filtered_self_contact_tables,
     integrate_ground_collision_phystwin,
+    sort_self_collision_table_rows,
     update_vel_from_force_phystwin,
 )
 from semiimplicit_bridge_kernels import (  # noqa: E402
@@ -88,6 +90,9 @@ class PhysTwinContactContext:
     neighbor_count: Any
     qd_after_force: Any
     qd_after_collision: Any
+    spring_incident_indices: Any
+    spring_incident_count: Any
+    spring_incident_capacity: int
     freeze_collision_table: bool
     collision_table_capacity: int
     collision_indices: Any
@@ -252,6 +257,22 @@ def build_strict_phystwin_contact_context(
 
     search_radius = max(collision_dist * 5.0, EPSILON)
 
+    spring_indices = model.spring_indices.numpy().astype(np.int32, copy=False).reshape(-1, 2)
+    incident_lists: list[list[int]] = [[] for _ in range(model.particle_count)]
+    for sid, (i_raw, j_raw) in enumerate(spring_indices):
+        i = int(i_raw)
+        j = int(j_raw)
+        if i >= 0:
+            incident_lists[i].append(int(sid))
+        if j >= 0:
+            incident_lists[j].append(int(sid))
+    incident_count_np = np.asarray([len(row) for row in incident_lists], dtype=np.int32)
+    incident_capacity = max(1, int(incident_count_np.max(initial=0)))
+    incident_indices_np = np.full((model.particle_count, incident_capacity), -1, dtype=np.int32)
+    for pid, row in enumerate(incident_lists):
+        if row:
+            incident_indices_np[pid, : len(row)] = np.asarray(sorted(row), dtype=np.int32)
+
     ctx = PhysTwinContactContext(
         n_object=n_object,
         particle_grid=particle_grid,
@@ -261,6 +282,9 @@ def build_strict_phystwin_contact_context(
         neighbor_count=neighbor_count,
         qd_after_force=wp.empty(model.particle_count, dtype=wp.vec3, device=device),
         qd_after_collision=wp.empty(model.particle_count, dtype=wp.vec3, device=device),
+        spring_incident_indices=wp.array(incident_indices_np, dtype=wp.int32, device=device),
+        spring_incident_count=wp.array(incident_count_np, dtype=wp.int32, device=device),
+        spring_incident_capacity=incident_capacity,
         freeze_collision_table=freeze_collision_table,
         collision_table_capacity=collision_table_capacity,
         collision_indices=collision_indices,
@@ -359,6 +383,13 @@ def prepare_strict_phystwin_contact_frame(
         collision_candidate_total=ctx.collision_candidate_total,
         collision_candidate_truncated=ctx.collision_candidate_truncated,
     )
+    sort_self_collision_table_rows(
+        device=model.device,
+        particle_count=ctx.n_object,
+        collision_indices=ctx.collision_indices,
+        collision_number=ctx.collision_number,
+        collision_table_capacity=ctx.collision_table_capacity,
+    )
 
 
 def step_strict_phystwin_contact_stack(
@@ -397,7 +428,14 @@ def step_strict_phystwin_contact_stack(
     if body_f is not None and model.joint_count and control.joint_f is not None:
         body_f_work = wp.clone(body_f)
 
-    eval_spring_forces(model, state_in, particle_f)
+    eval_spring_forces_deterministic(
+        model,
+        state_in,
+        incident_spring_indices=ctx.spring_incident_indices,
+        incident_spring_count=ctx.spring_incident_count,
+        incident_capacity=ctx.spring_incident_capacity,
+        particle_f=particle_f,
+    )
     eval_triangle_forces(model, state_in, control, particle_f)
     eval_bending_forces(model, state_in, particle_f)
     eval_tetrahedra_forces(model, state_in, control, particle_f)

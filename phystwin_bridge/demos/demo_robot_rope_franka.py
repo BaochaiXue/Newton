@@ -358,6 +358,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--joint-target-kd", type=float, default=40.0)
     p.add_argument("--finger-target-ke", type=float, default=100.0)
     p.add_argument("--finger-target-kd", type=float, default=10.0)
+    p.add_argument(
+        "--solver-joint-attach-ke",
+        type=float,
+        default=1.0e4,
+        help=(
+            "SemiImplicit articulation attachment stiffness. Lower values can stabilize physically actuated "
+            "articulation tracking in joint_target_drive/blocking experiments."
+        ),
+    )
+    p.add_argument(
+        "--solver-joint-attach-kd",
+        type=float,
+        default=1.0e2,
+        help=(
+            "SemiImplicit articulation attachment damping paired with --solver-joint-attach-ke for "
+            "joint_target_drive/blocking experiments."
+        ),
+    )
     p.add_argument("--gripper-open", type=float, default=0.04)
     p.add_argument("--settle-seconds", type=float, default=0.02)
     p.add_argument("--push-seconds", type=float, default=0.08)
@@ -1716,6 +1734,13 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
 
     checks = newton_import_ir.validate_ir_physics(ir_obj, cfg)
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
+    tabletop_joint_drive_requested = tabletop_task and str(args.tabletop_control_mode) == "joint_target_drive"
+    if tabletop_joint_drive_requested:
+        # SemiImplicit native articulation tracking is materially more stable on
+        # the Franka import when we use a small geometry-based armature and let
+        # Newton derive inertial properties from the imported geometry.
+        builder.default_body_armature = 0.01
+        builder.default_joint_cfg.armature = 0.01
     _, _, _ = newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts=bool(particle_contacts))
     newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
     builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
@@ -1740,6 +1765,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         enable_self_collisions=False,
         collapse_fixed_joints=True,
         force_show_colliders=False,
+        ignore_inertial_definitions=bool(tabletop_joint_drive_requested),
     )
 
     robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_task else FRANKA_INIT_Q.copy()
@@ -2210,6 +2236,8 @@ def simulate(
         model,
         angular_damping=cfg.angular_damping,
         friction_smoothing=cfg.friction_smoothing,
+        joint_attach_ke=float(args.solver_joint_attach_ke),
+        joint_attach_kd=float(args.solver_joint_attach_kd),
         enable_tri_contact=cfg.enable_tri_contact,
     )
     control = model.control() if tabletop_joint_drive_mode else None
@@ -2430,7 +2458,11 @@ def simulate(
                     state_out.joint_qd.assign(joint_target_qd)
                     newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
                 elif tabletop_joint_drive_mode:
-                    newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                    # SemiImplicit advances articulations in maximal/body coordinates.
+                    # Recover reduced coordinates from the solver-integrated body state
+                    # so diagnostics and any later consumers see the actual motion rather
+                    # than a stale pre-step joint_q snapshot.
+                    newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
                 elif tabletop_task:
                     state_out.joint_q.assign(joint_target_np)
                     state_out.joint_qd.assign(joint_target_qd)
@@ -2625,7 +2657,7 @@ def simulate(
                 state_out.joint_qd.assign(joint_target_qd)
                 newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
             elif tabletop_joint_drive_mode:
-                newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
+                newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
             else:
                 state_out.joint_q.assign(joint_target_np)
                 state_out.joint_qd.assign(joint_target_qd)
@@ -3612,6 +3644,8 @@ def build_summary(
         "visible_tool_half_height_m": (None if not visible_tool_enabled else float(meta.get("visible_tool_half_height"))),
         "visible_tool_total_length_m": (None if not visible_tool_enabled else float(meta.get("visible_tool_total_length"))),
         "ik_target_blend": float(args.ik_target_blend),
+        "solver_joint_attach_ke": float(args.solver_joint_attach_ke),
+        "solver_joint_attach_kd": float(args.solver_joint_attach_kd),
         "tabletop_control_mode": (None if not tabletop_task else str(args.tabletop_control_mode)),
         "tabletop_initial_pose": (None if not tabletop_task else str(args.tabletop_initial_pose)),
         "tabletop_robot_base_offset": (
