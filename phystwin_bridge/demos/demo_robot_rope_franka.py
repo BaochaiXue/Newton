@@ -226,6 +226,15 @@ def parse_args() -> argparse.Namespace:
         help="Controller used only for tabletop_push_hero. `joint_trajectory` is the current promoted path, `joint_target_drive` sends the same desired path through articulation targets so rigid contact can create tracking error, and `ik` remains available for bounded tabletop contact experiments.",
     )
     p.add_argument(
+        "--blocking-stage",
+        choices=["rope_integrated", "rigid_only"],
+        default="rope_integrated",
+        help=(
+            "Physical-blocking staging for tabletop_push_hero. `rigid_only` removes the rope and keeps only direct-finger vs table blocking "
+            "under the same controller truth. `rope_integrated` keeps the rope in the scene."
+        ),
+    )
+    p.add_argument(
         "--ik-target-blend",
         type=float,
         default=1.0,
@@ -375,6 +384,24 @@ def parse_args() -> argparse.Namespace:
             "SemiImplicit articulation attachment damping paired with --solver-joint-attach-ke for "
             "joint_target_drive/blocking experiments."
         ),
+    )
+    p.add_argument(
+        "--default-body-armature",
+        type=float,
+        default=0.01,
+        help="Default body armature used for stable SemiImplicit joint_target_drive/blocking runs.",
+    )
+    p.add_argument(
+        "--default-joint-armature",
+        type=float,
+        default=0.01,
+        help="Default joint armature used for stable SemiImplicit joint_target_drive/blocking runs.",
+    )
+    p.add_argument(
+        "--ignore-urdf-inertial-definitions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ignore URDF inertial definitions when using joint_target_drive so SemiImplicit derives a more stable bridge-layer Franka build.",
     )
     p.add_argument("--gripper-open", type=float, default=0.04)
     p.add_argument("--settle-seconds", type=float, default=0.02)
@@ -629,6 +656,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=6.0,
         help="Extra preroll damping scale used only while settling the tabletop hero before the recorded clip.",
+    )
+    p.add_argument(
+        "--tabletop-reset-robot-after-preroll",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After hidden tabletop preroll settle, restore the robot to the nominal initial joint pose "
+            "before the visible clip begins. This keeps rope settle hidden without letting low-gain "
+            "joint_target_drive preroll sag pre-load the robot into the table."
+        ),
     )
     p.add_argument(
         "--visible-tool-mode",
@@ -1655,6 +1692,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     raw_ir = load_ir(args.ir)
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
+    rigid_only_stage = tabletop_task and str(args.blocking_stage) == "rigid_only"
     tabletop_joint_path_mode = tabletop_task and str(args.tabletop_control_mode) in {
         "joint_trajectory",
         "joint_target_drive",
@@ -1663,19 +1701,20 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     _maybe_autoset_mass_spring_scale(args, raw_ir)
     ir_obj = _copy_object_only_ir(raw_ir, args)
 
-    n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
+    ir_n_obj = int(np.asarray(ir_obj["num_object_points"]).ravel()[0])
+    n_obj = 0 if rigid_only_stage else int(ir_n_obj)
     x0 = np.asarray(ir_obj["x0"], dtype=np.float32).copy()
     edges = np.asarray(ir_obj["spring_edges"], dtype=np.int32)
     collision_radius_arr = np.asarray(
         ir_obj.get(
             "collision_radius",
-            ir_obj.get("contact_collision_dist", np.full((n_obj,), 0.026, dtype=np.float32)),
+            ir_obj.get("contact_collision_dist", np.full((ir_n_obj,), 0.026, dtype=np.float32)),
         ),
         dtype=np.float32,
     ).reshape(-1)
     particle_radius_ref = float(collision_radius_arr[0]) if collision_radius_arr.size else 0.026
 
-    endpoint_indices = _rope_endpoints(edges, n_obj, x0)
+    endpoint_indices = _rope_endpoints(edges, ir_n_obj, x0)
     endpoint_mid = 0.5 * (x0[int(endpoint_indices[0])] + x0[int(endpoint_indices[1])])
     support_patch_indices = np.empty((0,), dtype=np.int32)
     support_patch_center = endpoint_mid.astype(np.float32, copy=False)
@@ -1690,13 +1729,13 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     )
     shifted_q = x0 + shift
     if tabletop_task and str(args.tabletop_initial_pose) in {"tabletop_curve", "tabletop_shallow_curve"}:
-        shifted_q[:n_obj] = _reshape_rope_for_tabletop(
-            shifted_q[:n_obj],
+        shifted_q[:ir_n_obj] = _reshape_rope_for_tabletop(
+            shifted_q[:ir_n_obj],
             table_top_z=float(args.tabletop_table_top_z),
             particle_radius=particle_radius_ref,
             pose_mode=str(args.tabletop_initial_pose),
         )
-    rope_center = shifted_q.mean(axis=0).astype(np.float32, copy=False)
+    rope_center = shifted_q[:ir_n_obj].mean(axis=0).astype(np.float32, copy=False)
     if drop_release_task:
         anchor_indices = _anchor_particle_indices(
             shifted_q, endpoint_indices=endpoint_indices, count_per_end=int(args.anchor_count_per_end)
@@ -1739,12 +1778,13 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         # SemiImplicit native articulation tracking is materially more stable on
         # the Franka import when we use a small geometry-based armature and let
         # Newton derive inertial properties from the imported geometry.
-        builder.default_body_armature = 0.01
-        builder.default_joint_cfg.armature = 0.01
-    _, _, _ = newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts=bool(particle_contacts))
-    newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
-    builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
-    if not tabletop_task:
+        builder.default_body_armature = float(args.default_body_armature)
+        builder.default_joint_cfg.armature = float(args.default_joint_armature)
+    if not rigid_only_stage:
+        _, _, _ = newton_import_ir._add_particles(builder, ir_obj, cfg, particle_contacts=bool(particle_contacts))
+        newton_import_ir._add_springs(builder, ir_obj, cfg, checks)
+        builder.particle_q = [wp.vec3(*row.tolist()) for row in shifted_q]
+    if not tabletop_task and not rigid_only_stage:
         for idx in anchor_indices.tolist():
             builder.particle_flags[idx] = int(builder.particle_flags[idx]) & ~int(newton.ParticleFlags.ACTIVE)
             if (not drop_release_task) and str(args.anchor_mass_mode) == "zero":
@@ -1765,7 +1805,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         enable_self_collisions=False,
         collapse_fixed_joints=True,
         force_show_colliders=False,
-        ignore_inertial_definitions=bool(tabletop_joint_drive_requested),
+        ignore_inertial_definitions=bool(tabletop_joint_drive_requested and args.ignore_urdf_inertial_definitions),
     )
 
     robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_task else FRANKA_INIT_Q.copy()
@@ -2123,6 +2163,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
             else np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         ),
         "task": str(args.task),
+        "blocking_stage": str(args.blocking_stage),
         "task_phases": task_phases,
         "mid_segment_indices": mid_segment_indices.astype(np.int32),
         "anchor_bar_center": anchor_bar_center.astype(np.float32),
@@ -2167,10 +2208,10 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "tabletop_push_focus": (
             tabletop_push_focus.astype(np.float32) if tabletop_task else rope_center.astype(np.float32)
         ),
-        "render_edges": render_edges,
+        "render_edges": (np.zeros((0, 2), dtype=np.int32) if rigid_only_stage else render_edges),
         "particle_contacts": bool(particle_contacts),
         "particle_contact_kernel": bool(particle_contact_kernel),
-        "total_object_mass": float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum()),
+        "total_object_mass": (0.0 if rigid_only_stage else float(np.asarray(ir_obj["mass"], dtype=np.float32)[:n_obj].sum())),
         "release_phase_start_s": _phase_start_time(
             task_phases,
             "release" if drop_release_task else ("retract" if tabletop_task else "release_retract"),
@@ -2206,6 +2247,7 @@ def simulate(
 ) -> dict[str, Any]:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
+    rigid_only_stage = tabletop_task and str(meta.get("blocking_stage", args.blocking_stage)) == "rigid_only"
     tabletop_joint_override_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_trajectory"
     tabletop_joint_drive_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_target_drive"
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
@@ -2326,7 +2368,11 @@ def simulate(
         replay = _load_replay_trajectory(Path(args.replay_source), n_frames=n_frames, frame_dt=frame_dt)
 
     store = RolloutStorage(args.out_dir, args.prefix, mode=str(args.history_storage))
-    particle_q0 = state_in.particle_q.numpy().astype(np.float32)
+    particle_q0 = (
+        state_in.particle_q.numpy().astype(np.float32)
+        if state_in.particle_q is not None
+        else np.zeros((0, 3), dtype=np.float32)
+    )
     body_q0 = state_in.body_q.numpy().astype(np.float32)
     body_qd0 = state_in.body_qd.numpy().astype(np.float32)
     particle_q_all = store.allocate("particle_q_all", (n_frames, particle_q0.shape[0], 3), np.float32)
@@ -2353,7 +2399,7 @@ def simulate(
     preroll_frame_count = 0
 
     if (drop_release_task and float(args.drop_preroll_settle_seconds) > 0.0) or (
-        tabletop_task and float(args.tabletop_preroll_settle_seconds) > 0.0
+        tabletop_task and (not rigid_only_stage) and float(args.tabletop_preroll_settle_seconds) > 0.0
     ):
         preroll_duration_s = (
             float(args.drop_preroll_settle_seconds)
@@ -2372,7 +2418,14 @@ def simulate(
         if tabletop_joint_override_mode or tabletop_joint_drive_mode:
             _, tabletop_preroll_joint_q = _joint_phase_state(0.0, meta)
         for preroll_frame in range(preroll_max_frames):
-            q_obj_preroll = state_in.particle_q.numpy().astype(np.float32)[:n_obj]
+            q_obj_preroll = (
+                state_in.particle_q.numpy().astype(np.float32)[:n_obj]
+                if state_in.particle_q is not None
+                else np.zeros((0, 3), dtype=np.float32)
+            )
+            if q_obj_preroll.shape[0] == 0:
+                preroll_frame_count = int(preroll_frame + 1)
+                break
             rope_com_preroll = np.mean(q_obj_preroll, axis=0).astype(np.float32, copy=False)
             if prev_q_obj_preroll is not None:
                 qd_preroll = (q_obj_preroll - prev_q_obj_preroll) / max(frame_dt, 1.0e-12)
@@ -2473,7 +2526,7 @@ def simulate(
                     newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
                 state_in, state_out = state_out, state_in
                 preroll_drag = tabletop_preroll_drag if tabletop_task else settle_drag
-                if preroll_drag > 0.0:
+                if preroll_drag > 0.0 and n_obj > 0 and state_in.particle_q is not None and state_in.particle_qd is not None:
                     if gravity_axis is not None:
                         wp.launch(
                             _apply_drag_correction_ignore_axis,
@@ -2498,33 +2551,56 @@ def simulate(
         if preroll_settle_pass is None:
             preroll_settle_pass = False
             preroll_settle_time_s = float(preroll_frame_count * frame_dt)
+        if tabletop_joint_drive_mode and bool(args.tabletop_reset_robot_after_preroll):
+            joint_reset_np = np.asarray(meta["joint_q_init"], dtype=np.float32).copy()
+            joint_reset_qd = np.zeros_like(joint_reset_np, dtype=np.float32)
+            prev_joint_q = joint_reset_np.copy()
+            for reset_state in (state_in, state_out):
+                reset_state.joint_q.assign(joint_reset_np)
+                reset_state.joint_qd.assign(joint_reset_qd)
+                newton.eval_fk(model, reset_state.joint_q, reset_state.joint_qd, reset_state)
+            if control is not None and getattr(control, "joint_target_pos", None) is not None:
+                control_joint_target_pos.assign(joint_reset_np)
+                wp.copy(dest=control.joint_target_pos, src=control_joint_target_pos)
+            if control is not None and getattr(control, "joint_target_vel", None) is not None:
+                control_joint_target_vel.zero_()
+                wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
+            if control is not None and getattr(control, "joint_f", None) is not None:
+                control.joint_f.zero_()
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
         if replay is not None:
             state_in.body_q.assign(replay["body_q"][frame])
             state_in.body_qd.assign(replay["body_qd"][frame])
-        q = state_in.particle_q.numpy().astype(np.float32)
+        q = (
+            state_in.particle_q.numpy().astype(np.float32)
+            if state_in.particle_q is not None
+            else np.zeros((0, 3), dtype=np.float32)
+        )
         particle_q_all[frame] = q
         particle_q_object[frame] = q[:n_obj]
         q_obj = particle_q_object[frame]
-        rope_com_frame = np.mean(q_obj, axis=0).astype(np.float32, copy=False)
-        support_patch_center_series[frame] = np.mean(q_obj[anchor_indices], axis=0).astype(np.float32, copy=False)
-        if prev_q_obj is not None:
-            qd_frame = (q_obj - prev_q_obj) / max(frame_dt, 1.0e-12)
-            particle_speed_mean_series[frame] = float(np.mean(np.linalg.norm(qd_frame, axis=1)))
-            if anchor_indices.size:
-                support_patch_speed_mean_series[frame] = float(np.mean(np.linalg.norm(qd_frame[anchor_indices], axis=1)))
-            com_vel = (rope_com_frame - prev_rope_com) / max(frame_dt, 1.0e-12)
-            rope_com_horizontal_speed_series[frame] = float(np.linalg.norm(com_vel[:2]))
-            rope_com_vertical_speed_series[frame] = float(com_vel[2])
-        if spring_edges.size:
-            edge_vec = q_obj[spring_edges[:, 0]] - q_obj[spring_edges[:, 1]]
-            edge_len = np.linalg.norm(edge_vec, axis=1)
-            stretch = edge_len - spring_rest
-            rope_spring_energy_proxy_series[frame] = float(np.mean(stretch * stretch))
-        prev_q_obj = q_obj.copy()
-        prev_rope_com = rope_com_frame.copy()
+        if q_obj.shape[0] > 0:
+            rope_com_frame = np.mean(q_obj, axis=0).astype(np.float32, copy=False)
+            support_patch_center_series[frame] = np.mean(q_obj[anchor_indices], axis=0).astype(np.float32, copy=False)
+            if prev_q_obj is not None:
+                qd_frame = (q_obj - prev_q_obj) / max(frame_dt, 1.0e-12)
+                particle_speed_mean_series[frame] = float(np.mean(np.linalg.norm(qd_frame, axis=1)))
+                if anchor_indices.size:
+                    support_patch_speed_mean_series[frame] = float(np.mean(np.linalg.norm(qd_frame[anchor_indices], axis=1)))
+                com_vel = (rope_com_frame - prev_rope_com) / max(frame_dt, 1.0e-12)
+                rope_com_horizontal_speed_series[frame] = float(np.linalg.norm(com_vel[:2]))
+                rope_com_vertical_speed_series[frame] = float(com_vel[2])
+            if spring_edges.size:
+                edge_vec = q_obj[spring_edges[:, 0]] - q_obj[spring_edges[:, 1]]
+                edge_len = np.linalg.norm(edge_vec, axis=1)
+                stretch = edge_len - spring_rest
+                rope_spring_energy_proxy_series[frame] = float(np.mean(stretch * stretch))
+            prev_q_obj = q_obj.copy()
+            prev_rope_com = rope_com_frame.copy()
+        else:
+            support_patch_center_series[frame] = np.asarray(meta["table_center"], dtype=np.float32)
         body_q[frame] = state_in.body_q.numpy().astype(np.float32)
         body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
         if replay is not None:
@@ -2552,16 +2628,17 @@ def simulate(
                 int(meta["right_finger_index"]),
             )
             frame_tracking_err = float(np.linalg.norm(frame_gripper_center - ee_target_pos[frame]))
-            frame_clearance, _, _ = _min_gripper_proxy_clearance(
-                q_obj,
-                particle_radius,
-                {
-                    "gripper_center": frame_gripper_center,
-                    "left_finger": body_q[frame, int(meta["left_finger_index"]), :3],
-                    "right_finger": body_q[frame, int(meta["right_finger_index"]), :3],
-                },
-                float(args.ee_contact_radius),
-            )
+            if q_obj.shape[0] > 0:
+                frame_clearance, _, _ = _min_gripper_proxy_clearance(
+                    q_obj,
+                    particle_radius,
+                    {
+                        "gripper_center": frame_gripper_center,
+                        "left_finger": body_q[frame, int(meta["left_finger_index"]), :3],
+                        "right_finger": body_q[frame, int(meta["right_finger_index"]), :3],
+                    },
+                    float(args.ee_contact_radius),
+                )
 
         for sub in range(substeps):
             state_in.clear_forces()
@@ -2672,7 +2749,7 @@ def simulate(
                     active_drag = 0.0
                 else:
                     active_drag = drag
-            if active_drag > 0.0:
+            if active_drag > 0.0 and n_obj > 0 and state_in.particle_q is not None and state_in.particle_qd is not None:
                 if gravity_axis is not None:
                     wp.launch(
                         _apply_drag_correction_ignore_axis,
@@ -2750,6 +2827,7 @@ def render_video(
 ) -> Path:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
+    rigid_only_stage = tabletop_task and str(meta.get("blocking_stage", args.blocking_stage)) == "rigid_only"
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found in PATH")
@@ -2820,7 +2898,11 @@ def render_video(
         cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
         viewer.set_camera(wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])), float(args.camera_pitch), float(args.camera_yaw))
 
-        particle_radius_sim = model.particle_radius.numpy().astype(np.float32)
+        particle_radius_sim = (
+            model.particle_radius.numpy().astype(np.float32)
+            if getattr(model, "particle_radius", None) is not None
+            else np.zeros((0,), dtype=np.float32)
+        )
         render_radii = compute_visual_particle_radii(
             particle_radius_sim,
             radius_scale=(
@@ -2903,7 +2985,8 @@ def render_video(
                 render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
 
             for out_idx, sim_idx in enumerate(render_indices):
-                state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
+                if state.particle_q is not None:
+                    state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
                 state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
 
                 sim_t = float(sim_idx) * sim_frame_dt
@@ -2928,7 +3011,7 @@ def render_video(
                 actual_tool_clearance = None
                 actual_tool_contact_source = None
                 if str(args.render_mode) == "debug":
-                    if tabletop_task and visible_tool_entry is not None:
+                    if tabletop_task and (not rigid_only_stage) and visible_tool_entry is not None:
                         actual_tool_clearance, actual_tool_contact_source = _min_capsule_clearance(
                             q_obj,
                             particle_radius,
@@ -2959,7 +3042,7 @@ def render_video(
                                     device=device,
                                 ),
                             )
-                    if tabletop_task and finger_box_entries:
+                    if tabletop_task and (not rigid_only_stage) and finger_box_entries:
                         actual_min_clearance, actual_contact_source, _ = _min_finger_box_clearance(
                             q_obj,
                             particle_radius,
@@ -3209,7 +3292,7 @@ def render_video(
                             wp.array([wp.vec3(*visible_tool_color.tolist())], dtype=wp.vec3, device=device),
                         )
 
-                if rope_edges.size and rope_line_starts_wp is not None and rope_line_ends_wp is not None:
+                if q_obj.shape[0] > 0 and rope_edges.size and rope_line_starts_wp is not None and rope_line_ends_wp is not None:
                     q_obj = sim_data["particle_q_object"][sim_idx]
                     rope_line_starts_wp.assign(q_obj[rope_edges[:, 0]].astype(np.float32, copy=False))
                     rope_line_ends_wp.assign(q_obj[rope_edges[:, 1]].astype(np.float32, copy=False))
@@ -3234,12 +3317,15 @@ def render_video(
                         speed = float(np.linalg.norm(gripper_center - prev_gripper_center) / sim_frame_dt)
                     else:
                         speed = 0.0
-                    min_clearance, min_proxy_name, _ = _min_gripper_proxy_clearance(
-                        q_obj,
-                        particle_radius,
-                        gripper_proxies,
-                        float(args.ee_contact_radius),
-                    )
+                    if q_obj.shape[0] > 0:
+                        min_clearance, min_proxy_name, _ = _min_gripper_proxy_clearance(
+                            q_obj,
+                            particle_radius,
+                            gripper_proxies,
+                            float(args.ee_contact_radius),
+                        )
+                    else:
+                        min_clearance, min_proxy_name = float("nan"), "none"
                     if tabletop_task and actual_tool_clearance is not None:
                         contact_state = "ON" if float(actual_tool_clearance) <= 0.0 else "OFF"
                         contact_line = (
@@ -3251,10 +3337,13 @@ def render_video(
                             f"contact: {contact_state} via {actual_contact_source} | actual finger-box clearance: {1000.0 * float(actual_min_clearance):.1f} mm"
                         )
                     else:
-                        contact_state = "ON" if min_clearance <= 0.0 else "OFF"
-                        contact_line = (
-                            f"contact: {contact_state} via {min_proxy_name} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm"
-                        )
+                        if q_obj.shape[0] > 0:
+                            contact_state = "ON" if min_clearance <= 0.0 else "OFF"
+                            contact_line = (
+                                f"contact: {contact_state} via {min_proxy_name} | approx gripper clearance: {1000.0 * min_clearance:.1f} mm"
+                            )
+                        else:
+                            contact_line = "contact: rope absent in rigid_only stage | direct finger vs table is audited offline"
                     tracking_line = f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s"
                     if release_time_s is not None:
                         tracking_line += f" | t_release: {float(release_time_s):.3f}s"
@@ -3297,10 +3386,59 @@ def build_summary(
 ) -> dict[str, Any]:
     drop_release_task = str(args.task) == DROP_RELEASE_TASK
     tabletop_task = str(args.task) == TABLETOP_PUSH_TASK
+    rigid_only_stage = tabletop_task and str(meta.get("blocking_stage", args.blocking_stage)) == "rigid_only"
     particle_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
     body_q = np.asarray(sim_data["body_q"], dtype=np.float32)
     body_vel = np.asarray(sim_data["body_vel"], dtype=np.float32)
     target_pos = np.asarray(sim_data["ee_target_pos"], dtype=np.float32)
+    if rigid_only_stage:
+        left_finger_idx = int(meta["left_finger_index"])
+        right_finger_idx = int(meta["right_finger_index"])
+        gripper_center = np.stack(
+            [_gripper_center_world_position(body_q[i], left_finger_idx, right_finger_idx) for i in range(body_q.shape[0])]
+        )
+        tracking_error = np.linalg.norm(gripper_center - target_pos, axis=1)
+        frame_dt = float(sim_data["sim_dt"]) * float(sim_data["substeps"])
+        gripper_speed = np.linalg.norm(np.diff(gripper_center, axis=0), axis=1) / frame_dt if body_q.shape[0] > 1 else np.zeros((1,), dtype=np.float32)
+        return {
+            "ir_path": str(args.ir.resolve()),
+            "output_mp4": str(out_mp4),
+            "frames": int(body_q.shape[0]),
+            "sim_dt": float(sim_data["sim_dt"]),
+            "substeps": int(sim_data["substeps"]),
+            "frame_dt": float(frame_dt),
+            "video_slowdown": float(args.slowdown),
+            "task_duration_s": float(_total_task_duration(args)),
+            "wall_time_sec": float(sim_data["wall_time"]),
+            "task": str(args.task),
+            "blocking_stage": "rigid_only",
+            "rope_present": False,
+            "render_mode": str(args.render_mode),
+            "camera_profile": str(args.camera_profile),
+            "recommended_hero_camera": meta["camera_presets"]["hero"],
+            "recommended_validation_camera": meta["camera_presets"]["validation"],
+            "robot_motion_mode": str(sim_data.get("robot_motion_mode", meta.get("robot_motion_mode", "ik"))),
+            "history_storage_mode": str(sim_data["history_storage_mode"]),
+            "history_storage_files": sim_data["history_storage_files"],
+            "robot_geometry": "native_franka",
+            "ee_body_index": int(meta["ee_body_index"]),
+            "visible_tool_enabled": False,
+            "tabletop_control_mode": str(args.tabletop_control_mode),
+            "tabletop_initial_pose": str(args.tabletop_initial_pose),
+            "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),
+            "gripper_center_tracking_error_max_m": float(np.max(tracking_error)),
+            "gripper_center_speed_max_m_s": float(np.max(gripper_speed)) if gripper_speed.size else 0.0,
+            "gripper_center_path_length_m": float(np.sum(np.linalg.norm(np.diff(gripper_center, axis=0), axis=1))) if body_q.shape[0] > 1 else 0.0,
+            "ground_z_m": float(meta.get("floor_z", 0.0)),
+            "table_top_z_m": float(meta.get("table_top_z")),
+            "contact_proxy_mode": "actual_finger_boxes_vs_table_box",
+            "contact_proxy_radius_m": None,
+            "contact_proxy_radii_m": {},
+            "support_contact_proxy_mode": "actual_finger_boxes_vs_table_box",
+            "support_contact_proxy_counts": {},
+            "actual_tool_contact_started": False,
+            "actual_finger_box_contact_started": False,
+        }
     particle_radius = model.particle_radius.numpy().astype(np.float32)[: particle_q.shape[1]]
     finger_box_entries = _finger_box_entries(model, meta) if tabletop_task else []
     visible_tool_entry = _visible_tool_entry(model, meta)
@@ -3623,6 +3761,7 @@ def build_summary(
         ),
         "anchor_mass_mode": str(args.anchor_mass_mode),
         "task": str(args.task),
+        "blocking_stage": (None if not tabletop_task else str(meta.get("blocking_stage", args.blocking_stage))),
         "render_mode": str(args.render_mode),
         "camera_profile": str(args.camera_profile),
         "recommended_hero_camera": meta["camera_presets"]["hero"],
@@ -3668,6 +3807,7 @@ def build_summary(
         "solver_joint_attach_kd": float(args.solver_joint_attach_kd),
         "tabletop_control_mode": (None if not tabletop_task else str(args.tabletop_control_mode)),
         "tabletop_initial_pose": (None if not tabletop_task else str(args.tabletop_initial_pose)),
+        "tabletop_reset_robot_after_preroll": (None if not tabletop_task else bool(args.tabletop_reset_robot_after_preroll)),
         "tabletop_robot_base_offset": (
             None if not tabletop_task else [float(v) for v in np.asarray(args.tabletop_robot_base_offset, dtype=np.float32)]
         ),
@@ -3886,6 +4026,16 @@ def build_physics_validation(
     args: argparse.Namespace,
     summary: dict[str, Any],
 ) -> dict[str, Any]:
+    rigid_only_stage = str(summary.get("blocking_stage", meta.get("blocking_stage", args.blocking_stage))) == "rigid_only"
+    if rigid_only_stage:
+        return {
+            "task": str(args.task),
+            "blocking_stage": "rigid_only",
+            "rope_present": False,
+            "robot_geometry": "native_franka",
+            "table_top_z_m": float(meta.get("table_top_z")),
+            "summary_contact_proxy_mode": "actual_finger_boxes_vs_table_box",
+        }
     particle_q = np.asarray(sim_data["particle_q_object"], dtype=np.float32)
     particle_radius = model.particle_radius.numpy().astype(np.float32)[: particle_q.shape[1]]
     rope_com = particle_q.mean(axis=1)
