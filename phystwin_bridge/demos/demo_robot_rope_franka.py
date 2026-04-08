@@ -786,7 +786,7 @@ def parse_args() -> argparse.Namespace:
         nargs=3,
         default=None,
         metavar=("HX", "HY", "HZ"),
-        help="Optional half-extents for the tabletop support/backstop box. If omitted, reuse the historical pedestal dimensions.",
+        help="Optional half-extents for the tabletop support/backstop box. If omitted, use the blocking-task backstop slab defaults on joint_target_drive runs and the historical pedestal dimensions otherwise.",
     )
     p.add_argument(
         "--tabletop-hero-hide-pedestal",
@@ -1733,6 +1733,43 @@ def _joint_phase_state(t: float, meta: dict[str, Any]) -> tuple[str, np.ndarray]
     return str(last["name"]), np.asarray(last["end_q"], dtype=np.float32)
 
 
+def _support_axis_name(axis_idx: int) -> str:
+    return ("x", "y", "z")[int(axis_idx)]
+
+
+def _infer_tabletop_support_axis(robot_base_center: np.ndarray, stage_center: np.ndarray) -> tuple[int, float]:
+    delta = np.asarray(stage_center, dtype=np.float32) - np.asarray(robot_base_center, dtype=np.float32)
+    delta = delta.astype(np.float32, copy=True)
+    delta[2] = 0.0
+    if float(np.max(np.abs(delta[:2]))) <= 1.0e-6:
+        return 0, 1.0
+    axis_idx = int(np.argmax(np.abs(delta[:2])))
+    sign = 1.0 if float(delta[axis_idx]) >= 0.0 else -1.0
+    return axis_idx, sign
+
+
+def _default_tabletop_support_box_geometry(
+    robot_base_center: np.ndarray,
+    robot_base_scale: np.ndarray,
+    stage_center: np.ndarray,
+    stage_scale: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    center = np.asarray(robot_base_center, dtype=np.float32).astype(np.float32, copy=True)
+    scale = np.asarray(robot_base_scale, dtype=np.float32).astype(np.float32, copy=True)
+    axis_idx, axis_sign = _infer_tabletop_support_axis(center, np.asarray(stage_center, dtype=np.float32))
+    center[axis_idx] -= float(axis_sign) * 0.16
+    scale[axis_idx] = max(0.04, float(scale[axis_idx]) - 0.08)
+    other_xy = 1 if axis_idx == 0 else 0
+    scale[other_xy] = float(np.clip(max(0.08, 0.5 * float(stage_scale[other_xy])), 0.08, 0.14))
+    scale[2] = float(np.clip(max(0.12, 0.60 * float(robot_base_scale[2])), 0.12, 0.18))
+    return center, scale, {
+        "source": "blocking_backstop_default",
+        "normal_axis_index": int(axis_idx),
+        "normal_axis": _support_axis_name(axis_idx),
+        "normal_sign": float(axis_sign),
+    }
+
+
 def _find_index_by_suffix(labels: list[str], suffix: str) -> int:
     for idx, label in enumerate(labels):
         if label.endswith(suffix):
@@ -2040,12 +2077,35 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         ],
         dtype=np.float32,
     )
-    support_box_center = robot_base_center.astype(np.float32, copy=True)
+    support_box_uses_blocking_backstop_default = bool(
+        tabletop_task and str(args.tabletop_control_mode) == "joint_target_drive"
+    )
+    if support_box_uses_blocking_backstop_default:
+        support_box_default_center, support_box_default_scale, support_box_geometry = _default_tabletop_support_box_geometry(
+            robot_base_center,
+            robot_base_scale,
+            stage_center,
+            stage_scale,
+        )
+    else:
+        support_box_default_center = robot_base_center.astype(np.float32, copy=True)
+        support_box_default_scale = robot_base_scale.astype(np.float32, copy=True)
+        support_axis_idx, support_axis_sign = _infer_tabletop_support_axis(robot_base_center, stage_center)
+        support_box_geometry = {
+            "source": "historical_pedestal_default",
+            "normal_axis_index": int(support_axis_idx),
+            "normal_axis": _support_axis_name(support_axis_idx),
+            "normal_sign": float(support_axis_sign),
+        }
+    support_box_center = support_box_default_center.astype(np.float32, copy=True)
     if args.tabletop_support_box_scale is not None:
         support_box_scale = np.asarray(args.tabletop_support_box_scale, dtype=np.float32)
+        support_box_geometry["source"] = "explicit_support_box_scale_override"
     else:
-        support_box_scale = robot_base_scale.astype(np.float32, copy=True)
+        support_box_scale = support_box_default_scale.astype(np.float32, copy=True)
     support_box_center = support_box_center + np.asarray(args.tabletop_support_box_offset, dtype=np.float32)
+    if np.linalg.norm(np.asarray(args.tabletop_support_box_offset, dtype=np.float32)) > 0.0:
+        support_box_geometry["source"] = "explicit_support_box_offset_override"
     support_box_enabled = bool(tabletop_task and str(args.tabletop_support_box_mode) != "none")
     support_box_physical = bool(tabletop_task and str(args.tabletop_support_box_mode) == "physical")
     if drop_release_task:
@@ -2261,10 +2321,16 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "robot_base_scale": robot_base_scale.astype(np.float32),
         "support_box_enabled": bool(support_box_enabled),
         "support_box_physical": bool(support_box_physical),
+        "support_box_default_center": support_box_default_center.astype(np.float32),
+        "support_box_default_scale": support_box_default_scale.astype(np.float32),
         "support_box_center": support_box_center.astype(np.float32),
         "support_box_scale": support_box_scale.astype(np.float32),
         "support_box_shape_index": support_box_shape_index,
         "support_box_shape_label": ("tabletop_support_box" if support_box_physical else None),
+        "support_box_geometry_source": str(support_box_geometry["source"]),
+        "support_box_normal_axis_index": int(support_box_geometry["normal_axis_index"]),
+        "support_box_normal_axis": str(support_box_geometry["normal_axis"]),
+        "support_box_normal_sign": float(support_box_geometry["normal_sign"]),
         "floor_center": floor_center.astype(np.float32),
         "floor_scale": floor_scale.astype(np.float32),
         "floor_z": float(floor_z),
@@ -3538,11 +3604,23 @@ def build_summary(
             "tabletop_control_mode": str(args.tabletop_control_mode),
             "tabletop_initial_pose": str(args.tabletop_initial_pose),
             "tabletop_joint_reference_family": str(args.tabletop_joint_reference_family),
+            "tabletop_settle_seconds": float(args.tabletop_settle_seconds),
+            "tabletop_approach_seconds": float(args.tabletop_approach_seconds),
+            "tabletop_push_seconds": float(args.tabletop_push_seconds),
+            "tabletop_hold_seconds": float(args.tabletop_hold_seconds),
+            "tabletop_retract_seconds": float(args.tabletop_retract_seconds),
             "tabletop_support_box_mode": str(args.tabletop_support_box_mode),
             "tabletop_support_box_offset": [float(v) for v in np.asarray(args.tabletop_support_box_offset, dtype=np.float32)],
             "tabletop_support_box_scale": [float(v) for v in np.asarray(support_box_scale, dtype=np.float32)],
             "support_box_enabled": bool(meta.get("support_box_enabled", False)),
             "support_box_physical": bool(meta.get("support_box_physical", False)),
+            "support_box_center": np.asarray(meta.get("support_box_center"), dtype=np.float32).astype(float).tolist(),
+            "support_box_default_center": np.asarray(meta.get("support_box_default_center"), dtype=np.float32).astype(float).tolist(),
+            "support_box_default_scale": np.asarray(meta.get("support_box_default_scale"), dtype=np.float32).astype(float).tolist(),
+            "support_box_geometry_source": str(meta.get("support_box_geometry_source")),
+            "support_box_normal_axis": str(meta.get("support_box_normal_axis")),
+            "support_box_normal_axis_index": int(meta.get("support_box_normal_axis_index", 0)),
+            "support_box_normal_sign": float(meta.get("support_box_normal_sign", 1.0)),
             "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),
             "gripper_center_tracking_error_max_m": float(np.max(tracking_error)),
             "gripper_center_speed_max_m_s": float(np.max(gripper_speed)) if gripper_speed.size else 0.0,
@@ -3926,6 +4004,11 @@ def build_summary(
         "tabletop_control_mode": (None if not tabletop_task else str(args.tabletop_control_mode)),
         "tabletop_initial_pose": (None if not tabletop_task else str(args.tabletop_initial_pose)),
         "tabletop_joint_reference_family": (None if not tabletop_task else str(args.tabletop_joint_reference_family)),
+        "tabletop_settle_seconds": (None if not tabletop_task else float(args.tabletop_settle_seconds)),
+        "tabletop_approach_seconds": (None if not tabletop_task else float(args.tabletop_approach_seconds)),
+        "tabletop_push_seconds": (None if not tabletop_task else float(args.tabletop_push_seconds)),
+        "tabletop_hold_seconds": (None if not tabletop_task else float(args.tabletop_hold_seconds)),
+        "tabletop_retract_seconds": (None if not tabletop_task else float(args.tabletop_retract_seconds)),
         "tabletop_support_box_mode": (None if not tabletop_task else str(args.tabletop_support_box_mode)),
         "tabletop_support_box_offset": (
             None if not tabletop_task else [float(v) for v in np.asarray(args.tabletop_support_box_offset, dtype=np.float32)]
@@ -3936,6 +4019,23 @@ def build_summary(
         "support_box_enabled": bool(meta.get("support_box_enabled", False)),
         "support_box_physical": bool(meta.get("support_box_physical", False)),
         "support_box_shape_index": meta.get("support_box_shape_index"),
+        "support_box_center": (
+            None if not tabletop_task else np.asarray(meta.get("support_box_center", [0.0, 0.0, 0.0]), dtype=np.float32).astype(float).tolist()
+        ),
+        "support_box_default_center": (
+            None if not tabletop_task else np.asarray(meta.get("support_box_default_center", [0.0, 0.0, 0.0]), dtype=np.float32).astype(float).tolist()
+        ),
+        "support_box_default_scale": (
+            None if not tabletop_task else np.asarray(meta.get("support_box_default_scale", [0.0, 0.0, 0.0]), dtype=np.float32).astype(float).tolist()
+        ),
+        "support_box_geometry_source": (None if not tabletop_task else str(meta.get("support_box_geometry_source"))),
+        "support_box_normal_axis": (None if not tabletop_task else str(meta.get("support_box_normal_axis"))),
+        "support_box_normal_axis_index": (
+            None if not tabletop_task else int(meta.get("support_box_normal_axis_index", 0))
+        ),
+        "support_box_normal_sign": (
+            None if not tabletop_task else float(meta.get("support_box_normal_sign", 1.0))
+        ),
         "tabletop_reset_robot_after_preroll": (None if not tabletop_task else bool(args.tabletop_reset_robot_after_preroll)),
         "tabletop_robot_base_offset": (
             None if not tabletop_task else [float(v) for v in np.asarray(args.tabletop_robot_base_offset, dtype=np.float32)]
