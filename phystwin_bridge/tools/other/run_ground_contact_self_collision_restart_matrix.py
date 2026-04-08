@@ -682,7 +682,7 @@ def main() -> int:
         report_path = case_dir / f"{spec.label}_rollout_report.json"
         if args.skip_existing and report_path.exists():
             report = _load_json(report_path)
-            proc = subprocess.CompletedProcess([], 0, "", "")
+            proc = subprocess.CompletedProcess([], 0 if bool(report.get("passed")) else 1, "", "")
         else:
             case_dir.mkdir(parents=True, exist_ok=True)
             cmd = _build_case_command(
@@ -706,69 +706,72 @@ def main() -> int:
         row = _collect_case_row(spec, report, proc)
         rows.append(row)
 
-        case_visual_cmd = [
-            str(args.python),
-            str(RENDER_COMPARISON),
-            "--report",
-            str(report_path),
-            "--case-dir",
-            str(derived_case_dir),
-            "--inference-pkl",
-            str(inference_slice_path),
-            "--overlay-base",
-            str(derived_overlay_root),
-            "--newton-label",
-            f"{spec.short_label} | Newton Bridge",
-            "--phystwin-label",
-            "PhysTwin Reference | Restart@137",
-            "--out-mp4",
-            str(case_dir / f"{spec.label}_cmp_2x3_labeled.mp4"),
-        ]
-        render_proc = _run_logged(
-            case_visual_cmd,
-            workdir=WORKSPACE_ROOT,
-            command_path=case_dir / "visual_command.sh",
-            log_path=case_dir / "visual.log",
-        )
-        if render_proc.returncode != 0:
-            raise RuntimeError(f"Visualization failed for {spec.label}; see {case_dir / 'visual.log'}")
-
-        gif_cmd = [
-            str(RENDER_GIF),
-            str(case_dir / f"{spec.label}_cmp_2x3_labeled.mp4"),
-            str(case_dir / f"{spec.label}_cmp_2x3_labeled.gif"),
-            str(int(args.gif_width)),
-            str(int(args.gif_fps)),
-            str(int(args.gif_max_colors)),
-        ]
-        gif_proc = _run_logged(
-            gif_cmd,
-            workdir=WORKSPACE_ROOT,
-            command_path=case_dir / "gif_command.sh",
-            log_path=case_dir / "gif.log",
-        )
-        if gif_proc.returncode != 0:
-            raise RuntimeError(f"GIF render failed for {spec.label}; see {case_dir / 'gif.log'}")
-
+        mp4_path = case_dir / f"{spec.label}_cmp_2x3_labeled.mp4"
+        gif_path = case_dir / f"{spec.label}_cmp_2x3_labeled.gif"
         snapshot_path = case_dir / f"{spec.label}_cmp_2x3_frame0.png"
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                str(case_dir / f"{spec.label}_cmp_2x3_labeled.mp4"),
-                "-vf",
-                "select=eq(n\\,0)",
-                "-vframes",
-                "1",
-                str(snapshot_path),
-            ],
-            check=True,
-            cwd=str(WORKSPACE_ROOT),
-        )
-        board_case_mp4s.append(case_dir / f"{spec.label}_cmp_2x3_labeled.mp4")
+        if not (args.skip_existing and mp4_path.exists() and gif_path.exists() and snapshot_path.exists()):
+            case_visual_cmd = [
+                str(args.python),
+                str(RENDER_COMPARISON),
+                "--report",
+                str(report_path),
+                "--case-dir",
+                str(derived_case_dir),
+                "--inference-pkl",
+                str(inference_slice_path),
+                "--overlay-base",
+                str(derived_overlay_root),
+                "--newton-label",
+                f"{spec.short_label} | Newton Bridge",
+                "--phystwin-label",
+                "PhysTwin Reference | Restart@137",
+                "--out-mp4",
+                str(mp4_path),
+            ]
+            render_proc = _run_logged(
+                case_visual_cmd,
+                workdir=WORKSPACE_ROOT,
+                command_path=case_dir / "visual_command.sh",
+                log_path=case_dir / "visual.log",
+            )
+            if render_proc.returncode != 0:
+                raise RuntimeError(f"Visualization failed for {spec.label}; see {case_dir / 'visual.log'}")
+
+            gif_cmd = [
+                str(RENDER_GIF),
+                str(mp4_path),
+                str(gif_path),
+                str(int(args.gif_width)),
+                str(int(args.gif_fps)),
+                str(int(args.gif_max_colors)),
+            ]
+            gif_proc = _run_logged(
+                gif_cmd,
+                workdir=WORKSPACE_ROOT,
+                command_path=case_dir / "gif_command.sh",
+                log_path=case_dir / "gif.log",
+            )
+            if gif_proc.returncode != 0:
+                raise RuntimeError(f"GIF render failed for {spec.label}; see {case_dir / 'gif.log'}")
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(mp4_path),
+                    "-vf",
+                    "select=eq(n\\,0)",
+                    "-vframes",
+                    "1",
+                    str(snapshot_path),
+                ],
+                check=True,
+                cwd=str(WORKSPACE_ROOT),
+            )
+        board_case_mp4s.append(mp4_path)
         board_snapshots[spec.label] = snapshot_path
         _write_text(
             case_dir / "README.md",
