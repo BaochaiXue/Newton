@@ -1758,6 +1758,7 @@ def simulate(
                     angular_damping=solver.angular_damping,
                     enable_self_collision=use_phystwin_self_contact,
                     ground_contact_law=ground_contact_law,
+                    law_isolation_mode=use_bridge_law_matrix,
                 )
             else:
                 particle_f = state_in.particle_f if state_in.particle_count else None
@@ -1783,7 +1784,7 @@ def simulate(
 
             state_in, state_out = state_out, state_in
 
-            if drag > 0.0 and ground_contact_law == GROUND_CONTACT_LAW_NATIVE:
+            if drag > 0.0 and (ground_contact_law == GROUND_CONTACT_LAW_NATIVE or use_bridge_law_matrix):
                 # PhysTwin drag is a post-step velocity damping; Newton doesn't have
                 # an equivalent built-in knob, so we apply it explicitly here.
                 # Important: this is limited to the first n_obj spring-mass object

@@ -830,6 +830,104 @@ def integrate_ground_collision_phystwin(
     )
 
 
+@wp.kernel
+def _integrate_ground_collision_phystwin_after_gravity(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    n_object: int,
+    collide_elas: float,
+    collide_fric: float,
+    dt: float,
+    gravity_mag: float,
+    reverse_factor: float,
+    particle_q_out: wp.array(dtype=wp.vec3),
+    particle_qd_out: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    x0 = particle_q[tid]
+    v0 = particle_qd[tid]
+    if tid >= n_object:
+        particle_q_out[tid] = x0
+        particle_qd_out[tid] = v0
+        return
+    if (particle_flags[tid] & newton.ParticleFlags.ACTIVE) == 0:
+        particle_q_out[tid] = x0
+        particle_qd_out[tid] = v0
+        return
+
+    gravity_step = wp.vec3(0.0, 0.0, -gravity_mag) * reverse_factor * dt
+    v_pre = v0 + gravity_step
+
+    normal = wp.vec3(0.0, 0.0, 1.0) * reverse_factor
+    x_z = x0[2]
+    v_z = v_pre[2]
+    next_x_z = (x_z + v_z * dt) * reverse_factor
+
+    if next_x_z < 0.0 and v_z * reverse_factor < -1.0e-4:
+        v_normal = wp.dot(v_pre, normal) * normal
+        v_tao = v_pre - v_normal
+        v_normal_length = wp.length(v_normal)
+        v_tao_length = wp.max(wp.length(v_tao), 1.0e-6)
+
+        clamp_collide_elas = wp.clamp(collide_elas, low=0.0, high=1.0)
+        clamp_collide_fric = wp.clamp(collide_fric, low=0.0, high=2.0)
+
+        v_normal_new = -clamp_collide_elas * v_normal
+        a = wp.max(
+            0.0,
+            1.0
+            - clamp_collide_fric
+            * (1.0 + clamp_collide_elas)
+            * v_normal_length
+            / v_tao_length,
+        )
+        v_tao_new = a * v_tao
+
+        v1 = v_normal_new + v_tao_new
+        toi = -x_z / v_z
+    else:
+        v1 = v_pre
+        toi = 0.0
+
+    particle_q_out[tid] = x0 + v_pre * toi + v1 * (dt - toi)
+    particle_qd_out[tid] = v1
+
+
+def integrate_ground_collision_phystwin_after_gravity(
+    model: Any,
+    particle_q: Any,
+    particle_qd: Any,
+    *,
+    n_object: int,
+    collide_elas: float,
+    collide_fric: float,
+    dt: float,
+    gravity_mag: float,
+    reverse_factor: float,
+    particle_q_out: Any,
+    particle_qd_out: Any,
+) -> None:
+    wp.launch(
+        kernel=_integrate_ground_collision_phystwin_after_gravity,
+        dim=model.particle_count,
+        inputs=[
+            particle_q,
+            particle_qd,
+            model.particle_flags,
+            int(n_object),
+            float(np.clip(collide_elas, 0.0, 1.0)),
+            float(np.clip(collide_fric, 0.0, 2.0)),
+            float(dt),
+            float(gravity_mag),
+            float(reverse_factor),
+        ],
+        outputs=[particle_q_out, particle_qd_out],
+        device=model.device,
+    )
+
+
 def reference_filtered_self_contact_phystwin_velocity(
     particle_x: np.ndarray,
     particle_qd: np.ndarray,

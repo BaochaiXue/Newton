@@ -180,6 +180,19 @@ TABLETOP_BLOCKING_Q_PUSH_END = np.asarray(
     [0.1299, 0.8765, 0.2067, -1.8453, 0.2722, 2.5554, 0.9594, 0.04, 0.04],
     dtype=np.float32,
 )
+TABLETOP_BLOCKING_Q_HIGH_PRE = np.asarray(
+    [0.0050, 0.2010, 0.0950, -2.3140, -0.1720, 2.4820, 0.6360, 0.04, 0.04],
+    dtype=np.float32,
+)
+TABLETOP_BLOCKING_Q_HIGH_APPROACH = np.asarray(
+    [-0.0072, 0.7012, 0.2289, -2.0749, -0.3194, 2.6258, 0.4438, 0.04, 0.04],
+    dtype=np.float32,
+)
+TABLETOP_BLOCKING_Q_UPRIGHT_PRE = FRANKA_INIT_Q.copy()
+TABLETOP_BLOCKING_Q_UPRIGHT_APPROACH = np.asarray(
+    [0.1236, 0.4046, 0.0763, -2.1651, -0.0325, 2.4765, 0.6925, 0.04, 0.04],
+    dtype=np.float32,
+)
 
 
 def _default_rope_ir() -> Path:
@@ -709,12 +722,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--tabletop-joint-reference-family",
-        choices=["accepted", "blocking_lowprofile"],
+        choices=["accepted", "blocking_lowprofile", "blocking_highclearance", "blocking_upright"],
         default="accepted",
         help=(
             "Joint-space reference family for tabletop joint-space phases. "
             "`accepted` preserves the readable tabletop baseline waypoints. "
-            "`blocking_lowprofile` uses a shallower blocking-specific family that keeps more wrist/hand clearance."
+            "`blocking_lowprofile` uses a shallower blocking-specific family that keeps more wrist/hand clearance. "
+            "`blocking_highclearance` raises the pre/approach target substantially so joint_target_drive does not fall into settle-phase table contact immediately. "
+            "`blocking_upright` uses a much more tucked FRANKA_INIT_Q-like pre-pose for gravity stability."
         ),
     )
     p.add_argument(
@@ -1705,6 +1720,14 @@ def _tabletop_joint_phase_waypoints(reference_family: str = "accepted") -> list[
         q_pre = TABLETOP_FRANKA_Q_PRE.copy()
         q_push_start = TABLETOP_BLOCKING_Q_PUSH_START.copy()
         q_push_end = TABLETOP_BLOCKING_Q_PUSH_END.copy()
+    elif str(reference_family) == "blocking_highclearance":
+        q_pre = TABLETOP_BLOCKING_Q_HIGH_PRE.copy()
+        q_push_start = TABLETOP_BLOCKING_Q_HIGH_APPROACH.copy()
+        q_push_end = TABLETOP_BLOCKING_Q_PUSH_END.copy()
+    elif str(reference_family) == "blocking_upright":
+        q_pre = TABLETOP_BLOCKING_Q_UPRIGHT_PRE.copy()
+        q_push_start = TABLETOP_BLOCKING_Q_UPRIGHT_APPROACH.copy()
+        q_push_end = TABLETOP_BLOCKING_Q_PUSH_END.copy()
     else:
         q_pre = TABLETOP_FRANKA_Q_PRE.copy()
         q_push_start = TABLETOP_FRANKA_Q_PUSH_START.copy()
@@ -1894,7 +1917,11 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         ignore_inertial_definitions=bool(tabletop_joint_drive_requested and args.ignore_urdf_inertial_definitions),
     )
 
-    robot_joint_init = TABLETOP_FRANKA_Q_PRE.copy() if tabletop_task else FRANKA_INIT_Q.copy()
+    if tabletop_task:
+        tabletop_joint_waypoints = _tabletop_joint_phase_waypoints(str(args.tabletop_joint_reference_family))
+        robot_joint_init = np.asarray(tabletop_joint_waypoints[0]["start_q"], dtype=np.float32).copy()
+    else:
+        robot_joint_init = FRANKA_INIT_Q.copy()
     builder.joint_q[:9] = robot_joint_init.tolist()
     builder.joint_target_pos[:9] = robot_joint_init.tolist()
     builder.joint_target_ke[:7] = [float(args.joint_target_ke)] * 7

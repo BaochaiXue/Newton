@@ -33,6 +33,7 @@ from self_contact_bridge_kernels import (  # noqa: E402
     apply_self_collision_phystwin_velocity,
     build_potential_self_collision_table,
     build_filtered_self_contact_tables,
+    integrate_ground_collision_phystwin_after_gravity,
     integrate_ground_collision_phystwin,
     sort_self_collision_table_rows,
     update_vel_from_force_phystwin,
@@ -408,6 +409,7 @@ def step_strict_phystwin_contact_stack(
     angular_damping: float = 0.0,
     enable_self_collision: bool = True,
     ground_contact_law: str = GROUND_CONTACT_LAW_PHYSTWIN,
+    law_isolation_mode: bool = False,
 ) -> None:
     """Run one strict PhysTwin-style substep for the cloth parity scene."""
 
@@ -448,6 +450,119 @@ def step_strict_phystwin_contact_stack(
             joint_attach_ke,
             joint_attach_kd,
         )
+
+    if law_isolation_mode:
+        apply_velocity_update_from_force(model, state_in, dt=float(sim_dt))
+        wp.launch(
+            kernel=_copy_vec3_buffer,
+            dim=model.particle_count,
+            inputs=[state_in.particle_qd, int(model.particle_count)],
+            outputs=[ctx.qd_after_force],
+            device=model.device,
+        )
+
+        if enable_self_collision:
+            if ctx.freeze_collision_table:
+                assert ctx.collision_indices is not None
+                assert ctx.collision_number is not None
+                apply_self_collision_phystwin_velocity_from_table(
+                    device=model.device,
+                    particle_count=model.particle_count,
+                    particle_x=state_in.particle_q,
+                    particle_qd=state_in.particle_qd,
+                    particle_mass=model.particle_mass,
+                    particle_flags=model.particle_flags,
+                    n_object=ctx.n_object,
+                    collision_indices=ctx.collision_indices,
+                    collision_number=ctx.collision_number,
+                    collision_table_capacity=ctx.collision_table_capacity,
+                    collision_dist=float(ctx.collision_dist),
+                    collide_elas=float(ctx.collide_elas),
+                    collide_fric=float(ctx.collide_fric),
+                    particle_qd_out=ctx.qd_after_collision,
+                )
+            else:
+                apply_self_collision_phystwin_velocity(
+                    device=model.device,
+                    particle_count=model.particle_count,
+                    particle_x=state_in.particle_q,
+                    particle_qd=state_in.particle_qd,
+                    particle_mass=model.particle_mass,
+                    particle_flags=model.particle_flags,
+                    grid=ctx.particle_grid,
+                    neighbor_table=ctx.neighbor_table,
+                    neighbor_count=ctx.neighbor_count,
+                    collision_dist=float(ctx.collision_dist),
+                    collide_elas=float(ctx.collide_elas),
+                    collide_fric=float(ctx.collide_fric),
+                    particle_qd_out=ctx.qd_after_collision,
+                )
+        else:
+            wp.launch(
+                kernel=_copy_vec3_buffer,
+                dim=model.particle_count,
+                inputs=[state_in.particle_qd, int(model.particle_count)],
+                outputs=[ctx.qd_after_collision],
+                device=model.device,
+            )
+
+        if ground_contact_law == GROUND_CONTACT_LAW_PHYSTWIN:
+            integrate_ground_collision_phystwin_after_gravity(
+                model,
+                particle_q=state_in.particle_q,
+                particle_qd=ctx.qd_after_collision,
+                n_object=ctx.n_object,
+                collide_elas=float(ctx.ground_collide_elas),
+                collide_fric=float(ctx.ground_collide_fric),
+                dt=float(sim_dt),
+                gravity_mag=float(ctx.gravity_mag),
+                reverse_factor=float(ctx.reverse_factor),
+                particle_q_out=state_out.particle_q,
+                particle_qd_out=state_out.particle_qd,
+            )
+            return
+        if ground_contact_law != GROUND_CONTACT_LAW_NATIVE:
+            raise ValueError(f"Unsupported ground_contact_law={ground_contact_law!r}")
+        if solver is None:
+            raise RuntimeError("Native ground-contact law requires a solver instance.")
+        if contacts is None:
+            raise RuntimeError("Native ground-contact law requires built contacts.")
+
+        wp.launch(
+            kernel=_copy_vec3_buffer,
+            dim=model.particle_count,
+            inputs=[ctx.qd_after_collision, int(model.particle_count)],
+            outputs=[state_in.particle_qd],
+            device=model.device,
+        )
+        state_in.clear_forces()
+
+        eval_body_contact_forces(
+            model,
+            state_in,
+            contacts,
+            friction_smoothing=float(friction_smoothing),
+            body_f_out=body_f_work,
+        )
+        eval_particle_body_contact_forces(
+            model,
+            state_in,
+            contacts,
+            particle_f,
+            body_f_work,
+            body_f_in_world_frame=False,
+        )
+
+        solver.integrate_particles(model, state_in, state_out, float(sim_dt))
+        if model.body_count:
+            if body_f_work is body_f:
+                solver.integrate_bodies(model, state_in, state_out, float(sim_dt), float(angular_damping))
+            else:
+                body_f_prev = state_in.body_f
+                state_in.body_f = body_f_work
+                solver.integrate_bodies(model, state_in, state_out, float(sim_dt), float(angular_damping))
+                state_in.body_f = body_f_prev
+        return
 
     if ground_contact_law == GROUND_CONTACT_LAW_PHYSTWIN:
         update_vel_from_force_phystwin(
