@@ -1759,9 +1759,6 @@ def _default_tabletop_support_box_geometry(
     axis_idx, axis_sign = _infer_tabletop_support_axis(center, np.asarray(stage_center, dtype=np.float32))
     center[axis_idx] -= float(axis_sign) * 0.16
     scale[axis_idx] = max(0.04, float(scale[axis_idx]) - 0.08)
-    other_xy = 1 if axis_idx == 0 else 0
-    scale[other_xy] = float(np.clip(max(0.08, 0.5 * float(stage_scale[other_xy])), 0.08, 0.14))
-    scale[2] = float(np.clip(max(0.12, 0.60 * float(robot_base_scale[2])), 0.12, 0.18))
     return center, scale, {
         "source": "blocking_backstop_default",
         "normal_axis_index": int(axis_idx),
