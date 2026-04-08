@@ -44,6 +44,39 @@ DEFAULT_TABLE_COLOR = np.asarray([0.56, 0.46, 0.34], dtype=np.float32)
 DEFAULT_FLOOR_COLOR = np.asarray([0.24, 0.22, 0.19], dtype=np.float32)
 
 
+def _enable_franka_gravity_comp(builder: newton.ModelBuilder) -> None:
+    gravcomp_attr = builder.custom_attributes.get("mujoco:jnt_actgravcomp")
+    gravcomp_body = builder.custom_attributes.get("mujoco:gravcomp")
+    if gravcomp_attr is None or gravcomp_body is None:
+        return
+    if gravcomp_attr.values is None:
+        gravcomp_attr.values = {}
+    for dof_idx in range(7):
+        gravcomp_attr.values[dof_idx] = True
+    if gravcomp_body.values is None:
+        gravcomp_body.values = {}
+    for body_idx, body_label in enumerate(builder.body_label):
+        label = str(body_label)
+        if any(
+            label.endswith(suffix)
+            for suffix in (
+                "/fr3_link1",
+                "/fr3_link2",
+                "/fr3_link3",
+                "/fr3_link4",
+                "/fr3_link5",
+                "/fr3_link6",
+                "/fr3_link7",
+                "/fr3_link8",
+                "/fr3_hand",
+                "/fr3_hand_tcp",
+                "/fr3_leftfinger",
+                "/fr3_rightfinger",
+            )
+        ):
+            gravcomp_body.values[body_idx] = 1.0
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Minimal native Newton articulated robot-table physical blocking benchmark.")
     p.add_argument("--out-dir", type=Path, required=True)
@@ -57,16 +90,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--screen-height", type=int, default=720)
     p.add_argument("--render-fps", type=float, default=30.0)
     p.add_argument("--viewer-headless", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--skip-render", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--joint-target-ke", type=float, default=200.0)
-    p.add_argument("--joint-target-kd", type=float, default=20.0)
-    p.add_argument("--finger-target-ke", type=float, default=20.0)
-    p.add_argument("--finger-target-kd", type=float, default=2.0)
+    p.add_argument("--solver-type", choices=["semiimplicit", "mujoco"], default="mujoco")
+    p.add_argument("--joint-target-ke", type=float, default=400.0)
+    p.add_argument("--joint-target-kd", type=float, default=40.0)
+    p.add_argument("--finger-target-ke", type=float, default=100.0)
+    p.add_argument("--finger-target-kd", type=float, default=10.0)
     p.add_argument("--solver-joint-attach-ke", type=float, default=400.0)
     p.add_argument("--solver-joint-attach-kd", type=float, default=5.0)
     p.add_argument("--default-body-armature", type=float, default=0.01)
     p.add_argument("--default-joint-armature", type=float, default=0.01)
-    p.add_argument("--ignore-urdf-inertial-definitions", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--ignore-urdf-inertial-definitions", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--enable-gravcomp", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--gripper-open", type=float, default=0.04)
     p.add_argument("--ik-iters", type=int, default=24)
     p.add_argument("--ik-target-blend", type=float, default=0.10)
@@ -144,6 +180,8 @@ def _camera_spec(args: argparse.Namespace, profile: str) -> tuple[np.ndarray, fl
 
 def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, dict[str, Any]]:
     builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=-float(args.gravity_mag))
+    if str(args.solver_type) == "mujoco":
+        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
     builder.default_body_armature = float(args.default_body_armature)
     builder.default_joint_cfg.armature = float(args.default_joint_armature)
 
@@ -201,6 +239,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     builder.joint_armature[7:9] = [0.15] * 2
     builder.joint_effort_limit[:7] = [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
     builder.joint_effort_limit[7:9] = [20.0, 20.0]
+    if str(args.solver_type) == "mujoco" and bool(args.enable_gravcomp):
+        _enable_franka_gravity_comp(builder)
 
     ee_body_index = _find_index_by_suffix(builder.body_label, "/fr3_link7")
     left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
@@ -234,6 +274,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "visible_tool_enabled": True,
         "solver_joint_attach_ke": float(args.solver_joint_attach_ke),
         "solver_joint_attach_kd": float(args.solver_joint_attach_kd),
+        "solver_type": str(args.solver_type),
+        "enable_gravcomp": bool(args.enable_gravcomp),
         "default_body_armature": float(args.default_body_armature),
         "default_joint_armature": float(args.default_joint_armature),
         "ignore_urdf_inertial_definitions": bool(args.ignore_urdf_inertial_definitions),
@@ -265,15 +307,30 @@ def simulate(model: newton.Model, meta: dict[str, Any], args: argparse.Namespace
     frame_dt = float(args.sim_dt) * float(args.substeps)
     n_frames = max(2, int(np.ceil(total_duration / max(frame_dt, 1.0e-12))) + 1)
 
-    solver = newton.solvers.SolverSemiImplicit(
-        model,
-        angular_damping=0.05,
-        friction_smoothing=1.0,
-        joint_attach_ke=float(args.solver_joint_attach_ke),
-        joint_attach_kd=float(args.solver_joint_attach_kd),
-    )
+    if str(args.solver_type) == "mujoco":
+        solver = newton.solvers.SolverMuJoCo(
+            model,
+            solver="newton",
+            integrator="implicitfast",
+            iterations=15,
+            ls_iterations=100,
+            nconmax=4000,
+            njmax=8000,
+            cone="elliptic",
+            impratio=50.0,
+            use_mujoco_contacts=False,
+        )
+    else:
+        solver = newton.solvers.SolverSemiImplicit(
+            model,
+            angular_damping=0.05,
+            friction_smoothing=1.0,
+            joint_attach_ke=float(args.solver_joint_attach_ke),
+            joint_attach_kd=float(args.solver_joint_attach_kd),
+        )
     control = model.control(clone_variables=False)
-    contacts = model.contacts()
+    collision_pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
+    contacts = collision_pipeline.contacts()
     state_in = model.state()
     state_out = model.state()
 
@@ -340,9 +397,10 @@ def simulate(model: newton.Model, meta: dict[str, Any], args: argparse.Namespace
 
         for _ in range(int(args.substeps)):
             state_in.clear_forces()
-            model.collide(state_in, contacts)
+            collision_pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, control, contacts, float(args.sim_dt))
-            newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
+            if str(args.solver_type) == "semiimplicit":
+                newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
             state_in, state_out = state_out, state_in
 
         body_q_frame = state_in.body_q.numpy().astype(np.float32, copy=False)
@@ -676,10 +734,16 @@ def main() -> int:
     model, meta = build_model(args, args.device)
     sim_data = simulate(model, meta, args, args.device)
 
-    presentation = render_video(model, sim_data, meta, args, profile="hero", out_path=args.out_dir / "hero_presentation.mp4", debug_overlay=False, geometry_overlay=False)
-    debug = render_video(model, sim_data, meta, args, profile="hero", out_path=args.out_dir / "hero_debug.mp4", debug_overlay=True, geometry_overlay=False)
-    validation = render_video(model, sim_data, meta, args, profile="validation", out_path=args.out_dir / "validation_camera.mp4", debug_overlay=True, geometry_overlay=False)
-    geometry_overlay = render_video(model, sim_data, meta, args, profile="overlay", out_path=args.out_dir / "geometry_overlay_debug.mp4", debug_overlay=True, geometry_overlay=True)
+    if bool(args.skip_render):
+        presentation = args.out_dir / "hero_presentation.mp4"
+        debug = args.out_dir / "hero_debug.mp4"
+        validation = args.out_dir / "validation_camera.mp4"
+        geometry_overlay = args.out_dir / "geometry_overlay_debug.mp4"
+    else:
+        presentation = render_video(model, sim_data, meta, args, profile="hero", out_path=args.out_dir / "hero_presentation.mp4", debug_overlay=False, geometry_overlay=False)
+        debug = render_video(model, sim_data, meta, args, profile="hero", out_path=args.out_dir / "hero_debug.mp4", debug_overlay=True, geometry_overlay=False)
+        validation = render_video(model, sim_data, meta, args, profile="validation", out_path=args.out_dir / "validation_camera.mp4", debug_overlay=True, geometry_overlay=False)
+        geometry_overlay = render_video(model, sim_data, meta, args, profile="overlay", out_path=args.out_dir / "geometry_overlay_debug.mp4", debug_overlay=True, geometry_overlay=True)
 
     robot_table_contact_report, ee_target_vs_actual_report, penetration_report, geometry_truth = build_reports(sim_data, meta, args)
     summary = {
@@ -693,6 +757,8 @@ def main() -> int:
         "visible_tool_enabled": True,
         "visible_tool_radius_m": float(meta["visible_tool_radius"]),
         "visible_tool_half_height_m": float(meta["visible_tool_half_height"]),
+        "solver_type": str(meta["solver_type"]),
+        "enable_gravcomp": bool(meta["enable_gravcomp"]),
         "solver_joint_attach_ke": float(meta["solver_joint_attach_ke"]),
         "solver_joint_attach_kd": float(meta["solver_joint_attach_kd"]),
         "default_body_armature": float(meta["default_body_armature"]),

@@ -195,6 +195,39 @@ TABLETOP_BLOCKING_Q_UPRIGHT_APPROACH = np.asarray(
 )
 
 
+def _enable_franka_gravity_comp(builder: newton.ModelBuilder) -> None:
+    gravcomp_attr = builder.custom_attributes.get("mujoco:jnt_actgravcomp")
+    gravcomp_body = builder.custom_attributes.get("mujoco:gravcomp")
+    if gravcomp_attr is None or gravcomp_body is None:
+        return
+    if gravcomp_attr.values is None:
+        gravcomp_attr.values = {}
+    for dof_idx in range(7):
+        gravcomp_attr.values[dof_idx] = True
+    if gravcomp_body.values is None:
+        gravcomp_body.values = {}
+    for body_idx, body_label in enumerate(builder.body_label):
+        label = str(body_label)
+        if any(
+            label.endswith(suffix)
+            for suffix in (
+                "/fr3_link1",
+                "/fr3_link2",
+                "/fr3_link3",
+                "/fr3_link4",
+                "/fr3_link5",
+                "/fr3_link6",
+                "/fr3_link7",
+                "/fr3_link8",
+                "/fr3_hand",
+                "/fr3_hand_tcp",
+                "/fr3_leftfinger",
+                "/fr3_rightfinger",
+            )
+        ):
+            gravcomp_body.values[body_idx] = 1.0
+
+
 def _default_rope_ir() -> Path:
     return BRIDGE_ROOT / "ir" / "rope_double_hand" / "phystwin_ir_v2_bf_strict.npz"
 
@@ -207,6 +240,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--prefix", default="robot_push_rope_franka")
     p.add_argument("--device", default=path_defaults.default_device())
+    p.add_argument("--solver-type", choices=["semiimplicit", "mujoco"], default="semiimplicit")
+    p.add_argument("--enable-gravcomp", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument(
         "--task",
         choices=["lift_release", "push_probe", "drop_release_baseline", TABLETOP_PUSH_TASK],
@@ -242,9 +277,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--tabletop-control-mode",
-        choices=["ik", "joint_trajectory", "joint_target_drive"],
+        choices=["ik", "joint_trajectory", "joint_target_drive", "hybrid_blocking"],
         default="joint_trajectory",
-        help="Controller used only for tabletop_push_hero. `joint_trajectory` is the current promoted path, `joint_target_drive` sends the same desired path through articulation targets so rigid contact can create tracking error, and `ik` remains available for bounded tabletop contact experiments.",
+        help="Controller used only for tabletop_push_hero. `joint_trajectory` is the promoted kinematic path, `joint_target_drive` sends the same desired path through articulation targets so rigid contact can create tracking error, `hybrid_blocking` keeps settle/approach kinematic then switches to joint_target_drive for push/hold/retract, and `ik` remains available for bounded tabletop contact experiments.",
     )
     p.add_argument(
         "--blocking-stage",
@@ -404,6 +439,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "SemiImplicit articulation attachment damping paired with --solver-joint-attach-ke for "
             "joint_target_drive/blocking experiments."
+        ),
+    )
+    p.add_argument(
+        "--joint-gravity-comp-scale",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional bridge-side gravity compensation scale for articulated robot joints. "
+            "0 disables it; positive values apply approximate J^T * m * g feedforward through control.joint_f."
         ),
     )
     p.add_argument(
@@ -754,6 +798,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--screen-width", type=int, default=1920)
     p.add_argument("--screen-height", type=int, default=1080)
     p.add_argument("--viewer-headless", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--skip-render", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument(
         "--camera-pos",
         type=float,
@@ -764,6 +809,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera-pitch", type=float, default=None)
     p.add_argument("--camera-yaw", type=float, default=None)
     p.add_argument("--camera-fov", type=float, default=None)
+    p.add_argument(
+        "--camera-track-mode",
+        choices=["none", "tabletop_follow"],
+        default="none",
+        help="Optional render-time camera tracking. `tabletop_follow` keeps a static viewing angle but translates the camera with the tabletop robot/rope working set.",
+    )
     p.add_argument(
         "--particle-radius-vis-scale",
         type=float,
@@ -1760,6 +1811,77 @@ def _support_axis_name(axis_idx: int) -> str:
     return ("x", "y", "z")[int(axis_idx)]
 
 
+def _quat_rotate_vec_np(q_xyzw: np.ndarray, v: np.ndarray) -> np.ndarray:
+    q = np.asarray(q_xyzw, dtype=np.float32)
+    vec = np.asarray(v, dtype=np.float32)
+    q_xyz = q[:3]
+    qw = float(q[3])
+    t = 2.0 * np.cross(q_xyz, vec)
+    return vec + qw * t + np.cross(q_xyz, t)
+
+
+def _approx_articulation_gravity_comp_torque(
+    model: newton.Model,
+    state: newton.State,
+    gravity_vec: np.ndarray,
+    *,
+    scale: float,
+    J_buf: wp.array | None = None,
+    joint_S_buf: wp.array | None = None,
+) -> np.ndarray | None:
+    if scale == 0.0 or model.articulation_count == 0:
+        return None
+
+    J = newton.eval_jacobian(model, state, J=J_buf, joint_S_s=joint_S_buf)
+    if J is None:
+        return None
+
+    J_np = J.numpy()
+    body_q_np = state.body_q.numpy().astype(np.float32, copy=False)
+    body_com_np = model.body_com.numpy().astype(np.float32, copy=False)
+    body_mass_np = model.body_mass.numpy().astype(np.float32, copy=False)
+    joint_child_np = model.joint_child.numpy().astype(np.int32, copy=False)
+    articulation_start_np = model.articulation_start.numpy().astype(np.int32, copy=False)
+    joint_qd_start_np = model.joint_qd_start.numpy().astype(np.int32, copy=False)
+
+    gravity_vec = np.asarray(gravity_vec, dtype=np.float32)
+    tau = np.zeros((model.joint_dof_count,), dtype=np.float32)
+
+    for art_idx in range(model.articulation_count):
+        joint_begin = int(articulation_start_np[art_idx])
+        joint_end = int(articulation_start_np[art_idx + 1])
+        if joint_end <= joint_begin:
+            continue
+        dof_begin = int(joint_qd_start_np[joint_begin])
+        dof_end = int(joint_qd_start_np[joint_end])
+        art_tau = np.zeros((dof_end - dof_begin,), dtype=np.float32)
+
+        for local_idx, joint_idx in enumerate(range(joint_begin, joint_end)):
+            body_idx = int(joint_child_np[joint_idx])
+            if body_idx < 0:
+                continue
+            mass = float(body_mass_np[body_idx])
+            if mass <= 0.0:
+                continue
+
+            body_q = np.asarray(body_q_np[body_idx], dtype=np.float32)
+            body_pos = body_q[:3]
+            body_quat = body_q[3:7]
+            com_local = np.asarray(body_com_np[body_idx], dtype=np.float32)
+            r = _quat_rotate_vec_np(body_quat, com_local)
+            f_gravity = mass * gravity_vec
+            tau_gravity = np.cross(r, f_gravity)
+
+            row_base = local_idx * 6
+            J_lin = J_np[art_idx, row_base : row_base + 3, : (dof_end - dof_begin)]
+            J_ang = J_np[art_idx, row_base + 3 : row_base + 6, : (dof_end - dof_begin)]
+            art_tau += J_lin.T @ (-f_gravity) + J_ang.T @ (-tau_gravity)
+
+        tau[dof_begin:dof_end] += art_tau
+
+    return (float(scale) * tau).astype(np.float32, copy=False)
+
+
 def _infer_tabletop_support_axis(robot_base_center: np.ndarray, stage_center: np.ndarray) -> tuple[int, float]:
     delta = np.asarray(stage_center, dtype=np.float32) - np.asarray(robot_base_center, dtype=np.float32)
     delta = delta.astype(np.float32, copy=True)
@@ -1805,6 +1927,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     tabletop_joint_path_mode = tabletop_task and str(args.tabletop_control_mode) in {
         "joint_trajectory",
         "joint_target_drive",
+        "hybrid_blocking",
     }
     _validate_scaling_args(args)
     _maybe_autoset_mass_spring_scale(args, raw_ir)
@@ -1882,7 +2005,9 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
 
     checks = newton_import_ir.validate_ir_physics(ir_obj, cfg)
     builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
-    tabletop_joint_drive_requested = tabletop_task and str(args.tabletop_control_mode) == "joint_target_drive"
+    if tabletop_task and str(args.solver_type) == "mujoco":
+        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
+    tabletop_joint_drive_requested = tabletop_task and str(args.tabletop_control_mode) in {"joint_target_drive", "hybrid_blocking"}
     if tabletop_joint_drive_requested:
         # SemiImplicit native articulation tracking is materially more stable on
         # the Franka import when we use a small geometry-based armature and let
@@ -1933,6 +2058,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     builder.joint_armature[7:9] = [0.15] * 2
     builder.joint_effort_limit[:7] = [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
     builder.joint_effort_limit[7:9] = [20.0, 20.0]
+    if tabletop_task and str(args.solver_type) == "mujoco" and bool(args.enable_gravcomp):
+        _enable_franka_gravity_comp(builder)
 
     ee_body_index = _find_index_by_suffix(builder.body_label, "/fr3_link7")
     left_finger_index = _find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
@@ -2303,6 +2430,8 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
     meta = {
         "robot_geometry": "native_franka",
         "robot_motion_mode": str(args.robot_motion_mode),
+        "solver_type": str(args.solver_type),
+        "enable_gravcomp": bool(args.enable_gravcomp),
         "robot_base_pos": robot_base_pos.astype(np.float32),
         "ee_body_index": int(ee_body_index),
         "left_finger_index": int(left_finger_index),
@@ -2435,6 +2564,10 @@ def simulate(
     rigid_only_stage = tabletop_task and str(meta.get("blocking_stage", args.blocking_stage)) == "rigid_only"
     tabletop_joint_override_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_trajectory"
     tabletop_joint_drive_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "joint_target_drive"
+    tabletop_joint_hybrid_mode = tabletop_task and str(meta.get("tabletop_control_mode")) == "hybrid_blocking"
+
+    def _hybrid_uses_drive(phase_name: str) -> bool:
+        return bool(tabletop_joint_hybrid_mode and phase_name in {"push", "hold", "retract"})
     spring_ke_scale, spring_kd_scale = _effective_spring_scales(ir_obj, args)
     particle_contacts, particle_contact_kernel = _resolve_particle_contact_settings(ir_obj, args)
     cfg = newton_import_ir.SimConfig(
@@ -2459,20 +2592,41 @@ def simulate(
         device=device,
     )
 
-    solver = newton.solvers.SolverSemiImplicit(
-        model,
-        angular_damping=cfg.angular_damping,
-        friction_smoothing=cfg.friction_smoothing,
-        joint_attach_ke=float(args.solver_joint_attach_ke),
-        joint_attach_kd=float(args.solver_joint_attach_kd),
-        enable_tri_contact=cfg.enable_tri_contact,
-    )
-    control = model.control() if tabletop_joint_drive_mode else None
+    if str(args.solver_type) == "mujoco":
+        solver = newton.solvers.SolverMuJoCo(
+            model,
+            solver="newton",
+            integrator="implicitfast",
+            iterations=15,
+            ls_iterations=100,
+            nconmax=8000,
+            njmax=16000,
+            cone="elliptic",
+            impratio=50.0,
+            use_mujoco_contacts=False,
+        )
+    else:
+        solver = newton.solvers.SolverSemiImplicit(
+            model,
+            angular_damping=cfg.angular_damping,
+            friction_smoothing=cfg.friction_smoothing,
+            joint_attach_ke=float(args.solver_joint_attach_ke),
+            joint_attach_kd=float(args.solver_joint_attach_kd),
+            enable_tri_contact=cfg.enable_tri_contact,
+        )
+    control = model.control() if (tabletop_joint_drive_mode or tabletop_joint_hybrid_mode) else None
     control_joint_target_pos = None
     control_joint_target_vel = None
+    control_joint_f = None
     state_in = model.state()
     state_out = model.state()
-    contacts = model.contacts() if newton_import_ir._use_collision_pipeline(cfg, ir_obj) else None
+    use_collision_pipeline = newton_import_ir._use_collision_pipeline(cfg, ir_obj)
+    collision_pipeline = newton.CollisionPipeline(model, broad_phase="explicit") if (use_collision_pipeline or str(args.solver_type) == "mujoco") else None
+    contacts = (
+        collision_pipeline.contacts()
+        if collision_pipeline is not None
+        else (model.contacts() if use_collision_pipeline else None)
+    )
     prev_joint_q = np.asarray(meta["joint_q_init"], dtype=np.float32).copy()
     state_in.joint_q.assign(prev_joint_q)
     state_in.joint_qd.zero_()
@@ -2481,6 +2635,8 @@ def simulate(
         control_joint_target_pos = wp.zeros(control.joint_target_pos.shape, dtype=wp.float32, device=device)
     if control is not None and getattr(control, "joint_target_vel", None) is not None:
         control_joint_target_vel = wp.zeros(control.joint_target_vel.shape, dtype=wp.float32, device=device)
+    if control is not None and getattr(control, "joint_f", None) is not None:
+        control_joint_f = wp.zeros(control.joint_f.shape, dtype=wp.float32, device=device)
     if control is not None and getattr(control, "joint_target_pos", None) is not None:
         control_joint_target_pos.assign(prev_joint_q.astype(np.float32))
         wp.copy(dest=control.joint_target_pos, src=control_joint_target_pos)
@@ -2488,7 +2644,20 @@ def simulate(
         control_joint_target_vel.zero_()
         wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
     if control is not None and getattr(control, "joint_f", None) is not None:
-        control.joint_f.zero_()
+        control_joint_f.zero_()
+        wp.copy(dest=control.joint_f, src=control_joint_f)
+
+    gravity_vec_np = np.asarray(newton_import_ir.resolve_gravity(cfg, ir_obj)[1], dtype=np.float32)
+    joint_gravity_comp_scale = float(args.joint_gravity_comp_scale)
+    jacobian_buf = None
+    joint_S_buf = None
+    if joint_gravity_comp_scale != 0.0 and (tabletop_joint_drive_mode or tabletop_joint_hybrid_mode):
+        jacobian_buf = wp.empty(
+            (model.articulation_count, model.max_joints_per_articulation * 6, model.max_dofs_per_articulation),
+            dtype=float,
+            device=device,
+        )
+        joint_S_buf = wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device=device)
 
     sim_dt = float(args.sim_dt) if args.sim_dt is not None else float(newton_import_ir.ir_scalar(ir_obj, "sim_dt"))
     substeps = max(1, int(args.substeps))
@@ -2501,17 +2670,16 @@ def simulate(
     tabletop_preroll_drag = 0.0
     if tabletop_task and "drag_damping" in ir_obj:
         tabletop_preroll_drag = float(newton_import_ir.ir_scalar(ir_obj, "drag_damping")) * float(args.tabletop_preroll_damping_scale)
-    _, gravity_vec = newton_import_ir.resolve_gravity(cfg, ir_obj)
     gravity_axis = None
-    gravity_norm = float(np.linalg.norm(gravity_vec))
+    gravity_norm = float(np.linalg.norm(gravity_vec_np))
     if bool(args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
-        gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
+        gravity_axis = (-gravity_vec_np / gravity_norm).astype(np.float32)
 
     ik_joint_q = None
     pos_obj = None
     rot_obj = None
     ik_solver = None
-    if not (tabletop_joint_override_mode or tabletop_joint_drive_mode):
+    if not (tabletop_joint_override_mode or tabletop_joint_drive_mode or tabletop_joint_hybrid_mode):
         ik_joint_q = wp.array(np.asarray(meta["joint_q_init"], dtype=np.float32).reshape(1, -1), dtype=wp.float32, device=device)
         pos_obj = ik.IKObjectivePosition(
             link_index=int(meta.get("ik_reference_body_index", meta["ee_body_index"])),
@@ -2600,7 +2768,7 @@ def simulate(
         preroll_target_pos = np.asarray(meta["task_phases"][0]["end"], dtype=np.float32)
         preroll_target_quat = np.asarray(meta["ee_target_quat"], dtype=np.float32)
         tabletop_preroll_joint_q = None
-        if tabletop_joint_override_mode or tabletop_joint_drive_mode:
+        if tabletop_joint_override_mode or tabletop_joint_drive_mode or tabletop_joint_hybrid_mode:
             _, tabletop_preroll_joint_q = _joint_phase_state(0.0, meta)
         for preroll_frame in range(preroll_max_frames):
             q_obj_preroll = (
@@ -2654,7 +2822,7 @@ def simulate(
 
             for _ in range(substeps):
                 state_in.clear_forces()
-                if tabletop_joint_override_mode:
+                if tabletop_joint_override_mode or tabletop_joint_hybrid_mode:
                     joint_target_np = np.asarray(tabletop_preroll_joint_q, dtype=np.float32).copy()
                     joint_target_np[7:9] = float(args.gripper_open)
                     joint_target_qd = np.zeros_like(joint_target_np, dtype=np.float32)
@@ -2673,7 +2841,22 @@ def simulate(
                         control_joint_target_vel.zero_()
                         wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
                     if control is not None and getattr(control, "joint_f", None) is not None:
-                        control.joint_f.zero_()
+                        if joint_gravity_comp_scale != 0.0:
+                            joint_tau = _approx_articulation_gravity_comp_torque(
+                                model,
+                                state_in,
+                                gravity_vec_np,
+                                scale=joint_gravity_comp_scale,
+                                J_buf=jacobian_buf,
+                                joint_S_buf=joint_S_buf,
+                            )
+                            if joint_tau is not None:
+                                control_joint_f.assign(joint_tau)
+                            else:
+                                control_joint_f.zero_()
+                        else:
+                            control_joint_f.zero_()
+                        wp.copy(dest=control.joint_f, src=control_joint_f)
                 elif tabletop_task:
                     pos_obj.set_target_position(0, wp.vec3(*preroll_target_pos.tolist()))
                     rot_obj.set_target_rotation(0, wp.vec4(*preroll_target_quat.tolist()))
@@ -2689,7 +2872,10 @@ def simulate(
                     state_in.joint_qd.assign(joint_target_qd)
                     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
                 if contacts is not None:
-                    model.collide(state_in, contacts)
+                    if collision_pipeline is not None:
+                        collision_pipeline.collide(state_in, contacts)
+                    else:
+                        model.collide(state_in, contacts)
                 solver.step(state_in, state_out, control, contacts, sim_dt)
                 if tabletop_joint_override_mode:
                     state_out.joint_q.assign(joint_target_np)
@@ -2700,7 +2886,8 @@ def simulate(
                     # Recover reduced coordinates from the solver-integrated body state
                     # so diagnostics and any later consumers see the actual motion rather
                     # than a stale pre-step joint_q snapshot.
-                    newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
+                    if str(args.solver_type) == "semiimplicit":
+                        newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
                 elif tabletop_task:
                     state_out.joint_q.assign(joint_target_np)
                     state_out.joint_qd.assign(joint_target_qd)
@@ -2736,7 +2923,7 @@ def simulate(
         if preroll_settle_pass is None:
             preroll_settle_pass = False
             preroll_settle_time_s = float(preroll_frame_count * frame_dt)
-        if tabletop_joint_drive_mode and bool(args.tabletop_reset_robot_after_preroll):
+        if (tabletop_joint_drive_mode or tabletop_joint_hybrid_mode) and bool(args.tabletop_reset_robot_after_preroll):
             joint_reset_np = np.asarray(meta["joint_q_init"], dtype=np.float32).copy()
             joint_reset_qd = np.zeros_like(joint_reset_np, dtype=np.float32)
             prev_joint_q = joint_reset_np.copy()
@@ -2751,7 +2938,8 @@ def simulate(
                 control_joint_target_vel.zero_()
                 wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
             if control is not None and getattr(control, "joint_f", None) is not None:
-                control.joint_f.zero_()
+                control_joint_f.zero_()
+                wp.copy(dest=control.joint_f, src=control_joint_f)
 
     t0 = time.perf_counter()
     for frame in range(n_frames):
@@ -2790,7 +2978,7 @@ def simulate(
         body_vel[frame] = state_in.body_qd.numpy().astype(np.float32)[:, :3]
         if replay is not None:
             ee_target_pos[frame] = replay["ee_target_pos"][frame]
-        elif tabletop_joint_override_mode or tabletop_joint_drive_mode:
+        elif tabletop_joint_override_mode or tabletop_joint_drive_mode or tabletop_joint_hybrid_mode:
             _, joint_target_frame = _joint_phase_state(float(frame) * frame_dt, meta)
             joint_target_frame = np.asarray(joint_target_frame, dtype=np.float32).copy()
             joint_target_frame[7:9] = float(args.gripper_open)
@@ -2829,6 +3017,8 @@ def simulate(
             state_in.clear_forces()
             sim_t = (float(frame) * float(substeps) + float(sub)) * sim_dt
             phase_name, _, _ = _task_phase_state(sim_t, meta)
+            hybrid_drive_phase = _hybrid_uses_drive(phase_name)
+            hybrid_override_phase = bool(tabletop_joint_hybrid_mode and not hybrid_drive_phase)
             if drop_release_task and (not release_triggered) and phase_name in {"release", "free_fall"}:
                 settle_gate_metrics, settle_ok = _settle_window_metrics_from_series(
                     particle_speed_mean_series,
@@ -2865,7 +3055,7 @@ def simulate(
                 body_qd_frame = replay["body_qd"][frame]
                 state_in.body_q.assign(body_q_frame)
                 state_in.body_qd.assign(body_qd_frame)
-            elif tabletop_joint_override_mode:
+            elif tabletop_joint_override_mode or hybrid_override_phase:
                 _, joint_target_np = _joint_phase_state(sim_t, meta)
                 joint_target_np = np.asarray(joint_target_np, dtype=np.float32).copy()
                 joint_target_np[7:9] = float(args.gripper_open)
@@ -2875,7 +3065,7 @@ def simulate(
                 state_in.joint_q.assign(joint_target_np)
                 state_in.joint_qd.assign(joint_target_qd)
                 newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-            elif tabletop_joint_drive_mode:
+            elif tabletop_joint_drive_mode or hybrid_drive_phase:
                 _, joint_target_np = _joint_phase_state(sim_t, meta)
                 joint_target_np = np.asarray(joint_target_np, dtype=np.float32).copy()
                 joint_target_np[7:9] = float(args.gripper_open)
@@ -2887,7 +3077,22 @@ def simulate(
                     control_joint_target_vel.zero_()
                     wp.copy(dest=control.joint_target_vel, src=control_joint_target_vel)
                 if control is not None and getattr(control, "joint_f", None) is not None:
-                    control.joint_f.zero_()
+                    if joint_gravity_comp_scale != 0.0:
+                        joint_tau = _approx_articulation_gravity_comp_torque(
+                            model,
+                            state_in,
+                            gravity_vec_np,
+                            scale=joint_gravity_comp_scale,
+                            J_buf=jacobian_buf,
+                            joint_S_buf=joint_S_buf,
+                        )
+                        if joint_tau is not None:
+                            control_joint_f.assign(joint_tau)
+                        else:
+                            control_joint_f.zero_()
+                    else:
+                        control_joint_f.zero_()
+                    wp.copy(dest=control.joint_f, src=control_joint_f)
             else:
                 _, target_pos, target_quat = _task_phase_state(sim_t, meta)
                 pos_obj.set_target_position(0, wp.vec3(*target_pos.tolist()))
@@ -2909,17 +3114,21 @@ def simulate(
                 state_in.joint_qd.assign(joint_target_qd)
                 newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
             if contacts is not None:
-                model.collide(state_in, contacts)
+                if collision_pipeline is not None:
+                    collision_pipeline.collide(state_in, contacts)
+                else:
+                    model.collide(state_in, contacts)
             solver.step(state_in, state_out, control, contacts, sim_dt)
             if replay is not None:
                 state_out.body_q.assign(body_q_frame)
                 state_out.body_qd.assign(body_qd_frame)
-            elif tabletop_joint_override_mode:
+            elif tabletop_joint_override_mode or hybrid_override_phase:
                 state_out.joint_q.assign(joint_target_np)
                 state_out.joint_qd.assign(joint_target_qd)
                 newton.eval_fk(model, state_out.joint_q, state_out.joint_qd, state_out)
-            elif tabletop_joint_drive_mode:
-                newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
+            elif tabletop_joint_drive_mode or hybrid_drive_phase:
+                if str(args.solver_type) == "semiimplicit":
+                    newton.eval_ik(model, state_out, state_out.joint_q, state_out.joint_qd)
             else:
                 state_out.joint_q.assign(joint_target_np)
                 state_out.joint_qd.assign(joint_target_qd)
@@ -3081,6 +3290,15 @@ def render_video(
         except Exception:
             pass
         cam_pos = np.asarray(args.camera_pos, dtype=np.float32)
+        camera_track_offset = None
+        if tabletop_task and str(args.camera_track_mode) == "tabletop_follow":
+            anchor_center = _tabletop_camera_track_center(
+                sim_data,
+                meta,
+                0,
+                rigid_only_stage=bool(rigid_only_stage),
+            )
+            camera_track_offset = cam_pos - anchor_center
         viewer.set_camera(wp.vec3(float(cam_pos[0]), float(cam_pos[1]), float(cam_pos[2])), float(args.camera_pitch), float(args.camera_yaw))
 
         particle_radius_sim = (
@@ -3180,6 +3398,19 @@ def render_video(
                     stage_banner = f"ROPE INTEGRATED | DIRECT-FINGER BLOCKING CANDIDATE | {str(args.render_mode).upper()} | {profile.upper()}"
 
             for out_idx, sim_idx in enumerate(render_indices):
+                if camera_track_offset is not None:
+                    track_center = _tabletop_camera_track_center(
+                        sim_data,
+                        meta,
+                        int(sim_idx),
+                        rigid_only_stage=bool(rigid_only_stage),
+                    )
+                    cam_frame = track_center + camera_track_offset
+                    viewer.set_camera(
+                        wp.vec3(float(cam_frame[0]), float(cam_frame[1]), float(cam_frame[2])),
+                        float(args.camera_pitch),
+                        float(args.camera_yaw),
+                    )
                 if state.particle_q is not None:
                     state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
                 state.body_q.assign(sim_data["body_q"][sim_idx].astype(np.float32, copy=False))
@@ -3635,7 +3866,10 @@ def build_summary(
             "tabletop_retract_seconds": float(args.tabletop_retract_seconds),
             "tabletop_support_box_mode": str(args.tabletop_support_box_mode),
             "tabletop_support_box_offset": [float(v) for v in np.asarray(args.tabletop_support_box_offset, dtype=np.float32)],
-            "tabletop_support_box_scale": [float(v) for v in np.asarray(support_box_scale, dtype=np.float32)],
+            "tabletop_support_box_scale": np.asarray(
+                meta.get("support_box_scale", meta.get("support_box_default_scale", [0.0, 0.0, 0.0])),
+                dtype=np.float32,
+            ).astype(float).tolist(),
             "support_box_enabled": bool(meta.get("support_box_enabled", False)),
             "support_box_physical": bool(meta.get("support_box_physical", False)),
             "support_box_center": np.asarray(meta.get("support_box_center"), dtype=np.float32).astype(float).tolist(),
@@ -4025,6 +4259,7 @@ def build_summary(
         "ik_target_blend": float(args.ik_target_blend),
         "solver_joint_attach_ke": float(args.solver_joint_attach_ke),
         "solver_joint_attach_kd": float(args.solver_joint_attach_kd),
+        "joint_gravity_comp_scale": float(args.joint_gravity_comp_scale),
         "tabletop_control_mode": (None if not tabletop_task else str(args.tabletop_control_mode)),
         "tabletop_initial_pose": (None if not tabletop_task else str(args.tabletop_initial_pose)),
         "tabletop_joint_reference_family": (None if not tabletop_task else str(args.tabletop_joint_reference_family)),
@@ -4441,6 +4676,32 @@ def _load_saved_history(
     }
 
 
+def _tabletop_camera_track_center(
+    sim_data: dict[str, Any],
+    meta: dict[str, Any],
+    frame_idx: int,
+    *,
+    rigid_only_stage: bool,
+) -> np.ndarray:
+    body_q_frame = np.asarray(sim_data["body_q"][frame_idx], dtype=np.float32)
+    left_finger_idx = int(meta["left_finger_index"])
+    right_finger_idx = int(meta["right_finger_index"])
+    gripper_center = _gripper_center_world_position(body_q_frame, left_finger_idx, right_finger_idx).astype(
+        np.float32, copy=False
+    )
+    robot_base_center = np.asarray(meta.get("robot_base_center", gripper_center), dtype=np.float32)
+    stage_center = np.asarray(meta.get("table_center", robot_base_center), dtype=np.float32)
+    if rigid_only_stage:
+        return (0.50 * gripper_center + 0.30 * robot_base_center + 0.20 * stage_center).astype(np.float32, copy=False)
+    q_obj = np.asarray(sim_data["particle_q_object"][frame_idx], dtype=np.float32)
+    rope_center = (
+        np.mean(q_obj, axis=0).astype(np.float32, copy=False)
+        if q_obj.size
+        else stage_center.astype(np.float32, copy=False)
+    )
+    return (0.45 * gripper_center + 0.25 * robot_base_center + 0.30 * rope_center).astype(np.float32, copy=False)
+
+
 def _materialize_loaded_history(args: argparse.Namespace, sim_data: dict[str, Any]) -> None:
     history_names = [
         "particle_q_all",
@@ -4548,8 +4809,11 @@ def main() -> int:
         _materialize_loaded_history(args, sim_data)
     else:
         sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
-    out_mp4 = render_video(model, sim_data, meta, args, device)
-    out_gif = make_gif(args, out_mp4)
+    out_mp4 = args.out_dir / f"{args.prefix}.mp4"
+    out_gif = None
+    if not bool(args.skip_render):
+        out_mp4 = render_video(model, sim_data, meta, args, device)
+        out_gif = make_gif(args, out_mp4)
     summary = build_summary(model, sim_data, meta, args, out_mp4)
     physics_validation = build_physics_validation(model, sim_data, meta, args, summary)
     physics_validation_path = save_physics_validation_json(args, physics_validation)

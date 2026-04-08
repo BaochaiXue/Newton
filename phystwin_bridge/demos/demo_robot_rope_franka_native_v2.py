@@ -57,6 +57,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--substeps", type=int, default=667)
     p.add_argument("--history-storage", choices=["memory", "memmap"], default="memmap")
     p.add_argument("--gravity-mag", type=float, default=9.8)
+    p.add_argument("--solver-type", choices=["semiimplicit", "mujoco"], default="mujoco")
+    p.add_argument("--enable-gravcomp", action=argparse.BooleanOptionalAction, default=True)
 
     p.add_argument("--object-mass", type=float, default=1.0)
     p.add_argument("--auto-set-weight", type=float, default=3.0)
@@ -130,10 +132,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--screen-width", type=int, default=1280)
     p.add_argument("--screen-height", type=int, default=720)
     p.add_argument("--viewer-headless", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--skip-render", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--camera-pos", nargs=3, type=float, default=None)
     p.add_argument("--camera-pitch", type=float, default=None)
     p.add_argument("--camera-yaw", type=float, default=None)
     p.add_argument("--camera-fov", type=float, default=None)
+    p.add_argument("--camera-track-mode", choices=["none", "tabletop_follow"], default="none")
     p.add_argument("--overlay-label", action=argparse.BooleanOptionalAction, default=None)
     p.add_argument("--label-font-size", type=int, default=22)
     p.add_argument("--particle-radius-vis-scale", type=float, default=None)
@@ -143,6 +147,39 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--load-history-from-dir", type=Path, default=None)
     p.add_argument("--load-history-prefix", default=None)
     return p.parse_args()
+
+
+def _enable_franka_gravity_comp(builder: newton.ModelBuilder) -> None:
+    gravcomp_attr = builder.custom_attributes.get("mujoco:jnt_actgravcomp")
+    gravcomp_body = builder.custom_attributes.get("mujoco:gravcomp")
+    if gravcomp_attr is None or gravcomp_body is None:
+        return
+    if gravcomp_attr.values is None:
+        gravcomp_attr.values = {}
+    for dof_idx in range(7):
+        gravcomp_attr.values[dof_idx] = True
+    if gravcomp_body.values is None:
+        gravcomp_body.values = {}
+    for body_idx, body_label in enumerate(builder.body_label):
+        label = str(body_label)
+        if any(
+            label.endswith(suffix)
+            for suffix in (
+                "/fr3_link1",
+                "/fr3_link2",
+                "/fr3_link3",
+                "/fr3_link4",
+                "/fr3_link5",
+                "/fr3_link6",
+                "/fr3_link7",
+                "/fr3_link8",
+                "/fr3_hand",
+                "/fr3_hand_tcp",
+                "/fr3_leftfinger",
+                "/fr3_rightfinger",
+            )
+        ):
+            gravcomp_body.values[body_idx] = 1.0
 
 
 def _total_task_duration(args: argparse.Namespace) -> float:
@@ -663,6 +700,8 @@ class NativeV2SceneBuilder:
 
         checks = newton_import_ir.validate_ir_physics(ir_obj, cfg)
         builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
+        if str(self.args.solver_type) == "mujoco":
+            newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
         builder.default_body_armature = float(args.default_body_armature)
         builder.default_joint_cfg.armature = float(args.default_joint_armature)
 
@@ -697,6 +736,8 @@ class NativeV2SceneBuilder:
         builder.joint_armature[7:9] = [0.15, 0.15]
         builder.joint_effort_limit[:7] = [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
         builder.joint_effort_limit[7:9] = [20.0, 20.0]
+        if str(args.solver_type) == "mujoco" and bool(args.enable_gravcomp):
+            _enable_franka_gravity_comp(builder)
 
         ee_body_index = legacy._find_index_by_suffix(builder.body_label, "/fr3_link7")
         left_finger_index = legacy._find_index_by_suffix(builder.body_label, "/fr3_leftfinger")
@@ -772,6 +813,8 @@ class NativeV2SceneBuilder:
             "task": TABLETOP_PUSH_TASK,
             "blocking_stage": str(args.blocking_stage),
             "tabletop_control_mode": "joint_target_drive",
+            "solver_type": str(args.solver_type),
+            "enable_gravcomp": bool(args.enable_gravcomp),
             "particle_contacts": bool(particle_contacts),
             "particle_contact_kernel": bool(particle_contact_kernel),
             "joint_q_init": q_pre.astype(np.float32),
@@ -951,14 +994,28 @@ def simulate(
         add_ground_plane=False,
     )
 
-    solver = newton.solvers.SolverSemiImplicit(
-        model,
-        angular_damping=cfg.angular_damping,
-        friction_smoothing=cfg.friction_smoothing,
-        joint_attach_ke=float(args.solver_joint_attach_ke),
-        joint_attach_kd=float(args.solver_joint_attach_kd),
-        enable_tri_contact=cfg.enable_tri_contact,
-    )
+    if str(args.solver_type) == "mujoco":
+        solver = newton.solvers.SolverMuJoCo(
+            model,
+            solver="newton",
+            integrator="implicitfast",
+            iterations=15,
+            ls_iterations=100,
+            nconmax=8000,
+            njmax=16000,
+            cone="elliptic",
+            impratio=50.0,
+            use_mujoco_contacts=False,
+        )
+    else:
+        solver = newton.solvers.SolverSemiImplicit(
+            model,
+            angular_damping=cfg.angular_damping,
+            friction_smoothing=cfg.friction_smoothing,
+            joint_attach_ke=float(args.solver_joint_attach_ke),
+            joint_attach_kd=float(args.solver_joint_attach_kd),
+            enable_tri_contact=cfg.enable_tri_contact,
+        )
     collision_pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
     contacts = collision_pipeline.contacts()
     control = model.control()
@@ -1031,7 +1088,8 @@ def simulate(
                 )
                 collision_pipeline.collide(state_0, contacts)
                 solver.step(state_0, state_1, control, contacts, sim_dt)
-                newton.eval_ik(model, state_1, state_1.joint_q, state_1.joint_qd)
+                if str(args.solver_type) == "semiimplicit":
+                    newton.eval_ik(model, state_1, state_1.joint_q, state_1.joint_qd)
                 state_0, state_1 = state_1, state_0
                 if preroll_drag > 0.0 and n_obj > 0 and state_0.particle_q is not None and state_0.particle_qd is not None:
                     if gravity_axis is not None:
@@ -1098,7 +1156,8 @@ def simulate(
             _set_control_targets(control, joint_target_pos_buf, joint_target_vel_buf, joint_target_q, joint_target_qd)
             collision_pipeline.collide(state_0, contacts)
             solver.step(state_0, state_1, control, contacts, sim_dt)
-            newton.eval_ik(model, state_1, state_1.joint_q, state_1.joint_qd)
+            if str(args.solver_type) == "semiimplicit":
+                newton.eval_ik(model, state_1, state_1.joint_q, state_1.joint_qd)
             state_0, state_1 = state_1, state_0
             if active_drag > 0.0 and n_obj > 0 and state_0.particle_q is not None and state_0.particle_qd is not None:
                 if gravity_axis is not None:
@@ -1285,6 +1344,8 @@ def build_summary(
         "gravity_mag_m_s2": float(args.gravity_mag),
         "apply_drag": bool(args.apply_drag),
         "drag_ignore_gravity_axis": bool(args.drag_ignore_gravity_axis),
+        "solver_type": str(meta.get("solver_type", args.solver_type)),
+        "enable_gravcomp": bool(meta.get("enable_gravcomp", args.enable_gravcomp)),
         "solver_joint_attach_ke": float(args.solver_joint_attach_ke),
         "solver_joint_attach_kd": float(args.solver_joint_attach_kd),
         "joint_target_ke": float(args.joint_target_ke),
@@ -1334,8 +1395,11 @@ def main() -> int:
     else:
         sim_data = simulate(model, ir_obj, meta, args, n_obj, device)
 
-    out_mp4 = legacy.render_video(model, sim_data, meta, args, device)
-    out_gif = legacy.make_gif(args, out_mp4)
+    out_mp4 = args.out_dir / f"{args.prefix}.mp4"
+    out_gif = None
+    if not bool(args.skip_render):
+        out_mp4 = legacy.render_video(model, sim_data, meta, args, device)
+        out_gif = legacy.make_gif(args, out_mp4)
     summary = build_summary(model, sim_data, meta, args, out_mp4)
     physics_validation = build_physics_validation(model, sim_data, meta, args, summary)
     physics_validation_path = legacy.save_physics_validation_json(args, physics_validation)
