@@ -172,6 +172,14 @@ TABLETOP_FRANKA_Q_PUSH_END = np.asarray(
     [-0.105, 0.980, 0.332, -1.779, 0.577, 2.578, 1.363, 0.04, 0.04],
     dtype=np.float32,
 )
+TABLETOP_BLOCKING_Q_PUSH_START = np.asarray(
+    [0.2509, 0.7853, 0.1489, -1.9619, -0.0649, 2.5607, 0.6005, 0.04, 0.04],
+    dtype=np.float32,
+)
+TABLETOP_BLOCKING_Q_PUSH_END = np.asarray(
+    [0.1299, 0.8765, 0.2067, -1.8453, 0.2722, 2.5554, 0.9594, 0.04, 0.04],
+    dtype=np.float32,
+)
 
 
 def _default_rope_ir() -> Path:
@@ -698,6 +706,16 @@ def parse_args() -> argparse.Namespace:
         default=(0.0, 0.0076, 0.0535),
         metavar=("X", "Y", "Z"),
         help="Local offset of the visible rigid tool center in the attachment body frame [m].",
+    )
+    p.add_argument(
+        "--tabletop-joint-reference-family",
+        choices=["accepted", "blocking_lowprofile"],
+        default="accepted",
+        help=(
+            "Joint-space reference family for tabletop joint-space phases. "
+            "`accepted` preserves the readable tabletop baseline waypoints. "
+            "`blocking_lowprofile` uses a shallower blocking-specific family that keeps more wrist/hand clearance."
+        ),
     )
     p.add_argument(
         "--visible-tool-axis",
@@ -1656,13 +1674,21 @@ def _task_phase_state(t: float, meta: dict[str, Any]) -> tuple[str, np.ndarray, 
     return str(last["name"]), np.asarray(last["end"], dtype=np.float32), np.asarray(last["quat"], dtype=np.float32)
 
 
-def _tabletop_joint_phase_waypoints() -> list[dict[str, Any]]:
+def _tabletop_joint_phase_waypoints(reference_family: str = "accepted") -> list[dict[str, Any]]:
+    if str(reference_family) == "blocking_lowprofile":
+        q_pre = TABLETOP_FRANKA_Q_PRE.copy()
+        q_push_start = TABLETOP_BLOCKING_Q_PUSH_START.copy()
+        q_push_end = TABLETOP_BLOCKING_Q_PUSH_END.copy()
+    else:
+        q_pre = TABLETOP_FRANKA_Q_PRE.copy()
+        q_push_start = TABLETOP_FRANKA_Q_PUSH_START.copy()
+        q_push_end = TABLETOP_FRANKA_Q_PUSH_END.copy()
     return [
-        {"name": "settle", "start_q": TABLETOP_FRANKA_Q_PRE.copy(), "end_q": TABLETOP_FRANKA_Q_PRE.copy()},
-        {"name": "approach", "start_q": TABLETOP_FRANKA_Q_PRE.copy(), "end_q": TABLETOP_FRANKA_Q_PUSH_START.copy()},
-        {"name": "push", "start_q": TABLETOP_FRANKA_Q_PUSH_START.copy(), "end_q": TABLETOP_FRANKA_Q_PUSH_END.copy()},
-        {"name": "hold", "start_q": TABLETOP_FRANKA_Q_PUSH_END.copy(), "end_q": TABLETOP_FRANKA_Q_PUSH_END.copy()},
-        {"name": "retract", "start_q": TABLETOP_FRANKA_Q_PUSH_END.copy(), "end_q": TABLETOP_FRANKA_Q_PRE.copy()},
+        {"name": "settle", "start_q": q_pre.copy(), "end_q": q_pre.copy()},
+        {"name": "approach", "start_q": q_pre.copy(), "end_q": q_push_start.copy()},
+        {"name": "push", "start_q": q_push_start.copy(), "end_q": q_push_end.copy()},
+        {"name": "hold", "start_q": q_push_end.copy(), "end_q": q_push_end.copy()},
+        {"name": "retract", "start_q": q_push_end.copy(), "end_q": q_pre.copy()},
     ]
 
 
@@ -2189,7 +2215,11 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
                     "start_q": joint_phase["start_q"],
                     "end_q": joint_phase["end_q"],
                 }
-                for pos_phase, joint_phase in zip(task_phases, _tabletop_joint_phase_waypoints(), strict=True)
+                for pos_phase, joint_phase in zip(
+                    task_phases,
+                    _tabletop_joint_phase_waypoints(str(args.tabletop_joint_reference_family)),
+                    strict=True,
+                )
             ]
             if tabletop_joint_path_mode
             else None
@@ -2205,6 +2235,7 @@ def build_model(args: argparse.Namespace, device: str) -> tuple[newton.Model, di
         "table_top_z": (None if table_top_z is None else float(table_top_z)),
         "tabletop_rope_top_z": (None if tabletop_target_z is None else float(tabletop_rope_top_z)),
         "tabletop_target_z": tabletop_target_z,
+        "tabletop_joint_reference_family": (None if not tabletop_task else str(args.tabletop_joint_reference_family)),
         "tabletop_push_focus": (
             tabletop_push_focus.astype(np.float32) if tabletop_task else rope_center.astype(np.float32)
         ),
@@ -2984,6 +3015,13 @@ def render_video(
                 sample_times = np.linspace(0.0, sim_duration, n_out_frames, endpoint=True, dtype=np.float64)
                 render_indices = np.clip(np.rint(sample_times / sim_frame_dt).astype(np.int32), 0, n_sim_frames - 1)
 
+            stage_banner = None
+            if tabletop_task and str(args.tabletop_control_mode) == "joint_target_drive":
+                if rigid_only_stage:
+                    stage_banner = f"RIGID ONLY — NO ROPE BY DESIGN | {str(args.render_mode).upper()} | {profile.upper()}"
+                else:
+                    stage_banner = f"ROPE INTEGRATED | DIRECT-FINGER BLOCKING CANDIDATE | {str(args.render_mode).upper()} | {profile.upper()}"
+
             for out_idx, sim_idx in enumerate(render_indices):
                 if state.particle_q is not None:
                     state.particle_q.assign(sim_data["particle_q_all"][sim_idx].astype(np.float32, copy=False))
@@ -3307,6 +3345,9 @@ def render_video(
 
                 viewer.end_frame()
                 frame = viewer.get_frame(render_ui=False).numpy()
+                overlay_lines: list[str] = []
+                if stage_banner is not None:
+                    overlay_lines.append(stage_banner)
                 if args.overlay_label:
                     target_pos = sim_data["ee_target_pos"][sim_idx]
                     tracking_err = float(np.linalg.norm(gripper_center - target_pos))
@@ -3347,8 +3388,7 @@ def render_video(
                     tracking_line = f"tracking err: {tracking_err:.3f} m | gripper speed: {speed:.3f} m/s"
                     if release_time_s is not None:
                         tracking_line += f" | t_release: {float(release_time_s):.3f}s"
-                    frame = overlay_text_lines_rgb(
-                        frame,
+                    overlay_lines.extend(
                         [
                             f"task: {args.task} | phase: {phase_name}",
                             (
@@ -3358,7 +3398,12 @@ def render_video(
                             ),
                             tracking_line,
                             contact_line,
-                        ],
+                        ]
+                    )
+                if overlay_lines:
+                    frame = overlay_text_lines_rgb(
+                        frame,
+                        overlay_lines,
                         font_size=int(args.label_font_size),
                     )
                 ffmpeg_proc.stdin.write(frame.tobytes())
@@ -3425,6 +3470,7 @@ def build_summary(
             "visible_tool_enabled": False,
             "tabletop_control_mode": str(args.tabletop_control_mode),
             "tabletop_initial_pose": str(args.tabletop_initial_pose),
+            "tabletop_joint_reference_family": str(args.tabletop_joint_reference_family),
             "gripper_center_tracking_error_mean_m": float(np.mean(tracking_error)),
             "gripper_center_tracking_error_max_m": float(np.max(tracking_error)),
             "gripper_center_speed_max_m_s": float(np.max(gripper_speed)) if gripper_speed.size else 0.0,
@@ -3807,6 +3853,7 @@ def build_summary(
         "solver_joint_attach_kd": float(args.solver_joint_attach_kd),
         "tabletop_control_mode": (None if not tabletop_task else str(args.tabletop_control_mode)),
         "tabletop_initial_pose": (None if not tabletop_task else str(args.tabletop_initial_pose)),
+        "tabletop_joint_reference_family": (None if not tabletop_task else str(args.tabletop_joint_reference_family)),
         "tabletop_reset_robot_after_preroll": (None if not tabletop_task else bool(args.tabletop_reset_robot_after_preroll)),
         "tabletop_robot_base_offset": (
             None if not tabletop_task else [float(v) for v in np.asarray(args.tabletop_robot_base_offset, dtype=np.float32)]
