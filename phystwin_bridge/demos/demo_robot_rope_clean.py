@@ -228,9 +228,9 @@ def parse_args():
     p.add_argument("--table-hy", type=float, default=0.30)
     p.add_argument("--table-hz", type=float, default=0.02)
     # Robot
-    p.add_argument("--robot-base-x", type=float, default=-0.50)
-    p.add_argument("--robot-base-y", type=float, default=-0.20)
-    p.add_argument("--robot-base-z", type=float, default=0.10)
+    p.add_argument("--robot-base-x", type=float, default=-0.40)
+    p.add_argument("--robot-base-y", type=float, default=0.0)
+    p.add_argument("--robot-base-z", type=float, default=0.02)
     p.add_argument("--joint-target-ke", type=float, default=650.0)
     p.add_argument("--joint-target-kd", type=float, default=100.0)
     p.add_argument("--finger-target-ke", type=float, default=100.0)
@@ -498,16 +498,21 @@ def generate_waypoints(model, meta, args, device):
     yaw_quat = _quat_from_axis_angle([0, 0, 1], np.deg2rad(-15.0))
     target_quat = _quat_multiply(down_quat, yaw_quat)
 
-    # Contact height: just above rope on table
-    contact_z = table_z + 2 * radius + 0.008
+    # Contact height: push gripper INTO the rope layer for reliable contact
+    # The gripper finger tips need to overlap with particle collision radii.
+    # particle_radius (after 0.5 scale) ≈ 0.013 m, soft_contact_margin ≈ 0.02
+    # So gripper surface must be within ~0.033 m of particle center.
+    # Since rope sits at table_z + radius + 0.002, finger tips at table_z + radius
+    # will overlap by ~0.002 m, guaranteeing contact.
+    contact_z = table_z + radius  # finger tips at rope particle center height
 
     # Waypoint positions (world space, relative to rope center)
-    high_z = table_z + 0.12  # safe clearance
+    high_z = table_z + 0.15  # safe clearance
     waypoints = {
-        "park":     np.array([rope_center[0] - 0.15, rope_center[1], high_z], dtype=np.float32),
-        "approach": np.array([rope_center[0] - 0.10, rope_center[1], contact_z], dtype=np.float32),
-        "push_end": np.array([rope_center[0] + 0.12, rope_center[1], contact_z], dtype=np.float32),
-        "retract":  np.array([rope_center[0] + 0.15, rope_center[1], high_z], dtype=np.float32),
+        "park":     np.array([rope_center[0] - 0.08, rope_center[1], high_z], dtype=np.float32),
+        "approach": np.array([rope_center[0] - 0.05, rope_center[1], contact_z], dtype=np.float32),
+        "push_end": np.array([rope_center[0] + 0.10, rope_center[1], contact_z], dtype=np.float32),
+        "retract":  np.array([rope_center[0] + 0.12, rope_center[1], high_z], dtype=np.float32),
     }
 
     # Solve IK for each waypoint
@@ -548,11 +553,12 @@ def run_simulation(args, device):
         use_mujoco_contacts=False,
     )
 
-    # Collision pipeline with NxN broad phase for full coverage
+    # Collision pipeline - use explicit broad phase (auto-generated pairs)
+    # Increase soft_contact_margin so particle-body contacts are detected earlier
     collision_pipeline = newton.CollisionPipeline(
         model,
         broad_phase="explicit",
-        soft_contact_margin=0.02,
+        soft_contact_margin=0.05,
     )
     contacts = collision_pipeline.contacts()
     control = model.control()
@@ -692,17 +698,33 @@ def run_simulation(args, device):
     rope_above_table = min_rope_z > (table_z - 0.01)
     print(f"[diag] Min rope z = {min_rope_z:.4f}, table z = {table_z:.4f}, above = {rope_above_table}")
 
-    # Finger-rope proximity
-    for phase_check_frame in range(settle_frames + approach_frames,
-                                    min(settle_frames + approach_frames + push_frames, n_frames)):
-        gc = _gripper_center(body_q_history[phase_check_frame],
+    # Finger-rope proximity during all push frames
+    min_finger_dist = float('inf')
+    min_finger_frame = -1
+    contact_frame_count = 0
+    push_start = settle_frames + approach_frames
+    push_end_f = min(push_start + push_frames, n_frames)
+    for pf in range(push_start, push_end_f):
+        gc = _gripper_center(body_q_history[pf],
                             meta["left_finger_idx"], meta["right_finger_idx"])
         closest_dist = float(np.min(np.linalg.norm(
-            particle_q_history[phase_check_frame] - gc, axis=1
+            particle_q_history[pf] - gc, axis=1
         )))
+        if closest_dist < min_finger_dist:
+            min_finger_dist = closest_dist
+            min_finger_frame = pf
         if closest_dist < 0.05:
-            print(f"[diag] Finger-rope contact at frame {phase_check_frame}: dist={closest_dist:.4f}")
-            break
+            contact_frame_count += 1
+    print(f"[diag] Min finger-rope dist = {min_finger_dist:.4f} at frame {min_finger_frame}")
+    print(f"[diag] Frames with finger-rope dist < 0.05: {contact_frame_count}/{push_end_f - push_start}")
+    # Print actual gripper z vs rope z at mid-push
+    mid_push_frame = (push_start + push_end_f) // 2
+    gc_mid = _gripper_center(body_q_history[mid_push_frame],
+                             meta["left_finger_idx"], meta["right_finger_idx"])
+    rope_z_mid = float(particle_q_history[mid_push_frame, :, 2].mean())
+    print(f"[diag] Mid-push: gripper xyz = [{gc_mid[0]:.4f}, {gc_mid[1]:.4f}, {gc_mid[2]:.4f}]")
+    print(f"[diag]           rope_z_mean = {rope_z_mid:.4f}, table_z = {table_z:.4f}")
+    print(f"[diag]           particle_radius_ref = {meta['particle_radius_ref']:.4f}")
 
     # Save summary
     summary = {
