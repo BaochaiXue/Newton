@@ -13,6 +13,26 @@ import numpy as np
 
 from bridge_shared import compute_visual_particle_radii
 
+__all__ = [
+    "_build_process_story_keyframes",
+    "_compute_force_visual_particle_radii",
+    "_continuous_output_frame_indices",
+    "_fit_camera_to_points",
+    "_force_active_interval_from_render_indices",
+    "_overlay_force_glyphs_rgb",
+    "_overlay_zoom_panel_rgb",
+    "_project_world_to_screen",
+    "_quat_angle_deg",
+    "_resolve_force_camera",
+    "_resolve_main_camera",
+    "_select_force_topk",
+    "_stage_label_for_frame",
+    "_thin_force_probe_indices",
+]
+
+
+# Ranking / selection helpers
+
 
 def _normalized(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float32)
@@ -107,6 +127,9 @@ def _thin_force_probe_indices(
             if len(selected) >= limit:
                 break
     return np.asarray(selected[:limit], dtype=np.int32)
+
+
+# Camera framing / projection helpers
 
 
 def _camera_basis_from_pitch_yaw(pitch_deg: float, yaw_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -260,6 +283,9 @@ def _project_world_to_screen(
     px = (ndc_x * 0.5 + 0.5) * float(width)
     py = (0.5 - ndc_y * 0.5) * float(height)
     return float(px), float(py)
+
+
+# Frame overlay helpers
 
 
 def _overlay_zoom_panel_rgb(
@@ -426,6 +452,9 @@ def _overlay_force_glyphs_rgb(
             _draw_arrow_2d(draw, s_px, e_px, color, width=line_w)
 
     return np.asarray(img, dtype=np.uint8)
+
+
+# Process-story helpers
 
 
 def _stage_label_for_frame(
