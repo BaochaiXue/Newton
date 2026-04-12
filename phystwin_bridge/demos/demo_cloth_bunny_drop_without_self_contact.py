@@ -39,6 +39,22 @@ from cloth_bunny_common import (
     _validate_scaling_args,
     load_ir,
 )
+from cloth_bunny_force_viz import (
+    _build_process_story_keyframes,
+    _compute_force_visual_particle_radii,
+    _continuous_output_frame_indices,
+    _fit_camera_to_points,
+    _force_active_interval_from_render_indices,
+    _overlay_force_glyphs_rgb,
+    _overlay_zoom_panel_rgb,
+    _project_world_to_screen,
+    _quat_angle_deg,
+    _resolve_force_camera,
+    _resolve_main_camera,
+    _select_force_topk,
+    _stage_label_for_frame,
+    _thin_force_probe_indices,
+)
 from bridge_bootstrap import newton, newton_import_ir, path_defaults
 from bridge_deformable_common import (
     _apply_drag_correction_ignore_axis,
@@ -688,173 +704,6 @@ def _write_force_render_bundle(
     with bundle_path.open("wb") as handle:
         pickle.dump(bundle, handle)
     return bundle_path
-
-
-def _normalized(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    if values.size == 0:
-        return values
-    peak = float(np.max(values))
-    if peak <= 1.0e-12:
-        return np.zeros_like(values, dtype=np.float32)
-    return (values / peak).astype(np.float32, copy=False)
-
-
-def _select_force_topk(
-    external_norm: np.ndarray,
-    *,
-    internal_force_normal: np.ndarray,
-    penetration_depth_signed: np.ndarray,
-    geom_contact_mask: np.ndarray,
-    topk: int,
-    eps: float,
-    mode: str,
-) -> np.ndarray:
-    geom_candidates = np.flatnonzero(np.asarray(geom_contact_mask, dtype=bool))
-    force_candidates = np.flatnonzero(np.asarray(external_norm, dtype=np.float32) > eps)
-    if geom_candidates.size:
-        candidates = geom_candidates
-    elif force_candidates.size:
-        candidates = force_candidates
-    else:
-        candidates = np.arange(external_norm.shape[0], dtype=np.int32)
-    if candidates.size == 0:
-        return np.zeros((0,), dtype=np.int32)
-
-    external_score = _normalized(np.asarray(external_norm, dtype=np.float32)[candidates])
-    internal_score = _normalized(
-        np.abs(np.asarray(internal_force_normal, dtype=np.float32)[candidates])
-    )
-    geom_score = _normalized(
-        np.asarray(penetration_depth_signed, dtype=np.float32)[candidates]
-    )
-
-    if mode == "external":
-        score = external_score
-    elif mode == "geom":
-        score = geom_score
-    else:
-        score = (
-            0.45 * external_score + 0.35 * internal_score + 0.20 * geom_score
-        ).astype(np.float32, copy=False)
-
-    order = np.argsort(score)[::-1]
-    limit = min(max(1, int(topk)), candidates.size)
-    return candidates[order[:limit]].astype(np.int32, copy=False)
-
-
-def _thin_force_probe_indices(
-    candidate_indices: np.ndarray,
-    closest_points_world: np.ndarray,
-    *,
-    max_count: int,
-    min_dist: float,
-) -> np.ndarray:
-    candidate_indices = np.asarray(candidate_indices, dtype=np.int32).reshape(-1)
-    if candidate_indices.size == 0:
-        return np.zeros((0,), dtype=np.int32)
-    limit = min(max(1, int(max_count)), candidate_indices.size)
-    if limit >= candidate_indices.size or float(min_dist) <= 0.0:
-        return candidate_indices[:limit].astype(np.int32, copy=False)
-
-    closest_points_world = np.asarray(closest_points_world, dtype=np.float32)
-    selected: list[int] = []
-    min_sq = float(min_dist) * float(min_dist)
-    for idx in candidate_indices.tolist():
-        point = closest_points_world[int(idx)]
-        keep = True
-        for prev in selected:
-            delta = point - closest_points_world[int(prev)]
-            if float(np.dot(delta, delta)) < min_sq:
-                keep = False
-                break
-        if keep:
-            selected.append(int(idx))
-            if len(selected) >= limit:
-                break
-    if not selected:
-        return candidate_indices[:limit].astype(np.int32, copy=False)
-    if len(selected) < limit:
-        used = set(selected)
-        for idx in candidate_indices.tolist():
-            if int(idx) in used:
-                continue
-            selected.append(int(idx))
-            if len(selected) >= limit:
-                break
-    return np.asarray(selected[:limit], dtype=np.int32)
-
-
-def _resolve_force_camera(
-    args: argparse.Namespace,
-    *,
-    focus_world: np.ndarray | None,
-    particle_world: np.ndarray | None,
-) -> tuple[np.ndarray, float, float, float]:
-    pitch = float(args.force_camera_pitch if args.force_camera_pitch is not None else args.camera_pitch)
-    yaw = float(args.force_camera_yaw if args.force_camera_yaw is not None else args.camera_yaw)
-    fov = float(args.force_camera_fov if args.force_camera_fov is not None else args.camera_fov)
-    if args.force_camera_pos is not None:
-        cam_pos = np.asarray(args.force_camera_pos, dtype=np.float32).reshape(3)
-        return cam_pos, pitch, yaw, fov
-    points: list[np.ndarray] = []
-    if particle_world is not None:
-        pts = np.asarray(particle_world, dtype=np.float32).reshape(-1, 3)
-        if pts.size:
-            points.append(pts)
-    if focus_world is not None:
-        points.append(np.asarray(focus_world, dtype=np.float32).reshape(1, 3))
-    if points:
-        scene_points = np.concatenate(points, axis=0)
-        cam_pos, _ = _fit_camera_to_points(
-            scene_points,
-            yaw_deg=yaw,
-            pitch_deg=pitch,
-            fov_deg=fov,
-            aspect=float(args.screen_width) / max(float(args.screen_height), 1.0),
-        )
-        return cam_pos, pitch, yaw, fov
-    return np.asarray(args.camera_pos, dtype=np.float32).reshape(3), pitch, yaw, fov
-
-
-def _resolve_main_camera(args: argparse.Namespace) -> tuple[np.ndarray, float, float, float]:
-    cam_pos = np.asarray(args.camera_pos, dtype=np.float32).reshape(3)
-    return cam_pos, float(args.camera_pitch), float(args.camera_yaw), float(args.camera_fov)
-
-
-def _continuous_output_frame_indices(
-    *,
-    n_sim_frames: int,
-    render_end_frame: int,
-    sim_frame_dt: float,
-    fps_out: float,
-    slowdown: float,
-) -> np.ndarray:
-    usable = max(1, min(int(render_end_frame) + 1, int(n_sim_frames)))
-    if usable <= 1:
-        return np.zeros((1,), dtype=np.int32)
-    if fps_out <= 0.0 or sim_frame_dt <= 0.0:
-        return np.arange(usable, dtype=np.int32)
-
-    sim_end_time = float(usable - 1) * float(sim_frame_dt)
-    out_duration = max(sim_end_time * max(float(slowdown), 1.0), sim_end_time)
-    out_count = max(usable, int(round(out_duration * float(fps_out))) + 1)
-    out_times = np.arange(out_count, dtype=np.float32) / max(float(fps_out), 1.0e-8)
-    sim_times = out_times / max(float(slowdown), 1.0e-8)
-    indices = np.rint(sim_times / max(float(sim_frame_dt), 1.0e-8)).astype(np.int32, copy=False)
-    indices = np.clip(indices, 0, usable - 1)
-    return indices
-
-
-def _compute_force_visual_particle_radii(
-    physical_radii: np.ndarray,
-    args: argparse.Namespace,
-) -> np.ndarray:
-    return compute_visual_particle_radii(
-        physical_radii,
-        radius_scale=min(float(args.particle_radius_vis_scale), 1.35),
-        radius_cap=min(float(args.particle_radius_vis_min), 0.0035),
-    )
 
 
 def _box_surface_info(
