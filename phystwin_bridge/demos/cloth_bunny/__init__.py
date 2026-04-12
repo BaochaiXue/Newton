@@ -7,6 +7,7 @@ __all__ = [
     "example",
     "offline",
     "outputs",
+    "profiling",
     "render",
     "runtime",
     "scene",

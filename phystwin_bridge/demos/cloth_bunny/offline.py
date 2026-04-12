@@ -32,6 +32,7 @@ if __package__ in {None, ""}:
     DEMOS_DIR = Path(__file__).resolve().parent.parent
     if str(DEMOS_DIR) not in sys.path:
         sys.path.insert(0, str(DEMOS_DIR))
+    from cloth_bunny import diagnostics as diagnostics_api
     from cloth_bunny.outputs import (
         build_summary,
         save_collision_force_rollout,
@@ -70,6 +71,7 @@ if __package__ in {None, ""}:
         quat_to_rotmat,
     )
 else:
+    from . import diagnostics as diagnostics_api
     from .outputs import (
         build_summary,
         save_collision_force_rollout,
@@ -691,9 +693,7 @@ def _assign_shape_material_triplet(model, ke: np.ndarray, kd: np.ndarray, kf: np
 
 
 def _resolve_force_dump_dir(args: argparse.Namespace) -> Path:
-    if args.force_dump_dir is not None:
-        return args.force_dump_dir.expanduser().resolve()
-    return (args.out_dir / "force_diagnostic").resolve()
+    return diagnostics_api.resolve_force_dump_dir(args)
 
 
 def _render_force_artifacts_subprocess(
@@ -706,30 +706,14 @@ def _render_force_artifacts_subprocess(
     render_sim_data: dict[str, Any] | None = None,
     video_mp4_path: Path | None = None,
 ) -> tuple[Path, Path | None, Path | None]:
-    force_dir = _resolve_force_dump_dir(args)
-    force_dir.mkdir(parents=True, exist_ok=True)
-    bundle_path = force_dir / "force_render_bundle.pkl"
-    bundle = {
-        "args": args,
-        "device": device,
-        "ir_obj": ir_obj,
-        "diag_snapshot": diag_snapshot,
-        "sequence_snapshots": sequence_snapshots,
-        "render_sim_data": render_sim_data,
-        "video_mp4_path": "" if video_mp4_path is None else str(video_mp4_path),
-    }
-    with bundle_path.open("wb") as handle:
-        pickle.dump(bundle, handle)
-    helper = Path(__file__).resolve().parents[4] / "scripts" / "render_bunny_force_artifacts.py"
-    cmd = [sys.executable, str(helper), "--bundle", str(bundle_path)]
-    subprocess.run(cmd, check=True)
-    snapshot_png_path = force_dir / "force_diag_trigger_snapshot.png"
-    snapshot_mp4_path = force_dir / "force_diag_trigger_snapshot.mp4"
-    sequence_mp4_path = force_dir / "force_diag_trigger_window.mp4"
-    return (
-        snapshot_png_path,
-        snapshot_mp4_path if snapshot_mp4_path.exists() else None,
-        sequence_mp4_path if sequence_mp4_path.exists() else None,
+    return diagnostics_api.render_force_artifacts_subprocess(
+        args=args,
+        device=device,
+        ir_obj=ir_obj,
+        diag_snapshot=diag_snapshot,
+        sequence_snapshots=sequence_snapshots,
+        render_sim_data=render_sim_data,
+        video_mp4_path=video_mp4_path,
     )
 
 
@@ -744,23 +728,16 @@ def _write_force_render_bundle(
     summary_json_path: Path,
     video_mp4_path: Path | None = None,
 ) -> Path:
-    force_dir = _resolve_force_dump_dir(args)
-    force_dir.mkdir(parents=True, exist_ok=True)
-    bundle_path = force_dir / "force_render_bundle.pkl"
-    bundle = {
-        "args": args,
-        "device": device,
-        "ir_obj": ir_obj,
-        "diag_snapshot": diag_snapshot,
-        "sequence_snapshots": [],
-        "render_sim_data": render_sim_data,
-        "trigger_substep_global": int(trigger_substep_global),
-        "summary_json_path": str(summary_json_path),
-        "video_mp4_path": "" if video_mp4_path is None else str(video_mp4_path),
-    }
-    with bundle_path.open("wb") as handle:
-        pickle.dump(bundle, handle)
-    return bundle_path
+    return diagnostics_api.write_force_render_bundle(
+        args=args,
+        device=device,
+        ir_obj=ir_obj,
+        diag_snapshot=diag_snapshot,
+        render_sim_data=render_sim_data,
+        trigger_substep_global=trigger_substep_global,
+        summary_json_path=summary_json_path,
+        video_mp4_path=video_mp4_path,
+    )
 
 
 def _box_surface_info(

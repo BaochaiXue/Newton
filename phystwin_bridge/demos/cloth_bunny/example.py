@@ -28,8 +28,6 @@ Experimental ON viewer:
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import sys
 import time
 from pathlib import Path
@@ -60,8 +58,32 @@ from semiimplicit_bridge_kernels import (
 
 if __package__ in {None, ""}:
     import cloth_bunny.offline as off_case
+    from cloth_bunny.profiling import (
+        PROFILE_GROUPS,
+        PROFILE_OP_NAMES,
+        compute_group_shares,
+        rank_profile_ops,
+        summarize_profile_runs,
+        write_profile_outputs,
+    )
+    from cloth_bunny.runtime import (
+        REQUIRED_RUNTIME_DEVICE,
+        build_example_runtime,
+    )
 else:
     from . import offline as off_case
+    from .profiling import (
+        PROFILE_GROUPS,
+        PROFILE_OP_NAMES,
+        compute_group_shares,
+        rank_profile_ops,
+        summarize_profile_runs,
+        write_profile_outputs,
+    )
+    from .runtime import (
+        REQUIRED_RUNTIME_DEVICE,
+        build_example_runtime,
+    )
 import demo_cloth_box_drop_with_self_contact as on_case
 
 
@@ -71,50 +93,9 @@ DEFAULT_IR = WORKSPACE_ROOT / "Newton/phystwin_bridge/ir/blue_cloth_double_lift_
 DEFAULT_TARGET_TOTAL_MASS = 0.1
 DEFAULT_VBD_ITERATIONS = 15
 DEFAULT_STEPS_PER_RENDER = 1
-REQUIRED_RUNTIME_DEVICE = "cuda:0"
-PROFILE_OP_NAMES = (
-    "particle_grid_build",
-    "model_collide",
-    "eval_spring_forces",
-    "eval_triangle_forces",
-    "eval_bending_forces",
-    "eval_tetrahedra_forces",
-    "eval_body_joint_forces",
-    "eval_particle_contact_forces",
-    "eval_triangle_contact_forces",
-    "eval_body_contact_forces",
-    "eval_particle_body_contact_forces",
-    "integrate_particles",
-    "integrate_bodies",
-    "drag_correction",
-    "solver_step",
-    "total_substep",
-    "total_step",
-)
-PROFILE_GROUPS = {
-    "internal_force": (
-        "eval_spring_forces",
-        "eval_triangle_forces",
-        "eval_bending_forces",
-        "eval_tetrahedra_forces",
-        "eval_body_joint_forces",
-    ),
-    "collision_contact": (
-        "particle_grid_build",
-        "model_collide",
-        "eval_particle_contact_forces",
-        "eval_triangle_contact_forces",
-        "eval_body_contact_forces",
-        "eval_particle_body_contact_forces",
-    ),
-    "integration": (
-        "integrate_particles",
-        "integrate_bodies",
-    ),
-}
 
 
-def create_parser() -> argparse.ArgumentParser:
+def _create_parser_impl() -> argparse.ArgumentParser:
     parser = newton.examples.create_parser()
     parser.description = "Real-time Newton-only cloth-rigid viewer."
 
@@ -286,57 +267,12 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def create_parser() -> argparse.ArgumentParser:
+    return _create_parser_impl()
+
+
 def _resolve_demo_module(mode: str):
     return off_case if mode == "off" else on_case
-
-
-def _resolve_workspace_path(path: Path) -> Path:
-    raw = Path(path).expanduser()
-    if raw.is_absolute():
-        return raw.resolve()
-    cwd_candidate = (Path.cwd() / raw).resolve()
-    if cwd_candidate.exists():
-        return cwd_candidate
-    workspace_candidate = (WORKSPACE_ROOT / raw).resolve()
-    return workspace_candidate
-
-
-def _maybe_autoset_alpha(args: argparse.Namespace, raw_ir: dict[str, np.ndarray]) -> None:
-    if args.mass_spring_scale is not None:
-        return
-    n_obj = int(np.asarray(raw_ir["num_object_points"]).ravel()[0])
-    total_mass = float(np.asarray(raw_ir["mass"], dtype=np.float32)[:n_obj].sum())
-    if total_mass <= 0.0:
-        raise ValueError(f"IR total object mass must be > 0, got {total_mass}")
-    args.mass_spring_scale = float(args.target_total_mass) / total_mass
-
-
-def _prepare_ir_for_runtime(module, args: argparse.Namespace) -> dict[str, Any]:
-    raw_ir = module.load_ir(args.ir)
-    _maybe_autoset_alpha(args, raw_ir)
-    if args.shape_contact_scale is None:
-        args.shape_contact_scale = float(args.mass_spring_scale)
-    ir_obj = module._copy_object_only_ir(raw_ir, args)
-    if "contact_collision_dist" in ir_obj:
-        scaled_dist = float(np.asarray(ir_obj["contact_collision_dist"]).ravel()[0]) * float(args.contact_dist_scale)
-        if args.mode == "on":
-            scaled_dist *= float(args.on_contact_dist_scale)
-        ir_obj["contact_collision_dist"] = np.asarray(scaled_dist, dtype=np.float32)
-    return ir_obj
-
-
-def _require_runtime_device(module, args: argparse.Namespace) -> str:
-    requested = str(
-        args.runtime_device or args.device or module.path_defaults.default_device()
-    )
-    resolved = module.newton_import_ir.resolve_device(requested)
-    if resolved != REQUIRED_RUNTIME_DEVICE:
-        raise RuntimeError(
-            "This realtime viewer is pinned to the local RTX 4090 path and must run "
-            f"on {REQUIRED_RUNTIME_DEVICE}. Requested device resolved to {resolved!r} "
-            f"from {requested!r}. Re-run with --runtime-device {REQUIRED_RUNTIME_DEVICE}."
-        )
-    return resolved
 
 
 class ClothBunnyExample:
@@ -344,93 +280,30 @@ class ClothBunnyExample:
         self.viewer = viewer
         self.args = args
         self.module = _resolve_demo_module(args.mode)
-        self.args.ir = _resolve_workspace_path(self.args.ir)
-        self.args.out_dir = _resolve_workspace_path(self.args.out_dir)
-        self.args.out_dir.mkdir(parents=True, exist_ok=True)
-
-        if args.mode == "on":
-            self.args.rigid_shape = "box"
-            self.args.add_box = bool(getattr(self.args, "add_bunny", True))
-            if self.args.prefix == "cloth_bunny_playground":
-                self.args.prefix = "cloth_box_playground"
-            freeze_profile_cfg = bool(self.args.profile_only) and bool(self.args.freeze_profile_config)
-            if not freeze_profile_cfg:
-                if float(self.args.sim_dt) == 5.0e-5:
-                    self.args.sim_dt = 1.0 / 600.0
-                if int(self.args.substeps) == 667:
-                    self.args.substeps = 10
-                if float(self.args.rigid_mass) == 0.5:
-                    self.args.rigid_mass = 4000.0
-                if float(self.args.body_ke) == 5.0e4:
-                    self.args.body_ke = 1.0e4
-                if float(self.args.body_kd) == 5.0e2:
-                    self.args.body_kd = 1.0e-2
-
-        self.module._validate_scaling_args(self.args)
-        self.device = _require_runtime_device(self.module, self.args)
-        self.ir_obj = _prepare_ir_for_runtime(self.module, self.args)
-        self.model, self.meta, self.n_obj = self.module.build_model(self.ir_obj, self.args, self.device)
-
-        add_rigid_shape = bool(getattr(self.args, "add_box", getattr(self.args, "add_bunny", True)))
-        self.shape_contacts_enabled = bool(self.args.shape_contacts) and add_rigid_shape
-        self.cfg = self.module.newton_import_ir.SimConfig(
-            ir_path=self.args.ir.resolve(),
-            out_dir=self.args.out_dir,
-            output_prefix=self.args.prefix,
-            spring_ke_scale=float(self.args.spring_ke_scale),
-            spring_kd_scale=float(self.args.spring_kd_scale),
-            angular_damping=float(self.args.angular_damping),
-            friction_smoothing=float(self.args.friction_smoothing),
-            enable_tri_contact=True,
-            disable_particle_contact_kernel=(self.args.mode == "off"),
-            shape_contacts=self.shape_contacts_enabled,
-            add_ground_plane=bool(self.args.add_ground_plane),
-            strict_physics_checks=False,
-            apply_drag=bool(self.args.apply_drag),
-            drag_damping_scale=float(self.args.drag_damping_scale),
-            gravity=-float(self.args.gravity_mag),
-            gravity_from_reverse_z=False,
-            up_axis="Z",
-            particle_contacts=True,
-            device=self.device,
+        runtime_assets = build_example_runtime(
+            self.module,
+            self.args,
+            workspace_root=WORKSPACE_ROOT,
+            required_runtime_device=REQUIRED_RUNTIME_DEVICE,
         )
 
-        self.solver = newton.solvers.SolverSemiImplicit(
-            self.model,
-            angular_damping=self.cfg.angular_damping,
-            friction_smoothing=self.cfg.friction_smoothing,
-            enable_tri_contact=self.cfg.enable_tri_contact,
-        )
+        self.device = runtime_assets.device
+        self.ir_obj = runtime_assets.ir_obj
+        self.model = runtime_assets.model
+        self.meta = runtime_assets.meta
+        self.n_obj = runtime_assets.n_obj
+        self.cfg = runtime_assets.cfg
+        self.solver = runtime_assets.solver
         self.collision_pipeline = None
 
         self.steps_per_render = max(1, int(self.args.steps_per_render))
         self.sim_dt = float(self.args.sim_dt)
-        self.drag = 0.0
-        if self.args.apply_drag and "drag_damping" in self.ir_obj:
-            self.drag = float(self.module.newton_import_ir.ir_scalar(self.ir_obj, "drag_damping")) * float(
-                self.args.drag_damping_scale
-            )
-        _, gravity_vec = self.module.newton_import_ir.resolve_gravity(self.cfg, self.ir_obj)
-        gravity_norm = float(np.linalg.norm(gravity_vec))
-        self.gravity_axis = None
-        if bool(self.args.drag_ignore_gravity_axis) and gravity_norm > 1.0e-12:
-            self.gravity_axis = (-np.asarray(gravity_vec, dtype=np.float32) / gravity_norm).astype(np.float32)
-
-        self.particle_grid = self.model.particle_grid
-        self.search_radius = 0.0
-        if self.particle_grid is not None:
-            with wp.ScopedDevice(self.model.device):
-                self.particle_grid.reserve(self.model.particle_count)
-            self.search_radius = float(self.model.particle_max_radius) * 2.0 + float(self.model.particle_cohesion)
-            self.search_radius = max(
-                self.search_radius, float(getattr(self.module.newton_import_ir, "EPSILON", 1.0e-6))
-            )
-
-        self._physical_particle_radius = self.model.particle_radius.numpy().astype(np.float32, copy=False).copy()
-        self._visual_particle_radius = np.minimum(
-            self._physical_particle_radius * float(self.args.particle_radius_vis_scale),
-            float(self.args.particle_radius_vis_min),
-        ).astype(np.float32)
+        self.drag = runtime_assets.drag
+        self.gravity_axis = runtime_assets.gravity_axis
+        self.particle_grid = runtime_assets.particle_grid
+        self.search_radius = runtime_assets.search_radius
+        self._physical_particle_radius = runtime_assets.physical_particle_radius
+        self._visual_particle_radius = runtime_assets.visual_particle_radius
 
         self.pending_reset = False
         self.sim_time = 0.0
@@ -451,6 +324,10 @@ class ClothBunnyExample:
         print("- H: show / hide UI")
         print("- F: frame camera on model")
         print("- ESC: exit")
+
+    @staticmethod
+    def create_parser() -> argparse.ArgumentParser:
+        return _create_parser_impl()
 
     def _profile_call(self, name: str, fn, *args, **kwargs):
         wp.synchronize_device(self.device)
@@ -825,106 +702,10 @@ class ClothBunnyExample:
     def test_final(self):
         pass
 
-    def _profile_num_frames(self) -> int:
-        num_frames = int(getattr(self.args, "num_frames", 0) or 0)
-        if num_frames > 0:
-            return num_frames
-        return max(1, int(self.args.frames))
-
-    def _summarize_profile_runs(self, runs: list[dict[str, Any]]) -> dict[str, Any]:
-        op_names = list(PROFILE_OP_NAMES)
-        summary: dict[str, Any] = {}
-        for name in op_names:
-            run_means = []
-            all_calls = []
-            counts = []
-            for run in runs:
-                samples = run["samples"].get(name, [])
-                counts.append(len(samples))
-                if samples:
-                    run_means.append(float(np.mean(samples)))
-                    all_calls.extend(samples)
-            summary[name] = {
-                "call_count_total": int(len(all_calls)),
-                "call_count_per_run": counts,
-                "run_mean_ms": run_means,
-                "mean_of_run_means_ms": float(np.mean(run_means)) if run_means else 0.0,
-                "std_of_run_means_ms": float(np.std(run_means)) if len(run_means) > 1 else 0.0,
-                "mean_over_all_calls_ms": float(np.mean(all_calls)) if all_calls else 0.0,
-                "std_over_all_calls_ms": float(np.std(all_calls)) if len(all_calls) > 1 else 0.0,
-            }
-        return summary
-
-    def _rank_profile_ops(self, aggregate: dict[str, Any]) -> list[dict[str, Any]]:
-        excluded = {"solver_step", "total_substep", "total_step"}
-        ranking = []
-        for name, stats in aggregate.items():
-            if name in excluded:
-                continue
-            ranking.append(
-                {
-                    "op_name": str(name),
-                    "mean_of_run_means_ms": float(stats["mean_of_run_means_ms"]),
-                    "call_count_total": int(stats["call_count_total"]),
-                }
-            )
-        ranking.sort(key=lambda item: item["mean_of_run_means_ms"], reverse=True)
-        return ranking
-
-    def _profile_group_shares(self, aggregate: dict[str, Any]) -> dict[str, float]:
-        total = float(aggregate.get("total_substep", {}).get("mean_of_run_means_ms", 0.0))
-        if total <= 1.0e-12:
-            return {name: 0.0 for name in PROFILE_GROUPS}
-        shares = {}
-        for group_name, op_names in PROFILE_GROUPS.items():
-            subtotal = 0.0
-            for op_name in op_names:
-                subtotal += float(aggregate.get(op_name, {}).get("mean_of_run_means_ms", 0.0))
-            shares[group_name] = subtotal / total
-        return shares
-
-    def _write_profile_outputs(self, payload: dict[str, Any]) -> tuple[Path, Path]:
-        json_path = (
-            self.args.profile_json.resolve()
-            if self.args.profile_json is not None
-            else (self.args.out_dir / f"{self.args.prefix}_profile.json").resolve()
-        )
-        csv_path = (
-            self.args.profile_csv.resolve()
-            if self.args.profile_csv is not None
-            else (self.args.out_dir / f"{self.args.prefix}_profile.csv").resolve()
-        )
-        json_path.parent.mkdir(parents=True, exist_ok=True)
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-        with csv_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(
-                [
-                    "op_name",
-                    "call_count_total",
-                    "mean_of_run_means_ms",
-                    "std_of_run_means_ms",
-                    "mean_over_all_calls_ms",
-                    "std_over_all_calls_ms",
-                ]
-            )
-            for name, stats in payload["aggregate"].items():
-                writer.writerow(
-                    [
-                        name,
-                        stats["call_count_total"],
-                        stats["mean_of_run_means_ms"],
-                        stats["std_of_run_means_ms"],
-                        stats["mean_over_all_calls_ms"],
-                        stats["std_over_all_calls_ms"],
-                    ]
-                )
-        return json_path, csv_path
-
     def profile_only(self) -> dict[str, Any]:
-        num_frames = self._profile_num_frames()
+        num_frames = int(getattr(self.args, "num_frames", 0) or 0)
+        if num_frames <= 0:
+            num_frames = max(1, int(self.args.frames))
         warmup_runs = max(0, int(self.args.profile_warmup_runs))
         prof_runs = max(1, int(self.args.profile_runs))
 
@@ -955,7 +736,9 @@ class ClothBunnyExample:
             run_episode(record=False)
 
         runs = [run_episode(record=True) for _ in range(prof_runs)]
-        aggregate = self._summarize_profile_runs(runs) if self.profile_mode == "attribution" else {}
+        aggregate = summarize_profile_runs(runs, op_names=PROFILE_OP_NAMES) if self.profile_mode == "attribution" else {}
+        bottleneck_ranking = rank_profile_ops(aggregate) if aggregate else []
+        group_shares = compute_group_shares(aggregate, groups=PROFILE_GROUPS) if aggregate else {}
         payload = {
             "mode": str(self.args.mode),
             "viewer": str(getattr(self.args, "viewer", "unknown")),
@@ -972,24 +755,24 @@ class ClothBunnyExample:
             "profile_runs": int(prof_runs),
             "runs": runs,
             "aggregate": aggregate,
-            "bottleneck_ranking": self._rank_profile_ops(aggregate) if aggregate else [],
-            "group_shares": self._profile_group_shares(aggregate) if aggregate else {},
+            "bottleneck_ranking": bottleneck_ranking,
+            "group_shares": group_shares,
         }
-        json_path, csv_path = self._write_profile_outputs(payload)
+        json_path, csv_path = write_profile_outputs(self.args, payload)
         print(f"Profile JSON: {json_path}", flush=True)
         print(f"Profile CSV: {csv_path}", flush=True)
         if aggregate:
-            for rank in payload["bottleneck_ranking"][:5]:
+            for rank in bottleneck_ranking[:5]:
                 print(
                     f"top op: {rank['op_name']} mean={rank['mean_of_run_means_ms']:.3f} ms calls={rank['call_count_total']}",
                     flush=True,
                 )
-            print(f"group shares: {payload['group_shares']}", flush=True)
+            print(f"group shares: {group_shares}", flush=True)
         return payload
 
 
 def main() -> int:
-    parser = create_parser()
+    parser = ClothBunnyExample.create_parser()
     viewer, args = newton.examples.init(parser)
     wp.init()
     example = ClothBunnyExample(viewer, args)
