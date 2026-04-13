@@ -1,0 +1,1192 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import json
+import math
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import warp as wp
+from PIL import Image, ImageDraw
+from pxr import Usd
+
+from bridge_bootstrap import newton, newton_import_ir
+from bridge_deformable_common import _copy_object_only_ir, _effective_spring_scales, load_ir
+from bridge_shared import apply_viewer_shape_colors
+from newton._src.viewer.viewer_gl import ViewerGL
+from newton.geometry import HydroelasticSDF
+
+import newton.ik as ik
+import newton.usd
+import newton.utils
+
+
+DEFAULT_IR = Path(__file__).resolve().parents[1] / "ir" / "rope_double_hand" / "phystwin_ir_v2_bf_strict.npz"
+
+
+def quat_to_vec4(q: wp.quat) -> wp.vec4:
+    return wp.vec4(q[0], q[1], q[2], q[3])
+
+
+def _ffmpeg_encode_mp4(width: int, height: int, fps: int, output_path: Path) -> subprocess.Popen[bytes]:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        str(output_path),
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+
+def _make_gif(mp4_path: Path, gif_path: Path, fps: int = 15, width: int = 720) -> None:
+    palette = gif_path.with_suffix(".palette.png")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(mp4_path),
+            "-vf",
+            f"fps={fps},scale={width}:-1:flags=lanczos,palettegen",
+            str(palette),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(mp4_path),
+            "-i",
+            str(palette),
+            "-lavfi",
+            f"fps={fps},scale={width}:-1:flags=lanczos[x];[x][1:v]paletteuse",
+            str(gif_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    palette.unlink(missing_ok=True)
+
+
+def _save_contact_sheet(frames: list[np.ndarray], output_path: Path, cols: int = 3) -> None:
+    if not frames:
+        return
+    h, w, _ = frames[0].shape
+    rows = math.ceil(len(frames) / cols)
+    canvas = Image.new("RGB", (cols * w, rows * h), (245, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+    for idx, frame in enumerate(frames):
+        r = idx // cols
+        c = idx % cols
+        image = Image.fromarray(frame)
+        x = c * w
+        y = r * h
+        canvas.paste(image, (x, y))
+        draw.rectangle((x, y, x + 180, y + 28), fill=(0, 0, 0))
+        draw.text((x + 8, y + 6), f"frame {idx}", fill=(255, 255, 255))
+    canvas.save(output_path)
+
+
+def _quat_xyzw_to_rotmat(q_xyzw: np.ndarray) -> np.ndarray:
+    x, y, z, w = [float(v) for v in np.asarray(q_xyzw, dtype=np.float32)]
+    n = max((x * x + y * y + z * z + w * w) ** 0.5, 1.0e-12)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.asarray(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _quat_rotate_np(q_xyzw: np.ndarray, v: np.ndarray) -> np.ndarray:
+    return _quat_xyzw_to_rotmat(q_xyzw) @ np.asarray(v, dtype=np.float32)
+
+
+def _transform_point_np(tf_xyzw: np.ndarray, p_local: np.ndarray) -> np.ndarray:
+    pos = np.asarray(tf_xyzw[:3], dtype=np.float32)
+    quat = np.asarray(tf_xyzw[3:7], dtype=np.float32)
+    return pos + _quat_rotate_np(quat, p_local)
+
+
+def _transform_wrench_body_to_world(tf_xyzw: np.ndarray, wrench_body: np.ndarray) -> np.ndarray:
+    quat = np.asarray(tf_xyzw[3:7], dtype=np.float32)
+    f_world = _quat_rotate_np(quat, wrench_body[:3])
+    tau_world = _quat_rotate_np(quat, wrench_body[3:6])
+    return np.concatenate([f_world, tau_world], axis=0).astype(np.float32, copy=False)
+
+
+def _parse_contact_count(count_array: wp.array) -> int:
+    return int(np.asarray(count_array.numpy()).reshape(-1)[0])
+
+
+@dataclass
+class FingerShapeSpec:
+    body_name: str
+    mesh: Any
+    local_xform: Any
+    scale: tuple[float, float, float]
+    label: str
+    is_pad: bool
+
+
+@dataclass
+class RigidStepMetrics:
+    frame: int
+    time_s: float
+    target_xyz: np.ndarray
+    actual_ee_xyz: np.ndarray
+    ee_error_m: float
+    robot_table_contacts: int
+    finger_table_contacts: int
+    nonfinger_table_contacts: int
+
+
+class NativePandaRigidSide:
+    def __init__(self, viewer: ViewerGL, args: argparse.Namespace):
+        self.viewer = viewer
+        self.args = args
+        self.video_fps = int(args.video_fps)
+        self.frame_dt = 1.0 / float(self.video_fps)
+        self.sim_substeps = int(args.sim_substeps_rigid)
+        self.sim_dt = self.frame_dt / float(self.sim_substeps)
+        self.sim_time = 0.0
+        self.frame_idx = 0
+
+        self.table_half_extents = np.array([0.10, 0.10, 0.05], dtype=np.float32)
+        self.table_pos = np.array([0.08, -0.50, 0.05], dtype=np.float32)
+        self.table_top_z = float(self.table_pos[2] + self.table_half_extents[2])
+
+        self.push_direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        self._build_scene()
+        self._setup_ik()
+        self._setup_motion_defaults()
+        self._set_camera()
+
+    def _build_scene(self) -> None:
+        shape_cfg = newton.ModelBuilder.ShapeConfig(
+            kh=1e11,
+            sdf_max_resolution=64,
+            is_hydroelastic=True,
+            sdf_narrow_band_range=(-0.01, 0.01),
+            gap=0.01,
+            mu_torsional=0.0,
+            mu_rolling=0.0,
+        )
+        mesh_shape_cfg = copy.deepcopy(shape_cfg)
+        mesh_shape_cfg.sdf_max_resolution = None
+        mesh_shape_cfg.sdf_target_voxel_size = None
+        mesh_shape_cfg.sdf_narrow_band_range = (-0.1, 0.1)
+        hydro_mesh_sdf_max_resolution = 64
+
+        builder = newton.ModelBuilder()
+        urdf_shape_cfg = copy.deepcopy(shape_cfg)
+        urdf_shape_cfg.is_hydroelastic = False
+        urdf_shape_cfg.sdf_max_resolution = None
+        urdf_shape_cfg.sdf_target_voxel_size = None
+        urdf_shape_cfg.sdf_narrow_band_range = (-0.1, 0.1)
+        builder.default_shape_cfg = urdf_shape_cfg
+
+        builder.add_urdf(
+            newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
+            xform=wp.transform((-0.5, -0.5, 0.05), wp.quat_identity()),
+            enable_self_collisions=False,
+            parse_visuals_as_colliders=True,
+        )
+        builder.default_shape_cfg = shape_cfg
+
+        def find_body(name: str) -> int:
+            return next(i for i, lbl in enumerate(builder.body_label) if lbl.endswith(f"/{name}"))
+
+        self.left_finger_body_idx = find_body("fr3_leftfinger")
+        self.right_finger_body_idx = find_body("fr3_rightfinger")
+        self.hand_body_idx = find_body("fr3_hand")
+        self.ee_index = 10
+
+        finger_body_indices = {self.left_finger_body_idx, self.right_finger_body_idx, self.hand_body_idx}
+        self.finger_shape_indices: list[int] = []
+        self.nonfinger_shape_indices: list[int] = []
+        self.contact_shape_specs: list[FingerShapeSpec] = []
+        self.pad_center_locals: dict[str, np.ndarray] = {}
+
+        for shape_idx, body_idx in enumerate(builder.shape_body):
+            if body_idx in finger_body_indices and builder.shape_type[shape_idx] == newton.GeoType.MESH:
+                mesh = builder.shape_source[shape_idx]
+                if mesh is not None and mesh.sdf is None:
+                    shape_scale = np.asarray(builder.shape_scale[shape_idx], dtype=np.float32)
+                    if not np.allclose(shape_scale, 1.0):
+                        mesh = mesh.copy(vertices=mesh.vertices * shape_scale, recompute_inertia=True)
+                        builder.shape_source[shape_idx] = mesh
+                        builder.shape_scale[shape_idx] = (1.0, 1.0, 1.0)
+                    mesh.build_sdf(
+                        max_resolution=hydro_mesh_sdf_max_resolution,
+                        narrow_band_range=shape_cfg.sdf_narrow_band_range,
+                        margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
+                    )
+                builder.shape_flags[shape_idx] |= newton.ShapeFlags.HYDROELASTIC
+                self.finger_shape_indices.append(shape_idx)
+            elif body_idx >= 0:
+                builder.shape_flags[shape_idx] &= ~newton.ShapeFlags.HYDROELASTIC
+                self.nonfinger_shape_indices.append(shape_idx)
+
+        builder.approximate_meshes(
+            method="convex_hull",
+            shape_indices=self.nonfinger_shape_indices,
+            keep_visual_shapes=True,
+        )
+
+        init_q = [
+            -3.6802115e-03,
+            2.3901723e-02,
+            3.6804110e-03,
+            -2.3683236e00,
+            -1.2918962e-04,
+            2.3922248e00,
+            7.8549200e-01,
+        ]
+        builder.joint_q[:9] = [*init_q, 0.04, 0.04]
+        builder.joint_target_pos[:9] = [*init_q, 0.04, 0.04]
+        builder.joint_target_ke[:9] = [650.0] * 9
+        builder.joint_target_kd[:9] = [100.0] * 9
+        builder.joint_effort_limit[:7] = [80.0] * 7
+        builder.joint_effort_limit[7:9] = [20.0] * 2
+        builder.joint_armature[:7] = [0.1] * 7
+        builder.joint_armature[7:9] = [0.5] * 2
+
+        pad_asset_path = newton.utils.download_asset("manipulation_objects/pad")
+        pad_stage = Usd.Stage.Open(str(pad_asset_path / "model.usda"))
+        pad_mesh = newton.usd.get_mesh(
+            pad_stage.GetPrimAtPath("/root/Model/Model"),
+            load_normals=True,
+            face_varying_normal_conversion="vertex_splitting",
+        )
+        pad_scale = np.asarray(newton.usd.get_scale(pad_stage.GetPrimAtPath("/root/Model")), dtype=np.float32)
+        if not np.allclose(pad_scale, 1.0):
+            pad_mesh = pad_mesh.copy(vertices=pad_mesh.vertices * pad_scale, recompute_inertia=True)
+        pad_mesh.build_sdf(
+            max_resolution=hydro_mesh_sdf_max_resolution,
+            narrow_band_range=shape_cfg.sdf_narrow_band_range,
+            margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
+        )
+        self.pad_xform = wp.transform(
+            wp.vec3(0.0, 0.005, 0.045),
+            wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -np.pi),
+        )
+        left_pad_shape = builder.add_shape_mesh(
+            body=self.left_finger_body_idx,
+            mesh=pad_mesh,
+            xform=self.pad_xform,
+            cfg=mesh_shape_cfg,
+            label="left_pad",
+        )
+        right_pad_shape = builder.add_shape_mesh(
+            body=self.right_finger_body_idx,
+            mesh=pad_mesh,
+            xform=self.pad_xform,
+            cfg=mesh_shape_cfg,
+            label="right_pad",
+        )
+        self.finger_shape_indices.extend([left_pad_shape, right_pad_shape])
+
+        table_mesh = newton.Mesh.create_box(
+            float(self.table_half_extents[0]),
+            float(self.table_half_extents[1]),
+            float(self.table_half_extents[2]),
+            duplicate_vertices=True,
+            compute_normals=False,
+            compute_uvs=False,
+            compute_inertia=True,
+        )
+        table_mesh.build_sdf(
+            max_resolution=hydro_mesh_sdf_max_resolution,
+            narrow_band_range=shape_cfg.sdf_narrow_band_range,
+            margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
+        )
+        self.table_shape_idx = builder.add_shape_mesh(
+            body=-1,
+            mesh=table_mesh,
+            xform=wp.transform(wp.vec3(*self.table_pos.tolist()), wp.quat_identity()),
+            cfg=mesh_shape_cfg,
+            label="split_probe_table",
+        )
+
+        builder.add_ground_plane()
+
+        for body_name, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx)):
+            for shape_idx in builder.body_shapes[body_idx]:
+                if builder.shape_type[shape_idx] != newton.GeoType.MESH:
+                    continue
+                mesh = builder.shape_source[shape_idx]
+                if mesh is None:
+                    continue
+                label = str(builder.shape_label[shape_idx])
+                is_pad = "pad" in label
+                local_xform = builder.shape_transform[shape_idx]
+                scale = tuple(float(v) for v in builder.shape_scale[shape_idx])
+                self.contact_shape_specs.append(
+                    FingerShapeSpec(
+                        body_name=body_name,
+                        mesh=mesh,
+                        local_xform=local_xform,
+                        scale=scale,
+                        label=label,
+                        is_pad=is_pad,
+                    )
+                )
+                if is_pad:
+                    self.pad_center_locals[body_name] = np.asarray(local_xform[:3], dtype=np.float32)
+
+        self.model_single = copy.deepcopy(builder).finalize()
+        self.model = builder.finalize()
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+
+        sdf_hydroelastic_config = HydroelasticSDF.Config(
+            output_contact_surface=hasattr(self.viewer, "renderer"),
+        )
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            reduce_contacts=True,
+            broad_phase="explicit",
+            sdf_hydroelastic_config=sdf_hydroelastic_config,
+        )
+        self.contacts = self.collision_pipeline.contacts()
+        self.solver = newton.solvers.SolverMuJoCo(
+            self.model,
+            use_mujoco_contacts=False,
+            solver="newton",
+            integrator="implicitfast",
+            cone="elliptic",
+            njmax=500,
+            nconmax=500,
+            iterations=15,
+            ls_iterations=100,
+            impratio=1000.0,
+        )
+        self.control = self.model.control()
+        self.viewer.set_model(self.model)
+
+    def _setup_motion_defaults(self) -> None:
+        self.settle_frames = int(round(2.0 / self.frame_dt))
+        self.approach_frames = int(round(0.5 / self.frame_dt))
+        self.retract_frames = int(round(1.0 / self.frame_dt))
+        self.push_path_length_m = 0.08
+        self.push_speed_mps = 0.03
+        self.push_frames = max(1, int(round(self.push_path_length_m / (self.push_speed_mps * self.frame_dt))))
+        self.total_frames = self.settle_frames + self.approach_frames + self.push_frames + self.retract_frames
+        self.target_y = float(self.table_pos[1] + self.table_half_extents[1] - 0.05)
+        self.prepush_x = -0.08
+        self.push_end_x = self.prepush_x + self.push_path_length_m
+        self.prepush_z = float(self.table_top_z + float(self.args.push_clearance))
+        self.retract_z = self.prepush_z + 0.06
+        self.gripper_opening = float(self.args.gripper_opening)
+        self.target_rotation = wp.mul(
+            wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi),
+            wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(self.args.gripper_yaw)),
+        )
+        self.leading_side_name = "right"
+        self.leading_pad_offset_world = np.zeros(3, dtype=np.float32)
+        self.pad_far_xyz = np.array([self.prepush_x - 0.12, self.target_y - 0.03, self.prepush_z + 0.08], dtype=np.float32)
+        self.pad_push_start_xyz = np.array([self.prepush_x, self.target_y, self.prepush_z], dtype=np.float32)
+        self.pad_push_end_xyz = np.array([self.push_end_x, self.target_y, self.prepush_z], dtype=np.float32)
+
+    def configure_for_rope(self, rope_radius_m: float, rope_line_center_x: float, rope_line_y: float) -> None:
+        self.target_y = float(rope_line_y)
+        self.prepush_z = float(self.table_top_z + float(rope_radius_m) + 0.003)
+        self.retract_z = self.prepush_z + 0.06
+        self.pad_push_start_xyz = np.array([float(rope_line_center_x - 0.06), self.target_y, self.prepush_z], dtype=np.float32)
+        self.pad_push_end_xyz = np.array([float(self.pad_push_start_xyz[0] + self.push_path_length_m), self.target_y, self.prepush_z], dtype=np.float32)
+        self.pad_far_xyz = np.array(
+            [float(self.pad_push_start_xyz[0] - 0.12), float(self.target_y - 0.03), self.prepush_z + 0.08],
+            dtype=np.float32,
+        )
+        self._calibrate_pad_offset()
+
+    def _solve_single_fk(self, ee_target_xyz: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
+        self.pos_obj.set_target_positions(wp.array([ee_target_xyz], dtype=wp.vec3))
+        self.rot_obj.set_target_rotations(wp.array([quat_to_vec4(self.target_rotation)], dtype=wp.vec4))
+        self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
+        q_np = self.joint_q_ik.numpy().astype(np.float32, copy=False).reshape(-1)
+        state_tmp = self.model_single.state()
+        q_wp = wp.array(q_np, dtype=wp.float32, device=self.model_single.device)
+        qd_wp = wp.zeros(self.model_single.joint_dof_count, dtype=wp.float32, device=self.model_single.device)
+        newton.eval_fk(self.model_single, q_wp, qd_wp, state_tmp)
+        body_q_np = state_tmp.body_q.numpy().astype(np.float32, copy=False)
+        ee_xyz = np.asarray(body_q_np[self.ee_index][:3], dtype=np.float32)
+        side_centers = {}
+        side_body_q = {}
+        for side, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx)):
+            center = _transform_point_np(body_q_np[body_idx], self.pad_center_locals[side])
+            side_centers[side] = center
+            side_body_q[side] = body_q_np[body_idx].copy()
+        return ee_xyz, side_centers, side_body_q
+
+    def _calibrate_pad_offset(self) -> None:
+        nominal_ee = self.pad_push_start_xyz.copy()
+        ee_xyz, side_centers, _ = self._solve_single_fk(nominal_ee)
+        projections = {side: float(np.dot(center, self.push_direction)) for side, center in side_centers.items()}
+        self.leading_side_name = max(projections, key=projections.get)
+        self.leading_pad_offset_world = ee_xyz - side_centers[self.leading_side_name]
+        self.parking_mirror_state = {
+            "left": {
+                "body_q": np.asarray([-0.55, -0.95, 0.45, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+                "body_qd": np.zeros(6, dtype=np.float32),
+            },
+            "right": {
+                "body_q": np.asarray([-0.52, -0.95, 0.45, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+                "body_qd": np.zeros(6, dtype=np.float32),
+            },
+        }
+
+    def _setup_ik(self) -> None:
+        self.state_single = self.model_single.state()
+        newton.eval_fk(self.model_single, self.model_single.joint_q, self.model_single.joint_qd, self.state_single)
+        body_q_np = self.state_single.body_q.numpy()
+        self.ee_tf = wp.transform(*body_q_np[self.ee_index])
+
+        self.pos_obj = ik.IKObjectivePosition(
+            link_index=self.ee_index,
+            link_offset=wp.vec3(0.0, 0.0, 0.0),
+            target_positions=wp.array([wp.transform_get_translation(self.ee_tf)], dtype=wp.vec3),
+        )
+        self.rot_obj = ik.IKObjectiveRotation(
+            link_index=self.ee_index,
+            link_offset_rotation=wp.quat_identity(),
+            target_rotations=wp.array([quat_to_vec4(wp.transform_get_rotation(self.ee_tf))], dtype=wp.vec4),
+        )
+        self.obj_joint_limits = ik.IKObjectiveJointLimit(
+            joint_limit_lower=self.model_single.joint_limit_lower,
+            joint_limit_upper=self.model_single.joint_limit_upper,
+        )
+        self.joint_q_ik = wp.array(self.model_single.joint_q, shape=(1, self.model_single.joint_coord_count))
+        self.ik_solver = ik.IKSolver(
+            model=self.model_single,
+            n_problems=1,
+            objectives=[self.pos_obj, self.rot_obj, self.obj_joint_limits],
+            lambda_initial=0.1,
+            jacobian_mode=ik.IKJacobianType.ANALYTIC,
+        )
+        self.ik_iters = 24
+
+    def _set_camera(self) -> None:
+        self.viewer.set_camera(wp.vec3(0.36, -0.03, 0.33), -14.0, -120.0)
+        if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "fov"):
+            self.viewer.camera.fov = 68.0
+
+    def current_target_position(self) -> np.ndarray:
+        if self.frame_idx < self.settle_frames:
+            pad_xyz = self.pad_far_xyz
+        elif self.frame_idx < self.settle_frames + self.approach_frames:
+            alpha = (self.frame_idx - self.settle_frames) / max(self.approach_frames - 1, 1)
+            pad_xyz = (1.0 - alpha) * self.pad_far_xyz + alpha * self.pad_push_start_xyz
+        elif self.frame_idx < self.settle_frames + self.approach_frames + self.push_frames:
+            alpha = (self.frame_idx - self.settle_frames - self.approach_frames) / max(self.push_frames - 1, 1)
+            pad_xyz = (1.0 - alpha) * self.pad_push_start_xyz + alpha * self.pad_push_end_xyz
+        else:
+            alpha = (self.frame_idx - self.settle_frames - self.approach_frames - self.push_frames) / max(self.retract_frames - 1, 1)
+            pad_xyz = (1.0 - alpha) * self.pad_push_end_xyz + alpha * (self.pad_far_xyz + np.array([0.02, 0.0, 0.0], dtype=np.float32))
+        return pad_xyz + self.leading_pad_offset_world
+
+    def _robot_table_counts(self) -> tuple[int, int, int]:
+        count = _parse_contact_count(self.contacts.rigid_contact_count)
+        if count <= 0:
+            return 0, 0, 0
+        shape0 = self.contacts.rigid_contact_shape0.numpy()[:count].astype(np.int32, copy=False)
+        shape1 = self.contacts.rigid_contact_shape1.numpy()[:count].astype(np.int32, copy=False)
+        robot_total = 0
+        finger = 0
+        nonfinger = 0
+        finger_shapes = set(self.finger_shape_indices)
+        nonfinger_shapes = set(self.nonfinger_shape_indices)
+        for s0, s1 in zip(shape0, shape1, strict=False):
+            pair = {int(s0), int(s1)}
+            if self.table_shape_idx not in pair:
+                continue
+            other = int(s1) if int(s0) == self.table_shape_idx else int(s0)
+            robot_total += 1
+            if other in finger_shapes:
+                finger += 1
+            elif other in nonfinger_shapes:
+                nonfinger += 1
+        return robot_total, finger, nonfinger
+
+    def step(self, external_world_wrenches: dict[str, np.ndarray] | None = None) -> RigidStepMetrics:
+        target_position = self.current_target_position()
+        self.pos_obj.set_target_positions(wp.array([target_position], dtype=wp.vec3))
+        self.rot_obj.set_target_rotations(wp.array([quat_to_vec4(self.target_rotation)], dtype=wp.vec4))
+        self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
+        self.control.joint_target_pos.zero_()
+        wp.copy(self.control.joint_target_pos, self.joint_q_ik.flatten())
+        self.control.joint_target_pos[7:9].fill_(self.gripper_opening)
+
+        external = external_world_wrenches or {}
+        for _ in range(self.sim_substeps):
+            self.state_0.clear_forces()
+            self.state_1.clear_forces()
+
+            if external:
+                body_f = self.state_0.body_f.numpy()
+                for body_name, wrench in external.items():
+                    body_idx = self.left_finger_body_idx if body_name == "left" else self.right_finger_body_idx
+                    body_f[body_idx, :6] += np.asarray(wrench, dtype=np.float32)
+                self.state_0.body_f.assign(body_f)
+
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.state_0, self.state_1 = self.state_1, self.state_0
+
+        body_q = self.state_0.body_q.numpy()
+        actual_ee = np.asarray(body_q[self.ee_index][:3], dtype=np.float32)
+        robot_total, finger_count, nonfinger_count = self._robot_table_counts()
+        ee_error = float(np.linalg.norm(target_position - actual_ee))
+        metrics = RigidStepMetrics(
+            frame=int(self.frame_idx),
+            time_s=float(self.sim_time),
+            target_xyz=target_position,
+            actual_ee_xyz=actual_ee,
+            ee_error_m=ee_error,
+            robot_table_contacts=robot_total,
+            finger_table_contacts=finger_count,
+            nonfinger_table_contacts=nonfinger_count,
+        )
+        self.frame_idx += 1
+        self.sim_time += self.frame_dt
+        return metrics
+
+    def render(self) -> None:
+        self.viewer.begin_frame(self.sim_time)
+        self.viewer.log_state(self.state_0)
+        self.viewer.log_contacts(self.contacts, self.state_0)
+
+    def end_render(self) -> None:
+        self.viewer.end_frame()
+
+    def mirror_body_state(self) -> dict[str, dict[str, np.ndarray]]:
+        body_q = self.state_0.body_q.numpy().astype(np.float32, copy=False)
+        body_qd = self.state_0.body_qd.numpy().astype(np.float32, copy=False)
+        return {
+            "left": {"body_q": body_q[self.left_finger_body_idx].copy(), "body_qd": body_qd[self.left_finger_body_idx].copy()},
+            "right": {"body_q": body_q[self.right_finger_body_idx].copy(), "body_qd": body_qd[self.right_finger_body_idx].copy()},
+        }
+
+    def leading_side(self) -> str:
+        return self.leading_side_name
+
+    def parked_mirror_state(self) -> dict[str, dict[str, np.ndarray]]:
+        return {
+            side: {
+                "body_q": self.parking_mirror_state[side]["body_q"].copy(),
+                "body_qd": self.parking_mirror_state[side]["body_qd"].copy(),
+            }
+            for side in ("left", "right")
+        }
+
+
+class SemiImplicitRopeSide:
+    def __init__(self, args: argparse.Namespace, rigid: NativePandaRigidSide):
+        self.args = args
+        self.rigid = rigid
+        self.device = args.device
+        self._build_rope_ir()
+        self._build_model()
+        self._setup_render_metadata()
+        self.frame_idx = 0
+        self.last_world_wrench = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
+
+    def _build_rope_ir(self) -> None:
+        raw_ir = load_ir(Path(self.args.ir))
+        scale_args = SimpleNamespace(
+            object_mass=1.0,
+            mass_spring_scale=None,
+            spring_ke_scale=1.0,
+            spring_kd_scale=1.0,
+            particle_radius_scale=float(self.args.particle_radius_scale),
+        )
+        rope_ir = _copy_object_only_ir(raw_ir, scale_args)
+        x0 = np.asarray(rope_ir["x0"], dtype=np.float32).copy()
+        bbox_min = x0.min(axis=0)
+        bbox_max = x0.max(axis=0)
+        center = 0.5 * (bbox_min + bbox_max)
+
+        target_center = np.array(
+            [
+                self.rigid.prepush_x + 0.05,
+                self.rigid.table_pos[1] - self.rigid.table_half_extents[1] + 0.09,
+                self.rigid.table_top_z + 0.015,
+            ],
+            dtype=np.float32,
+        )
+        shift = target_center - center
+        shifted = (x0 + shift).astype(np.float32, copy=False)
+        table_edge_y = float(self.rigid.table_pos[1] - self.rigid.table_half_extents[1])
+        overhang_mask = shifted[:, 1] < table_edge_y
+        if np.any(overhang_mask):
+            hang = (table_edge_y - shifted[overhang_mask, 1]).astype(np.float32, copy=False)
+            shifted[overhang_mask, 2] -= 0.40 * hang
+            min_clearance = float(np.mean(np.asarray(rope_ir["collision_radius"], dtype=np.float32))) + 0.002
+            shifted[:, 2] = np.maximum(shifted[:, 2], min_clearance)
+        rope_ir["x0"] = shifted
+        rope_ir["v0"] = np.zeros_like(rope_ir["x0"], dtype=np.float32)
+        self.rope_ir = rope_ir
+        self.rope_shift = shift.astype(np.float32, copy=False)
+        self.n_obj = int(np.asarray(rope_ir["num_object_points"]).ravel()[0])
+        self.rope_center_target_x = float(target_center[0])
+        self.rope_line_target_y = float(target_center[1])
+
+    def _contact_cfg(self, params: dict[str, float]) -> Any:
+        cfg = newton.ModelBuilder.ShapeConfig()
+        cfg.ke = float(params["ke"])
+        cfg.kd = float(params["kd"])
+        cfg.kf = float(params["kf"])
+        cfg.mu = float(params["mu"])
+        return cfg
+
+    def _build_model(self) -> None:
+        cfg = newton_import_ir.SimConfig(
+            ir_path=Path(self.args.ir).resolve(),
+            out_dir=Path(self.args.out_dir).resolve(),
+            output_prefix="robot_table_rope_split",
+            spring_ke_scale=float(self.args.spring_ke_scale),
+            spring_kd_scale=float(self.args.spring_kd_scale),
+            angular_damping=float(self.args.angular_damping),
+            friction_smoothing=float(self.args.friction_smoothing),
+            enable_tri_contact=True,
+            disable_particle_contact_kernel=True,
+            shape_contacts=True,
+            add_ground_plane=True,
+            strict_physics_checks=False,
+            apply_drag=bool(self.args.apply_drag),
+            drag_damping_scale=float(self.args.drag_damping_scale),
+            gravity=-float(self.args.gravity_mag),
+            gravity_from_reverse_z=False,
+            up_axis="Z",
+            particle_contacts=False,
+            device=self.device,
+        )
+        rope_checks = newton_import_ir.validate_ir_physics(self.rope_ir, cfg)
+        rope_contact = self._map_object_contact_params(self.rope_ir, cfg)
+        rope_ground = self._map_ground_contact_params(self.rope_ir, cfg)
+
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z, gravity=0.0)
+        radius, _, _ = newton_import_ir._add_particles(builder, self.rope_ir, cfg, particle_contacts=False)
+        newton_import_ir._add_springs(builder, self.rope_ir, cfg, rope_checks)
+        ground_cfg = self._contact_cfg(rope_ground)
+        self.ground_shape_idx = builder.add_ground_plane(cfg=ground_cfg, label="rope_ground")
+
+        shape_cfg = self._contact_cfg(rope_contact)
+        table_mesh = newton.Mesh.create_box(
+            float(self.rigid.table_half_extents[0]),
+            float(self.rigid.table_half_extents[1]),
+            float(self.rigid.table_half_extents[2]),
+            duplicate_vertices=True,
+            compute_normals=False,
+            compute_uvs=False,
+            compute_inertia=True,
+        )
+        table_mesh.build_sdf(
+            max_resolution=64,
+            narrow_band_range=(-0.01, 0.01),
+            margin=0.05,
+        )
+        self.table_shape_idx = builder.add_shape_mesh(
+            body=-1,
+            mesh=table_mesh,
+            xform=wp.transform(wp.vec3(*self.rigid.table_pos.tolist()), wp.quat_identity()),
+            cfg=shape_cfg,
+            label="rope_table",
+        )
+
+        self.mirror_body_ids: dict[str, int] = {}
+        self.mirror_joint_q_start: dict[str, int] = {}
+        self.mirror_joint_qd_start: dict[str, int] = {}
+        self.side_shape_indices = {"left": [], "right": []}
+        self.pad_shape_indices = {"left": [], "right": []}
+
+        for side in ("left", "right"):
+            state = self.rigid.mirror_body_state()[side]
+            body_id = builder.add_link(
+                xform=wp.transform(*state["body_q"]),
+                label=f"mirror_{side}_finger",
+                is_kinematic=True,
+            )
+            joint_id = builder.add_joint_free(child=body_id, label=f"mirror_{side}_joint")
+            builder.add_articulation([joint_id], label=f"mirror_{side}_articulation")
+            self.mirror_body_ids[side] = body_id
+            self.mirror_joint_q_start[side] = builder.joint_q_start[joint_id]
+            self.mirror_joint_qd_start[side] = builder.joint_qd_start[joint_id]
+
+        for spec in self.rigid.contact_shape_specs:
+            body_id = self.mirror_body_ids[spec.body_name]
+            mesh_copy = spec.mesh.copy()
+            shape_idx = builder.add_shape_mesh(
+                body=body_id,
+                mesh=mesh_copy,
+                xform=spec.local_xform,
+                scale=spec.scale,
+                cfg=shape_cfg,
+                label=f"mirror_{spec.body_name}_{spec.label}",
+            )
+            self.side_shape_indices[spec.body_name].append(shape_idx)
+            if spec.is_pad:
+                self.pad_shape_indices[spec.body_name].append(shape_idx)
+
+        self.model = builder.finalize(device=self.device)
+        self.model.set_gravity((0.0, 0.0, -float(self.args.gravity_mag)))
+        self.model.soft_contact_ke = float(rope_contact["ke"])
+        self.model.soft_contact_kd = float(rope_contact["kd"])
+        self.model.soft_contact_kf = float(rope_contact["kf"])
+        self.model.soft_contact_mu = float(rope_contact["mu"])
+
+        self.state_in = self.model.state()
+        self.state_out = self.model.state()
+        self.control = self.model.control()
+        self.contacts = self.model.contacts()
+        self.solver = newton.solvers.SolverSemiImplicit(
+            self.model,
+            angular_damping=float(self.args.angular_damping),
+            friction_smoothing=float(self.args.friction_smoothing),
+            enable_tri_contact=True,
+        )
+        self.physical_radius = self.model.particle_radius.numpy().astype(np.float32, copy=False)[: self.n_obj].copy()
+        self.render_radius = self.physical_radius.copy()
+        self.rope_spring_edges = np.asarray(self.rope_ir["spring_edges"], dtype=np.int32).copy()
+        self.drag = float(newton_import_ir.ir_scalar(self.rope_ir, "drag_damping")) * float(self.args.drag_damping_scale) if self.args.apply_drag and "drag_damping" in self.rope_ir else 0.0
+
+        gravity_vec = np.array([0.0, 0.0, -float(self.args.gravity_mag)], dtype=np.float32)
+        gravity_norm = float(np.linalg.norm(gravity_vec))
+        self.gravity_axis = None
+        if gravity_norm > 1.0e-12:
+            self.gravity_axis = (-gravity_vec / gravity_norm).astype(np.float32)
+
+    def _map_object_contact_params(self, ir: dict[str, Any], cfg: newton_import_ir.SimConfig) -> dict[str, float]:
+        elas_raw = float(newton_import_ir.ir_scalar(ir, "contact_collide_object_elas"))
+        fric_raw = float(newton_import_ir.ir_scalar(ir, "contact_collide_object_fric"))
+        mu = float(np.clip(fric_raw, 0.0, newton_import_ir.MU_MAX))
+        zeta = float(newton_import_ir._restitution_to_damping_ratio(elas_raw))
+        ke = 1.0e3
+        m_ref = float(newton_import_ir._resolve_object_mass_reference(ir))
+        m_eff_ref = max(0.5 * m_ref, float(newton_import_ir.EPSILON))
+        kd = 2.0 * zeta * np.sqrt(ke * m_eff_ref)
+        kf = kd
+        return {"ke": float(ke), "kd": float(kd), "kf": float(kf), "mu": float(mu)}
+
+    def _map_ground_contact_params(self, ir: dict[str, Any], cfg: newton_import_ir.SimConfig) -> dict[str, float]:
+        tmp_builder = newton.ModelBuilder(up_axis=newton.Axis.from_any("Z"), gravity=0.0)
+        gcfg = tmp_builder.default_shape_cfg.copy()
+        checks: dict[str, Any] = {}
+        newton_import_ir._configure_ground_contact_material(gcfg, ir, cfg, checks, context="split_ground")
+        return {"ke": float(gcfg.ke), "kd": float(gcfg.kd), "kf": float(gcfg.kf), "mu": float(gcfg.mu)}
+
+    def _setup_render_metadata(self) -> None:
+        self.rope_color = wp.array(np.tile(np.asarray([[0.96, 0.78, 0.47]], dtype=np.float32), (self.n_obj, 1)), dtype=wp.vec3)
+        stride = max(1, int(self.args.rope_spring_stride))
+        self.render_edges = self.rope_spring_edges[::stride].astype(np.int32, copy=False)
+
+    def _sync_mirror_body(self, side: str, pose: dict[str, np.ndarray]) -> None:
+        body_q = self.state_in.body_q.numpy()
+        body_qd = self.state_in.body_qd.numpy()
+        q = self.state_in.joint_q.numpy()
+        qd = self.state_in.joint_qd.numpy()
+        body_idx = self.mirror_body_ids[side]
+        q_start = self.mirror_joint_q_start[side]
+        qd_start = self.mirror_joint_qd_start[side]
+
+        body_q[body_idx] = pose["body_q"]
+        body_qd[body_idx] = pose["body_qd"]
+        q[q_start : q_start + 7] = pose["body_q"]
+        qd[qd_start : qd_start + 6] = pose["body_qd"]
+
+        self.state_in.body_q.assign(body_q)
+        self.state_in.body_qd.assign(body_qd)
+        self.state_in.joint_q.assign(q)
+        self.state_in.joint_qd.assign(qd)
+
+        self.state_out.body_q.assign(body_q)
+        self.state_out.body_qd.assign(body_qd)
+        self.state_out.joint_q.assign(q)
+        self.state_out.joint_qd.assign(qd)
+
+    def sync_mirrors(self, mirror_state: dict[str, dict[str, np.ndarray]]) -> None:
+        for side in ("left", "right"):
+            self._sync_mirror_body(side, mirror_state[side])
+
+    def step_frame(self, mirror_state: dict[str, dict[str, np.ndarray]]) -> dict[str, Any]:
+        self.sync_mirrors(mirror_state)
+        contact_any = {"left": 0, "right": 0, "ground": 0, "table": 0}
+        reaction_world = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
+
+        sim_dt = float(
+            self.args.rope_sim_dt
+            if self.args.rope_sim_dt is not None
+            else (self.rigid.frame_dt / float(self.args.sim_substeps_rope))
+        )
+        for _ in range(int(self.args.sim_substeps_rope)):
+            self.state_in.clear_forces()
+            self.model.collide(self.state_in, self.contacts)
+            self.solver.step(self.state_in, self.state_out, self.control, self.contacts, sim_dt)
+
+            soft_count = _parse_contact_count(self.contacts.soft_contact_count)
+            if soft_count > 0:
+                soft_shapes = self.contacts.soft_contact_shape.numpy()[:soft_count].astype(np.int32, copy=False)
+                if np.any(soft_shapes == self.ground_shape_idx):
+                    contact_any["ground"] += 1
+                if np.any(soft_shapes == self.table_shape_idx):
+                    contact_any["table"] += 1
+                for side in ("left", "right"):
+                    side_shapes = set(self.side_shape_indices[side])
+                    count_side = sum(int(s in side_shapes) for s in soft_shapes.tolist())
+                    contact_any[side] += count_side
+
+            if self.args.coupling_mode == "two_way":
+                body_f_np = self.state_out.body_f.numpy().astype(np.float32, copy=False)
+                body_q_np = self.state_out.body_q.numpy().astype(np.float32, copy=False)
+                for side in ("left", "right"):
+                    body_idx = self.mirror_body_ids[side]
+                    local_wrench = body_f_np[body_idx, :6].copy()
+                    reaction_world[side] += _transform_wrench_body_to_world(body_q_np[body_idx], local_wrench)
+
+            self.state_in, self.state_out = self.state_out, self.state_in
+
+            if self.drag > 0.0 and self.gravity_axis is not None:
+                wp.launch(
+                    newton_import_ir._apply_drag_correction,
+                    dim=self.n_obj,
+                    inputs=[self.state_in.particle_q, self.state_in.particle_qd, self.n_obj, sim_dt, self.drag],
+                    device=self.device,
+                )
+
+        self.frame_idx += 1
+        self.last_world_wrench = reaction_world
+        return {
+            "contact_any": contact_any,
+            "reaction_world": reaction_world,
+            "particle_q": self.state_in.particle_q.numpy().astype(np.float32, copy=False)[: self.n_obj].copy(),
+        }
+
+    def rope_points_wp(self) -> wp.array:
+        return wp.array(self.state_in.particle_q.numpy().astype(np.float32, copy=False)[: self.n_obj].copy(), dtype=wp.vec3)
+
+    def rope_radii_wp(self) -> wp.array:
+        return wp.array(self.render_radius.astype(np.float32, copy=False), dtype=wp.float32)
+
+    def rope_line_buffers(self) -> tuple[wp.array, wp.array] | tuple[None, None]:
+        points = self.state_in.particle_q.numpy().astype(np.float32, copy=False)[: self.n_obj]
+        if self.render_edges.size == 0:
+            return None, None
+        starts = wp.array(points[self.render_edges[:, 0]].astype(np.float32, copy=False), dtype=wp.vec3)
+        ends = wp.array(points[self.render_edges[:, 1]].astype(np.float32, copy=False), dtype=wp.vec3)
+        return starts, ends
+
+
+class SplitDemo:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        if args.device:
+            wp.set_device(args.device)
+
+        self.viewer = ViewerGL(width=args.width, height=args.height, headless=True)
+        self.rigid = NativePandaRigidSide(self.viewer, args)
+        self.rope = SemiImplicitRopeSide(args, self.rigid)
+        self.rigid.configure_for_rope(
+            rope_radius_m=float(np.mean(self.rope.physical_radius)),
+            rope_line_center_x=float(self.rope.rope_center_target_x),
+            rope_line_y=float(self.rope.rope_line_target_y),
+        )
+        try:
+            apply_viewer_shape_colors(self.viewer, self.rigid.model)
+        except Exception:
+            pass
+
+        self.leading_side = self.rigid.leading_side()
+        self.trailing_side = "right" if self.leading_side == "left" else "left"
+        self.timeseries: list[dict[str, Any]] = []
+        self.first_finger_contact_frame: int | None = None
+        self.first_rope_motion_frame: int | None = None
+        self.first_contact_side: str | None = None
+        self.first_contact_reaction_nonzero: int | None = None
+        self.baseline_com_x = None
+        self.preview_frames: list[np.ndarray] = []
+        self.preview_indices = sorted(set(np.linspace(0, max(args.num_frames - 1, 0), 6, dtype=int).tolist()))
+
+    def run(self) -> dict[str, Any]:
+        out_dir = Path(self.args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        mp4_path = out_dir / "hero.mp4"
+        gif_path = out_dir / "hero.gif"
+        sheet_path = out_dir / "contact_sheet.jpg"
+        ffmpeg = _ffmpeg_encode_mp4(self.args.width, self.args.height, self.args.video_fps, mp4_path)
+        if ffmpeg.stdin is None:
+            raise RuntimeError("Failed to open ffmpeg stdin")
+
+        pending_world_wrench = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
+        try:
+            for frame_idx in range(int(self.args.num_frames)):
+                rigid_metrics = self.rigid.step(
+                    external_world_wrenches=(pending_world_wrench if self.args.coupling_mode == "two_way" else None)
+                )
+                mirror_state = (
+                    self.rigid.parked_mirror_state()
+                    if frame_idx < self.rigid.settle_frames
+                    else self.rigid.mirror_body_state()
+                )
+                rope_metrics = self.rope.step_frame(mirror_state)
+
+                rope_q = rope_metrics["particle_q"]
+                rope_com = rope_q.mean(axis=0)
+                if frame_idx == self.rigid.settle_frames - 1:
+                    self.baseline_com_x = float(rope_com[0])
+                rope_com_shift_x = 0.0 if self.baseline_com_x is None else float(rope_com[0] - self.baseline_com_x)
+
+                contact_any = rope_metrics["contact_any"]
+                if self.first_finger_contact_frame is None and (contact_any["left"] > 0 or contact_any["right"] > 0):
+                    self.first_finger_contact_frame = frame_idx
+                    self.first_contact_side = "left" if contact_any["left"] >= contact_any["right"] else "right"
+
+                if (
+                    self.first_rope_motion_frame is None
+                    and self.first_finger_contact_frame is not None
+                    and frame_idx >= self.first_finger_contact_frame
+                    and abs(rope_com_shift_x) > float(self.args.rope_motion_threshold)
+                ):
+                    self.first_rope_motion_frame = frame_idx
+
+                if (
+                    self.first_contact_reaction_nonzero is None
+                    and self.args.coupling_mode == "two_way"
+                    and any(np.linalg.norm(v[:3]) > 1.0e-6 or np.linalg.norm(v[3:]) > 1.0e-6 for v in rope_metrics["reaction_world"].values())
+                ):
+                    self.first_contact_reaction_nonzero = frame_idx
+
+                pending_world_wrench = rope_metrics["reaction_world"]
+
+                self.rigid.render()
+                rope_points_wp = self.rope.rope_points_wp()
+                rope_radii_wp = self.rope.rope_radii_wp()
+                rope_starts_wp, rope_ends_wp = self.rope.rope_line_buffers()
+                self.viewer.log_points("/demo/rope_points", rope_points_wp, rope_radii_wp, self.rope.rope_color, hidden=False)
+                if rope_starts_wp is not None and rope_ends_wp is not None:
+                    self.viewer.log_lines(
+                        "/demo/rope_lines",
+                        rope_starts_wp,
+                        rope_ends_wp,
+                        (0.98, 0.78, 0.47),
+                        width=float(self.args.rope_line_width),
+                        hidden=False,
+                    )
+                self.rigid.end_render()
+                frame = self.viewer.get_frame(render_ui=False).numpy()
+                ffmpeg.stdin.write(frame.tobytes())
+                if frame_idx in self.preview_indices:
+                    self.preview_frames.append(frame.copy())
+
+                self.timeseries.append(
+                    {
+                        "frame": int(frame_idx),
+                        "time_s": float(rigid_metrics.time_s),
+                        "target_x_m": float(rigid_metrics.target_xyz[0]),
+                        "target_y_m": float(rigid_metrics.target_xyz[1]),
+                        "target_z_m": float(rigid_metrics.target_xyz[2]),
+                        "actual_ee_x_m": float(rigid_metrics.actual_ee_xyz[0]),
+                        "actual_ee_y_m": float(rigid_metrics.actual_ee_xyz[1]),
+                        "actual_ee_z_m": float(rigid_metrics.actual_ee_xyz[2]),
+                        "ee_error_m": float(rigid_metrics.ee_error_m),
+                        "robot_table_contact_frames": int(rigid_metrics.robot_table_contacts > 0),
+                        "rope_table_contact_frames": int(contact_any["table"] > 0),
+                        "rope_ground_contact_frames": int(contact_any["ground"] > 0),
+                        "left_finger_rope_contacts": int(contact_any["left"]),
+                        "right_finger_rope_contacts": int(contact_any["right"]),
+                        "rope_com_x_m": float(rope_com[0]),
+                        "rope_com_y_m": float(rope_com[1]),
+                        "rope_com_z_m": float(rope_com[2]),
+                        "rope_com_shift_x_m": float(rope_com_shift_x),
+                    }
+                )
+        finally:
+            ffmpeg.stdin.close()
+            ffmpeg.wait()
+            self.viewer.close()
+
+        _make_gif(mp4_path, gif_path)
+        _save_contact_sheet(self.preview_frames, sheet_path)
+        return self._finalize(out_dir, mp4_path, gif_path, sheet_path)
+
+    def _finalize(self, out_dir: Path, mp4_path: Path, gif_path: Path, sheet_path: Path) -> dict[str, Any]:
+        arr = self.timeseries
+        robot_table_contact_frames = int(sum(int(row["robot_table_contact_frames"]) for row in arr))
+        rope_table_contact_frames = int(sum(int(row["rope_table_contact_frames"]) for row in arr))
+        rope_ground_contact_frames = int(sum(int(row["rope_ground_contact_frames"]) for row in arr))
+        rope_motion_after_contact = bool(
+            self.first_finger_contact_frame is not None
+            and self.first_rope_motion_frame is not None
+            and self.first_rope_motion_frame >= self.first_finger_contact_frame
+        )
+        rope_render_matches_physics = bool(np.allclose(self.rope.render_radius, self.rope.physical_radius))
+        leading_side_is_first = self.first_contact_side == self.leading_side if self.first_contact_side is not None else False
+        net_rope_to_robot_wrench_nonzero = bool(
+            self.first_contact_reaction_nonzero is not None
+            or any(np.linalg.norm(v[:3]) > 1.0e-6 or np.linalg.norm(v[3:]) > 1.0e-6 for v in self.rope.last_world_wrench.values())
+        )
+
+        summary = {
+            "demo": "robot_table_rope_split_mujoco_semiimplicit",
+            "coupling_mode": str(self.args.coupling_mode),
+            "rigid_frame_dt_s": float(self.rigid.frame_dt),
+            "rigid_substep_dt_s": float(self.rigid.sim_dt),
+            "rope_substep_dt_s": float(
+                self.args.rope_sim_dt
+                if self.args.rope_sim_dt is not None
+                else (self.rigid.frame_dt / float(self.args.sim_substeps_rope))
+            ),
+            "scene_topology": str(self.args.scene_topology),
+            "motion_pattern": str(self.args.motion_pattern),
+            "rope_render_mode": str(self.args.rope_render_mode),
+            "finger_contact_set": str(self.args.finger_contact_set),
+            "leading_side_expected": self.leading_side,
+            "first_contact_side": self.first_contact_side,
+            "leading_side_first_contact": bool(leading_side_is_first),
+            "first_finger_rope_contact_frame": self.first_finger_contact_frame,
+            "first_rope_motion_frame": self.first_rope_motion_frame,
+            "rope_motion_after_contact": rope_motion_after_contact,
+            "robot_table_contact_frames": robot_table_contact_frames,
+            "rope_table_contact_frames": rope_table_contact_frames,
+            "rope_ground_contact_frames": rope_ground_contact_frames,
+            "rope_physical_radius_m": float(np.mean(self.rope.physical_radius)),
+            "rope_render_radius_m": float(np.mean(self.rope.render_radius)),
+            "rope_render_matches_physics": rope_render_matches_physics,
+            "net_rope_to_robot_wrench_nonzero": bool(net_rope_to_robot_wrench_nonzero),
+            "push_speed_mps": float(self.rigid.push_speed_mps),
+            "push_path_length_m": float(self.rigid.push_path_length_m),
+            "table_top_z_m": float(self.rigid.table_top_z),
+            "artifacts": {
+                "scene_npz": str(out_dir / "scene.npz"),
+                "timeseries_csv": str(out_dir / "timeseries.csv"),
+                "hero_mp4": str(mp4_path),
+                "hero_gif": str(gif_path),
+                "contact_sheet": str(sheet_path),
+            },
+        }
+
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        np.savez(
+            out_dir / "scene.npz",
+            frame=np.asarray([row["frame"] for row in arr], dtype=np.int32),
+            target_xyz=np.asarray([[row["target_x_m"], row["target_y_m"], row["target_z_m"]] for row in arr], dtype=np.float32),
+            actual_ee_xyz=np.asarray([[row["actual_ee_x_m"], row["actual_ee_y_m"], row["actual_ee_z_m"]] for row in arr], dtype=np.float32),
+            rope_com_xyz=np.asarray([[row["rope_com_x_m"], row["rope_com_y_m"], row["rope_com_z_m"]] for row in arr], dtype=np.float32),
+            rope_physical_radius=self.rope.physical_radius.astype(np.float32, copy=False),
+            rope_render_radius=self.rope.render_radius.astype(np.float32, copy=False),
+        )
+        with (out_dir / "timeseries.csv").open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(arr[0].keys()))
+            writer.writeheader()
+            writer.writerows(arr)
+        (out_dir / "README.md").write_text(
+            "\n".join(
+                [
+                    "# Robot Table Rope Split MuJoCo SemiImplicit",
+                    "",
+                    f"- Coupling mode: `{self.args.coupling_mode}`",
+                    f"- Scene topology: `{self.args.scene_topology}`",
+                    f"- Motion pattern: `{self.args.motion_pattern}`",
+                    f"- Rope render mode: `{self.args.rope_render_mode}`",
+                    f"- First finger contact frame: `{self.first_finger_contact_frame}`",
+                    f"- First rope motion frame: `{self.first_rope_motion_frame}`",
+                    f"- Rope motion after contact: `{rope_motion_after_contact}`",
+                    f"- Rope render matches physics: `{rope_render_matches_physics}`",
+                    "",
+                    "Artifacts:",
+                    "- `summary.json`",
+                    "- `scene.npz`",
+                    "- `timeseries.csv`",
+                    "- `hero.mp4`",
+                    "- `hero.gif`",
+                    "- `contact_sheet.jpg`",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return summary
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Direct-finger split demo: MuJoCo rigid robot/table + SemiImplicit rope.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--ir", type=Path, default=DEFAULT_IR)
+    parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--coupling-mode", choices=["one_way", "two_way"], default="one_way")
+    parser.add_argument("--scene-topology", choices=["table_edge_drape"], default="table_edge_drape")
+    parser.add_argument("--motion-pattern", choices=["side_finger_push"], default="side_finger_push")
+    parser.add_argument("--rope-render-mode", choices=["physical_only"], default="physical_only")
+    parser.add_argument("--finger-contact-set", choices=["fingers_plus_pads"], default="fingers_plus_pads")
+    parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--num-frames", type=int, default=170)
+    parser.add_argument("--sim-substeps-rigid", type=int, default=10)
+    parser.add_argument("--sim-substeps-rope", type=int, default=667)
+    parser.add_argument("--rope-sim-dt", type=float, default=None)
+    parser.add_argument("--width", type=int, default=960)
+    parser.add_argument("--height", type=int, default=540)
+    parser.add_argument("--gravity-mag", type=float, default=9.8)
+    parser.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--drag-damping-scale", type=float, default=1.0)
+    parser.add_argument("--spring-ke-scale", type=float, default=1.0)
+    parser.add_argument("--spring-kd-scale", type=float, default=1.0)
+    parser.add_argument("--angular-damping", type=float, default=0.05)
+    parser.add_argument("--friction-smoothing", type=float, default=1.0)
+    parser.add_argument("--particle-radius-scale", type=float, default=1.0)
+    parser.add_argument("--gripper-opening", type=float, default=0.04)
+    parser.add_argument("--push-clearance", type=float, default=0.029)
+    parser.add_argument("--gripper-yaw", type=float, default=1.32079632679)
+    parser.add_argument("--rope-line-width", type=float, default=0.008)
+    parser.add_argument("--rope-spring-stride", type=int, default=4)
+    parser.add_argument("--rope-motion-threshold", type=float, default=0.001)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    demo = SplitDemo(args)
+    summary = demo.run()
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
