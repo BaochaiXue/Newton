@@ -9,7 +9,6 @@ import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -18,7 +17,13 @@ from PIL import Image, ImageDraw
 from pxr import Usd
 
 from bridge_bootstrap import newton, newton_import_ir
-from bridge_deformable_common import _copy_object_only_ir, _effective_spring_scales, load_ir
+from bridge_deformable_common import (
+    _copy_object_only_ir,
+    _effective_spring_scales,
+    _maybe_autoset_mass_spring_scale,
+    _validate_scaling_args,
+    load_ir,
+)
 from bridge_shared import apply_viewer_shape_colors
 from newton._src.viewer.viewer_gl import ViewerGL
 from newton.geometry import HydroelasticSDF
@@ -172,6 +177,98 @@ class RigidStepMetrics:
     robot_table_contacts: int
     finger_table_contacts: int
     nonfinger_table_contacts: int
+
+
+@dataclass
+class WindowMetrics:
+    rope_table_contact_frames: int
+    rope_ground_contact_frames: int
+    robot_table_contact_frames: int
+    max_rope_com_z: float
+    max_abs_delta_rope_com_z: float
+    max_ground_penetration_m: float
+    max_table_penetration_m: float
+    max_support_penetration_m: float
+    final_ground_penetration_p99_m: float
+    final_table_penetration_p99_m: float
+    final_support_penetration_p99_m: float
+
+
+@dataclass
+class CalibrationCandidate:
+    ground_shape_contact_scale: float
+    ground_shape_contact_damping_multiplier: float
+    table_shape_contact_scale: float
+    table_shape_contact_damping_multiplier: float
+    finger_shape_contact_scale: float
+    finger_shape_contact_damping_multiplier: float
+    table_edge_inset_y: float
+    overhang_drop_factor: float
+
+
+def _scale_contact_triplet(ke: float, kd: float, kf: float, scale: float, damping_mult: float) -> tuple[float, float, float]:
+    return (
+        float(ke * scale),
+        float(kd * scale * damping_mult),
+        float(kf * scale * damping_mult),
+    )
+
+
+def _box_signed_distance_np(points: np.ndarray, center: np.ndarray, half_extents: np.ndarray) -> np.ndarray:
+    q = np.abs(points - center[None, :]) - half_extents[None, :]
+    outside = np.linalg.norm(np.maximum(q, 0.0), axis=1)
+    inside = np.minimum(np.max(q, axis=1), 0.0)
+    return outside + inside
+
+
+def _penetration_stats(depths: np.ndarray) -> tuple[float, float]:
+    if depths.size == 0:
+        return 0.0, 0.0
+    return float(np.max(depths)), float(np.quantile(depths, 0.99))
+
+
+def _support_soft_contact_scale(args: argparse.Namespace) -> tuple[float, float]:
+    support_scale = 0.5 * (float(args.ground_shape_contact_scale) + float(args.table_shape_contact_scale))
+    support_damping = 0.5 * (
+        float(args.ground_shape_contact_damping_multiplier) + float(args.table_shape_contact_damping_multiplier)
+    )
+    return support_scale, support_damping
+
+
+def _apply_split_shape_contact_scaling(model: Any, args: argparse.Namespace) -> None:
+    support_scale, support_damping = _support_soft_contact_scale(args)
+    soft_ke, soft_kd, soft_kf = _scale_contact_triplet(
+        float(model.soft_contact_ke),
+        float(model.soft_contact_kd),
+        float(model.soft_contact_kf),
+        support_scale,
+        support_damping,
+    )
+    model.soft_contact_ke = soft_ke
+    model.soft_contact_kd = soft_kd
+    model.soft_contact_kf = soft_kf
+
+    labels = [str(label).lower() for label in list(model.shape_label)]
+    for arr_name in ("shape_material_ke", "shape_material_kd", "shape_material_kf"):
+        arr = getattr(model, arr_name)
+        vals = arr.numpy().astype(np.float32, copy=False).copy()
+        for idx, label in enumerate(labels):
+            if "rope_ground" in label or "ground" in label or "plane" in label:
+                scale = float(args.ground_shape_contact_scale)
+                damping_mult = float(args.ground_shape_contact_damping_multiplier)
+            elif "rope_table" in label or "table" in label:
+                scale = float(args.table_shape_contact_scale)
+                damping_mult = float(args.table_shape_contact_damping_multiplier)
+            elif "mirror_" in label:
+                scale = float(args.finger_shape_contact_scale)
+                damping_mult = float(args.finger_shape_contact_damping_multiplier)
+            else:
+                scale = 1.0
+                damping_mult = 1.0
+            vals[idx] *= np.float32(scale)
+            if arr_name != "shape_material_ke":
+                vals[idx] *= np.float32(damping_mult)
+        arr.assign(vals)
 
 
 class NativePandaRigidSide:
@@ -628,24 +725,22 @@ class SemiImplicitRopeSide:
 
     def _build_rope_ir(self) -> None:
         raw_ir = load_ir(Path(self.args.ir))
-        scale_args = SimpleNamespace(
-            object_mass=1.0,
-            mass_spring_scale=None,
-            spring_ke_scale=1.0,
-            spring_kd_scale=1.0,
-            particle_radius_scale=float(self.args.particle_radius_scale),
-        )
-        rope_ir = _copy_object_only_ir(raw_ir, scale_args)
+        _validate_scaling_args(self.args)
+        _maybe_autoset_mass_spring_scale(self.args, raw_ir)
+        rope_ir = _copy_object_only_ir(raw_ir, self.args)
         x0 = np.asarray(rope_ir["x0"], dtype=np.float32).copy()
         bbox_min = x0.min(axis=0)
         bbox_max = x0.max(axis=0)
         center = 0.5 * (bbox_min + bbox_max)
+        rope_radius_m = float(np.mean(np.asarray(rope_ir["collision_radius"], dtype=np.float32)))
+        z_clearance = float(self.rigid.table_top_z + rope_radius_m + float(self.args.min_clearance_extra))
+        center_z_for_table_clearance = float(z_clearance - float(bbox_min[2] - center[2]))
 
         target_center = np.array(
             [
                 self.rigid.prepush_x + 0.05,
-                self.rigid.table_pos[1] - self.rigid.table_half_extents[1] + 0.09,
-                self.rigid.table_top_z + 0.015,
+                self.rigid.table_pos[1] - self.rigid.table_half_extents[1] + float(self.args.table_edge_inset_y),
+                center_z_for_table_clearance,
             ],
             dtype=np.float32,
         )
@@ -655,8 +750,8 @@ class SemiImplicitRopeSide:
         overhang_mask = shifted[:, 1] < table_edge_y
         if np.any(overhang_mask):
             hang = (table_edge_y - shifted[overhang_mask, 1]).astype(np.float32, copy=False)
-            shifted[overhang_mask, 2] -= 0.40 * hang
-            min_clearance = float(np.mean(np.asarray(rope_ir["collision_radius"], dtype=np.float32))) + 0.002
+            shifted[overhang_mask, 2] -= float(self.args.overhang_drop_factor) * hang
+            min_clearance = rope_radius_m + float(self.args.min_clearance_extra)
             shifted[:, 2] = np.maximum(shifted[:, 2], min_clearance)
         rope_ir["x0"] = shifted
         rope_ir["v0"] = np.zeros_like(rope_ir["x0"], dtype=np.float32)
@@ -675,12 +770,13 @@ class SemiImplicitRopeSide:
         return cfg
 
     def _build_model(self) -> None:
+        spring_ke_scale, spring_kd_scale = _effective_spring_scales(self.rope_ir, self.args)
         cfg = newton_import_ir.SimConfig(
             ir_path=Path(self.args.ir).resolve(),
             out_dir=Path(self.args.out_dir).resolve(),
             output_prefix="robot_table_rope_split",
-            spring_ke_scale=float(self.args.spring_ke_scale),
-            spring_kd_scale=float(self.args.spring_kd_scale),
+            spring_ke_scale=float(spring_ke_scale),
+            spring_kd_scale=float(spring_kd_scale),
             angular_damping=float(self.args.angular_damping),
             friction_smoothing=float(self.args.friction_smoothing),
             enable_tri_contact=True,
@@ -769,6 +865,7 @@ class SemiImplicitRopeSide:
         self.model.soft_contact_kd = float(rope_contact["kd"])
         self.model.soft_contact_kf = float(rope_contact["kf"])
         self.model.soft_contact_mu = float(rope_contact["mu"])
+        _apply_split_shape_contact_scaling(self.model, self.args)
 
         self.state_in = self.model.state()
         self.state_out = self.model.state()
@@ -910,6 +1007,32 @@ class SemiImplicitRopeSide:
         ends = wp.array(points[self.render_edges[:, 1]].astype(np.float32, copy=False), dtype=wp.vec3)
         return starts, ends
 
+    def support_penetration_proxy(self, particle_q: np.ndarray) -> dict[str, np.ndarray | float]:
+        points = np.asarray(particle_q, dtype=np.float32)
+        radii = self.physical_radius[: points.shape[0]]
+        ground_depth = np.maximum(radii - points[:, 2], 0.0).astype(np.float32, copy=False)
+
+        table_center = np.asarray(self.rigid.table_pos, dtype=np.float32)
+        table_half_extents = np.asarray(self.rigid.table_half_extents, dtype=np.float32)
+        table_sdf = _box_signed_distance_np(points, table_center, table_half_extents).astype(np.float32, copy=False)
+        table_depth = np.maximum(radii - table_sdf, 0.0).astype(np.float32, copy=False)
+        support_depth = np.maximum(ground_depth, table_depth).astype(np.float32, copy=False)
+
+        max_ground, p99_ground = _penetration_stats(ground_depth)
+        max_table, p99_table = _penetration_stats(table_depth)
+        max_support, p99_support = _penetration_stats(support_depth)
+        return {
+            "ground_depth": ground_depth,
+            "table_depth": table_depth,
+            "support_depth": support_depth,
+            "max_ground_penetration_m": max_ground,
+            "max_table_penetration_m": max_table,
+            "max_support_penetration_m": max_support,
+            "p99_ground_penetration_m": p99_ground,
+            "p99_table_penetration_m": p99_table,
+            "p99_support_penetration_m": p99_support,
+        }
+
 
 class SplitDemo:
     def __init__(self, args: argparse.Namespace):
@@ -939,7 +1062,173 @@ class SplitDemo:
         self.first_contact_reaction_nonzero: int | None = None
         self.baseline_com_x = None
         self.preview_frames: list[np.ndarray] = []
+        self.first_30_frames: list[np.ndarray] = []
         self.preview_indices = sorted(set(np.linspace(0, max(args.num_frames - 1, 0), 6, dtype=int).tolist()))
+
+    def _current_mirror_state(self, control_frame: int) -> dict[str, dict[str, np.ndarray]]:
+        return self.rigid.parked_mirror_state() if control_frame < self.rigid.settle_frames else self.rigid.mirror_body_state()
+
+    def _advance_one_frame(self, pending_world_wrench: dict[str, np.ndarray]) -> tuple[RigidStepMetrics, dict[str, Any], np.ndarray, float, dict[str, np.ndarray], int]:
+        control_frame = int(self.rigid.frame_idx)
+        rigid_metrics = self.rigid.step(
+            external_world_wrenches=(pending_world_wrench if self.args.coupling_mode == "two_way" else None)
+        )
+        mirror_state = self._current_mirror_state(control_frame)
+        rope_metrics = self.rope.step_frame(mirror_state)
+        rope_q = rope_metrics["particle_q"]
+        rope_com = rope_q.mean(axis=0)
+        if control_frame == self.rigid.settle_frames - 1 and self.baseline_com_x is None:
+            self.baseline_com_x = float(rope_com[0])
+        rope_com_shift_x = 0.0 if self.baseline_com_x is None else float(rope_com[0] - self.baseline_com_x)
+        next_pending_world_wrench = rope_metrics["reaction_world"]
+        return rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, next_pending_world_wrench, control_frame
+
+    def _record_metrics(
+        self,
+        frame_idx: int,
+        rigid_metrics: RigidStepMetrics,
+        rope_metrics: dict[str, Any],
+        rope_com: np.ndarray,
+        rope_com_shift_x: float,
+        penetration: dict[str, np.ndarray | float],
+    ) -> None:
+        contact_any = rope_metrics["contact_any"]
+        if self.first_finger_contact_frame is None and (contact_any["left"] > 0 or contact_any["right"] > 0):
+            self.first_finger_contact_frame = frame_idx
+            self.first_contact_side = "left" if contact_any["left"] >= contact_any["right"] else "right"
+
+        if (
+            self.first_rope_motion_frame is None
+            and self.first_finger_contact_frame is not None
+            and frame_idx >= self.first_finger_contact_frame
+            and abs(rope_com_shift_x) > float(self.args.rope_motion_threshold)
+        ):
+            self.first_rope_motion_frame = frame_idx
+
+        if (
+            self.first_contact_reaction_nonzero is None
+            and self.args.coupling_mode == "two_way"
+            and any(np.linalg.norm(v[:3]) > 1.0e-6 or np.linalg.norm(v[3:]) > 1.0e-6 for v in rope_metrics["reaction_world"].values())
+        ):
+            self.first_contact_reaction_nonzero = frame_idx
+
+        self.timeseries.append(
+            {
+                "frame": int(frame_idx),
+                "time_s": float(rigid_metrics.time_s),
+                "target_x_m": float(rigid_metrics.target_xyz[0]),
+                "target_y_m": float(rigid_metrics.target_xyz[1]),
+                "target_z_m": float(rigid_metrics.target_xyz[2]),
+                "actual_ee_x_m": float(rigid_metrics.actual_ee_xyz[0]),
+                "actual_ee_y_m": float(rigid_metrics.actual_ee_xyz[1]),
+                "actual_ee_z_m": float(rigid_metrics.actual_ee_xyz[2]),
+                "ee_error_m": float(rigid_metrics.ee_error_m),
+                "robot_table_contact_frames": int(rigid_metrics.robot_table_contacts > 0),
+                "rope_table_contact_frames": int(contact_any["table"] > 0),
+                "rope_ground_contact_frames": int(contact_any["ground"] > 0),
+                "left_finger_rope_contacts": int(contact_any["left"]),
+                "right_finger_rope_contacts": int(contact_any["right"]),
+                "rope_com_x_m": float(rope_com[0]),
+                "rope_com_y_m": float(rope_com[1]),
+                "rope_com_z_m": float(rope_com[2]),
+                "rope_com_shift_x_m": float(rope_com_shift_x),
+                "max_ground_penetration_m": float(penetration["max_ground_penetration_m"]),
+                "max_table_penetration_m": float(penetration["max_table_penetration_m"]),
+                "max_support_penetration_m": float(penetration["max_support_penetration_m"]),
+                "p99_ground_penetration_m": float(penetration["p99_ground_penetration_m"]),
+                "p99_table_penetration_m": float(penetration["p99_table_penetration_m"]),
+                "p99_support_penetration_m": float(penetration["p99_support_penetration_m"]),
+            }
+        )
+
+    def _render_current_frame(self, ffmpeg: subprocess.Popen[bytes], frame_idx: int) -> None:
+        if ffmpeg.stdin is None:
+            raise RuntimeError("Failed to open ffmpeg stdin")
+        self.rigid.render()
+        rope_points_wp = self.rope.rope_points_wp()
+        rope_radii_wp = self.rope.rope_radii_wp()
+        rope_starts_wp, rope_ends_wp = self.rope.rope_line_buffers()
+        self.viewer.log_points("/demo/rope_points", rope_points_wp, rope_radii_wp, self.rope.rope_color, hidden=False)
+        if rope_starts_wp is not None and rope_ends_wp is not None:
+            self.viewer.log_lines(
+                "/demo/rope_lines",
+                rope_starts_wp,
+                rope_ends_wp,
+                (0.98, 0.78, 0.47),
+                width=float(self.args.rope_line_width),
+                hidden=False,
+            )
+        self.rigid.end_render()
+        frame = self.viewer.get_frame(render_ui=False).numpy()
+        ffmpeg.stdin.write(frame.tobytes())
+        if frame_idx in self.preview_indices:
+            self.preview_frames.append(frame.copy())
+        if frame_idx < 30:
+            self.first_30_frames.append(frame.copy())
+
+    def _run_preroll(self) -> dict[str, np.ndarray]:
+        pre_frames = max(0, int(round(float(self.args.rope_preroll_seconds) * float(self.args.video_fps))))
+        pending_world_wrench = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
+        for _ in range(pre_frames):
+            _, rope_metrics, rope_com, _, pending_world_wrench, _ = self._advance_one_frame(pending_world_wrench)
+            if not np.all(np.isfinite(rope_com)) or float(rope_com[2]) > 0.5:
+                break
+        self.rigid.sim_time = 0.0
+        return pending_world_wrench
+
+    def evaluate_window(self, num_frames: int = 30, *, freeze_robot: bool = False) -> WindowMetrics:
+        pending_world_wrench = self._run_preroll()
+        rope_z_values: list[float] = []
+        rope_table_frames = 0
+        rope_ground_frames = 0
+        robot_table_frames = 0
+        max_ground_penetration = 0.0
+        max_table_penetration = 0.0
+        max_support_penetration = 0.0
+        final_ground_p99 = 0.0
+        final_table_p99 = 0.0
+        final_support_p99 = 0.0
+        for _ in range(int(num_frames)):
+            if freeze_robot:
+                mirror_state = self.rigid.mirror_body_state()
+                rope_metrics = self.rope.step_frame(mirror_state)
+                rope_com = rope_metrics["particle_q"].mean(axis=0)
+                robot_table_contact = 0
+            else:
+                rigid_metrics, rope_metrics, rope_com, _, pending_world_wrench, _ = self._advance_one_frame(pending_world_wrench)
+                robot_table_contact = int(rigid_metrics.robot_table_contacts > 0)
+            rope_z = float(rope_com[2])
+            rope_z_values.append(rope_z)
+            contact_any = rope_metrics["contact_any"]
+            rope_table_frames += int(contact_any["table"] > 0)
+            rope_ground_frames += int(contact_any["ground"] > 0)
+            robot_table_frames += int(robot_table_contact)
+            penetration = self.rope.support_penetration_proxy(rope_metrics["particle_q"])
+            max_ground_penetration = max(max_ground_penetration, float(penetration["max_ground_penetration_m"]))
+            max_table_penetration = max(max_table_penetration, float(penetration["max_table_penetration_m"]))
+            max_support_penetration = max(max_support_penetration, float(penetration["max_support_penetration_m"]))
+            final_ground_p99 = float(penetration["p99_ground_penetration_m"])
+            final_table_p99 = float(penetration["p99_table_penetration_m"])
+            final_support_p99 = float(penetration["p99_support_penetration_m"])
+            if not np.isfinite(rope_z) or rope_z > 0.35:
+                break
+        if not rope_z_values:
+            rope_z_values = [np.inf]
+        diffs = np.diff(np.asarray(rope_z_values, dtype=np.float32))
+        max_abs_delta = float(np.max(np.abs(diffs))) if diffs.size else 0.0
+        return WindowMetrics(
+            rope_table_contact_frames=int(rope_table_frames),
+            rope_ground_contact_frames=int(rope_ground_frames),
+            robot_table_contact_frames=int(robot_table_frames),
+            max_rope_com_z=float(np.max(np.asarray(rope_z_values, dtype=np.float32))),
+            max_abs_delta_rope_com_z=float(max_abs_delta),
+            max_ground_penetration_m=float(max_ground_penetration),
+            max_table_penetration_m=float(max_table_penetration),
+            max_support_penetration_m=float(max_support_penetration),
+            final_ground_penetration_p99_m=float(final_ground_p99),
+            final_table_penetration_p99_m=float(final_table_p99),
+            final_support_penetration_p99_m=float(final_support_p99),
+        )
 
     def run(self) -> dict[str, Any]:
         out_dir = Path(self.args.out_dir)
@@ -952,89 +1241,13 @@ class SplitDemo:
         if ffmpeg.stdin is None:
             raise RuntimeError("Failed to open ffmpeg stdin")
 
-        pending_world_wrench = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
+        pending_world_wrench = self._run_preroll()
         try:
             for frame_idx in range(int(self.args.num_frames)):
-                rigid_metrics = self.rigid.step(
-                    external_world_wrenches=(pending_world_wrench if self.args.coupling_mode == "two_way" else None)
-                )
-                mirror_state = (
-                    self.rigid.parked_mirror_state()
-                    if frame_idx < self.rigid.settle_frames
-                    else self.rigid.mirror_body_state()
-                )
-                rope_metrics = self.rope.step_frame(mirror_state)
-
-                rope_q = rope_metrics["particle_q"]
-                rope_com = rope_q.mean(axis=0)
-                if frame_idx == self.rigid.settle_frames - 1:
-                    self.baseline_com_x = float(rope_com[0])
-                rope_com_shift_x = 0.0 if self.baseline_com_x is None else float(rope_com[0] - self.baseline_com_x)
-
-                contact_any = rope_metrics["contact_any"]
-                if self.first_finger_contact_frame is None and (contact_any["left"] > 0 or contact_any["right"] > 0):
-                    self.first_finger_contact_frame = frame_idx
-                    self.first_contact_side = "left" if contact_any["left"] >= contact_any["right"] else "right"
-
-                if (
-                    self.first_rope_motion_frame is None
-                    and self.first_finger_contact_frame is not None
-                    and frame_idx >= self.first_finger_contact_frame
-                    and abs(rope_com_shift_x) > float(self.args.rope_motion_threshold)
-                ):
-                    self.first_rope_motion_frame = frame_idx
-
-                if (
-                    self.first_contact_reaction_nonzero is None
-                    and self.args.coupling_mode == "two_way"
-                    and any(np.linalg.norm(v[:3]) > 1.0e-6 or np.linalg.norm(v[3:]) > 1.0e-6 for v in rope_metrics["reaction_world"].values())
-                ):
-                    self.first_contact_reaction_nonzero = frame_idx
-
-                pending_world_wrench = rope_metrics["reaction_world"]
-
-                self.rigid.render()
-                rope_points_wp = self.rope.rope_points_wp()
-                rope_radii_wp = self.rope.rope_radii_wp()
-                rope_starts_wp, rope_ends_wp = self.rope.rope_line_buffers()
-                self.viewer.log_points("/demo/rope_points", rope_points_wp, rope_radii_wp, self.rope.rope_color, hidden=False)
-                if rope_starts_wp is not None and rope_ends_wp is not None:
-                    self.viewer.log_lines(
-                        "/demo/rope_lines",
-                        rope_starts_wp,
-                        rope_ends_wp,
-                        (0.98, 0.78, 0.47),
-                        width=float(self.args.rope_line_width),
-                        hidden=False,
-                    )
-                self.rigid.end_render()
-                frame = self.viewer.get_frame(render_ui=False).numpy()
-                ffmpeg.stdin.write(frame.tobytes())
-                if frame_idx in self.preview_indices:
-                    self.preview_frames.append(frame.copy())
-
-                self.timeseries.append(
-                    {
-                        "frame": int(frame_idx),
-                        "time_s": float(rigid_metrics.time_s),
-                        "target_x_m": float(rigid_metrics.target_xyz[0]),
-                        "target_y_m": float(rigid_metrics.target_xyz[1]),
-                        "target_z_m": float(rigid_metrics.target_xyz[2]),
-                        "actual_ee_x_m": float(rigid_metrics.actual_ee_xyz[0]),
-                        "actual_ee_y_m": float(rigid_metrics.actual_ee_xyz[1]),
-                        "actual_ee_z_m": float(rigid_metrics.actual_ee_xyz[2]),
-                        "ee_error_m": float(rigid_metrics.ee_error_m),
-                        "robot_table_contact_frames": int(rigid_metrics.robot_table_contacts > 0),
-                        "rope_table_contact_frames": int(contact_any["table"] > 0),
-                        "rope_ground_contact_frames": int(contact_any["ground"] > 0),
-                        "left_finger_rope_contacts": int(contact_any["left"]),
-                        "right_finger_rope_contacts": int(contact_any["right"]),
-                        "rope_com_x_m": float(rope_com[0]),
-                        "rope_com_y_m": float(rope_com[1]),
-                        "rope_com_z_m": float(rope_com[2]),
-                        "rope_com_shift_x_m": float(rope_com_shift_x),
-                    }
-                )
+                rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, pending_world_wrench, _ = self._advance_one_frame(pending_world_wrench)
+                penetration = self.rope.support_penetration_proxy(rope_metrics["particle_q"])
+                self._record_metrics(frame_idx, rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, penetration)
+                self._render_current_frame(ffmpeg, frame_idx)
         finally:
             ffmpeg.stdin.close()
             ffmpeg.wait()
@@ -1042,13 +1255,30 @@ class SplitDemo:
 
         _make_gif(mp4_path, gif_path)
         _save_contact_sheet(self.preview_frames, sheet_path)
-        return self._finalize(out_dir, mp4_path, gif_path, sheet_path)
+        first_30_sheet_path = out_dir / "first_30_frames_sheet.jpg"
+        _save_contact_sheet(self.first_30_frames, first_30_sheet_path, cols=5)
+        return self._finalize(out_dir, mp4_path, gif_path, sheet_path, first_30_sheet_path)
 
-    def _finalize(self, out_dir: Path, mp4_path: Path, gif_path: Path, sheet_path: Path) -> dict[str, Any]:
+    def _finalize(self, out_dir: Path, mp4_path: Path, gif_path: Path, sheet_path: Path, first_30_sheet_path: Path) -> dict[str, Any]:
         arr = self.timeseries
         robot_table_contact_frames = int(sum(int(row["robot_table_contact_frames"]) for row in arr))
         rope_table_contact_frames = int(sum(int(row["rope_table_contact_frames"]) for row in arr))
         rope_ground_contact_frames = int(sum(int(row["rope_ground_contact_frames"]) for row in arr))
+        first_30 = arr[: min(30, len(arr))]
+        rope_table_contact_frames_first_30 = int(sum(int(row["rope_table_contact_frames"]) for row in first_30))
+        rope_ground_contact_frames_first_30 = int(sum(int(row["rope_ground_contact_frames"]) for row in first_30))
+        robot_table_contact_frames_first_30 = int(sum(int(row["robot_table_contact_frames"]) for row in first_30))
+        rope_z_first_30 = np.asarray([row["rope_com_z_m"] for row in first_30], dtype=np.float32) if first_30 else np.zeros((0,), dtype=np.float32)
+        max_rope_com_z_first_30 = float(np.max(rope_z_first_30)) if rope_z_first_30.size else 0.0
+        max_abs_delta_rope_com_z_first_30 = (
+            float(np.max(np.abs(np.diff(rope_z_first_30)))) if rope_z_first_30.size > 1 else 0.0
+        )
+        max_ground_penetration_m = float(max(float(row["max_ground_penetration_m"]) for row in arr)) if arr else 0.0
+        max_table_penetration_m = float(max(float(row["max_table_penetration_m"]) for row in arr)) if arr else 0.0
+        max_support_penetration_m = float(max(float(row["max_support_penetration_m"]) for row in arr)) if arr else 0.0
+        final_ground_penetration_p99_m = float(arr[-1]["p99_ground_penetration_m"]) if arr else 0.0
+        final_table_penetration_p99_m = float(arr[-1]["p99_table_penetration_m"]) if arr else 0.0
+        final_support_penetration_p99_m = float(arr[-1]["p99_support_penetration_m"]) if arr else 0.0
         rope_motion_after_contact = bool(
             self.first_finger_contact_frame is not None
             and self.first_rope_motion_frame is not None
@@ -1074,6 +1304,8 @@ class SplitDemo:
             "scene_topology": str(self.args.scene_topology),
             "motion_pattern": str(self.args.motion_pattern),
             "rope_render_mode": str(self.args.rope_render_mode),
+            "record_start_mode": "post_settle",
+            "rope_preroll_seconds": float(self.args.rope_preroll_seconds),
             "finger_contact_set": str(self.args.finger_contact_set),
             "leading_side_expected": self.leading_side,
             "first_contact_side": self.first_contact_side,
@@ -1084,6 +1316,34 @@ class SplitDemo:
             "robot_table_contact_frames": robot_table_contact_frames,
             "rope_table_contact_frames": rope_table_contact_frames,
             "rope_ground_contact_frames": rope_ground_contact_frames,
+            "robot_table_contact_frames_first_30": robot_table_contact_frames_first_30,
+            "rope_table_contact_frames_first_30": rope_table_contact_frames_first_30,
+            "rope_ground_contact_frames_first_30": rope_ground_contact_frames_first_30,
+            "rope_original_total_object_mass_kg": float(self.rope.rope_ir.get("original_total_object_mass", 0.0)),
+            "rope_current_total_object_mass_kg": float(self.rope.rope_ir.get("current_total_object_mass", 0.0)),
+            "rope_weight_scale": float(self.rope.rope_ir.get("weight_scale", 1.0)),
+            "rope_mass_spring_scale": (
+                None if self.args.mass_spring_scale is None else float(self.args.mass_spring_scale)
+            ),
+            "rope_object_mass_per_particle_kg": float(np.asarray(self.rope.rope_ir["mass"], dtype=np.float32)[: self.rope.n_obj].mean()),
+            "particle_radius_scale": float(self.args.particle_radius_scale),
+            "ground_shape_contact_scale": float(self.args.ground_shape_contact_scale),
+            "ground_shape_contact_damping_multiplier": float(self.args.ground_shape_contact_damping_multiplier),
+            "table_shape_contact_scale": float(self.args.table_shape_contact_scale),
+            "table_shape_contact_damping_multiplier": float(self.args.table_shape_contact_damping_multiplier),
+            "finger_shape_contact_scale": float(self.args.finger_shape_contact_scale),
+            "finger_shape_contact_damping_multiplier": float(self.args.finger_shape_contact_damping_multiplier),
+            "table_edge_inset_y": float(self.args.table_edge_inset_y),
+            "overhang_drop_factor": float(self.args.overhang_drop_factor),
+            "min_clearance_extra": float(self.args.min_clearance_extra),
+            "max_rope_com_z_first_30": float(max_rope_com_z_first_30),
+            "max_abs_delta_rope_com_z_first_30": float(max_abs_delta_rope_com_z_first_30),
+            "max_ground_penetration_m": float(max_ground_penetration_m),
+            "max_table_penetration_m": float(max_table_penetration_m),
+            "max_support_penetration_m": float(max_support_penetration_m),
+            "final_ground_penetration_p99_m": float(final_ground_penetration_p99_m),
+            "final_table_penetration_p99_m": float(final_table_penetration_p99_m),
+            "final_support_penetration_p99_m": float(final_support_penetration_p99_m),
             "rope_physical_radius_m": float(np.mean(self.rope.physical_radius)),
             "rope_render_radius_m": float(np.mean(self.rope.render_radius)),
             "rope_render_matches_physics": rope_render_matches_physics,
@@ -1097,6 +1357,7 @@ class SplitDemo:
                 "hero_mp4": str(mp4_path),
                 "hero_gif": str(gif_path),
                 "contact_sheet": str(sheet_path),
+                "first_30_frames_sheet": str(first_30_sheet_path),
             },
         }
 
@@ -1127,6 +1388,8 @@ class SplitDemo:
                     f"- First rope motion frame: `{self.first_rope_motion_frame}`",
                     f"- Rope motion after contact: `{rope_motion_after_contact}`",
                     f"- Rope render matches physics: `{rope_render_matches_physics}`",
+                    f"- Record start mode: `post_settle`",
+                    f"- Rope pre-roll seconds: `{float(self.args.rope_preroll_seconds):.3f}`",
                     "",
                     "Artifacts:",
                     "- `summary.json`",
@@ -1135,12 +1398,176 @@ class SplitDemo:
                     "- `hero.mp4`",
                     "- `hero.gif`",
                     "- `contact_sheet.jpg`",
+                    "- `first_30_frames_sheet.jpg`",
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
         return summary
+
+
+def _clone_args(args: argparse.Namespace, **updates: Any) -> argparse.Namespace:
+    data = vars(args).copy()
+    data.update(updates)
+    return argparse.Namespace(**data)
+
+
+def _support_candidates() -> list[CalibrationCandidate]:
+    candidates: list[CalibrationCandidate] = []
+    for inset_y in (0.17, 0.15, 0.13, 0.11):
+        for overhang_drop in (0.15, 0.10, 0.05):
+            for support_scale in (1.0e-5, 5.0e-5, 1.0e-4, 5.0e-4, 1.0e-3):
+                for support_damping in (8.0, 4.0, 2.0):
+                    candidates.append(
+                        CalibrationCandidate(
+                            ground_shape_contact_scale=support_scale,
+                            ground_shape_contact_damping_multiplier=support_damping,
+                            table_shape_contact_scale=support_scale,
+                            table_shape_contact_damping_multiplier=support_damping,
+                            finger_shape_contact_scale=0.10,
+                            finger_shape_contact_damping_multiplier=1.5,
+                            table_edge_inset_y=inset_y,
+                            overhang_drop_factor=overhang_drop,
+                        )
+                    )
+    return candidates
+
+
+def _finger_candidates(base: CalibrationCandidate) -> list[CalibrationCandidate]:
+    candidates: list[CalibrationCandidate] = []
+    for finger_scale in (0.10, 0.20, 0.35):
+        for finger_damping in (1.5, 1.0):
+            candidates.append(
+                CalibrationCandidate(
+                    ground_shape_contact_scale=base.ground_shape_contact_scale,
+                    ground_shape_contact_damping_multiplier=base.ground_shape_contact_damping_multiplier,
+                    table_shape_contact_scale=base.table_shape_contact_scale,
+                    table_shape_contact_damping_multiplier=base.table_shape_contact_damping_multiplier,
+                    finger_shape_contact_scale=finger_scale,
+                    finger_shape_contact_damping_multiplier=finger_damping,
+                    table_edge_inset_y=base.table_edge_inset_y,
+                    overhang_drop_factor=base.overhang_drop_factor,
+                )
+            )
+    return candidates
+
+
+def _support_passes(metrics: WindowMetrics) -> bool:
+    return (
+        metrics.rope_table_contact_frames >= 20
+        and metrics.rope_ground_contact_frames >= 20
+        and metrics.max_rope_com_z <= 0.25
+        and metrics.max_abs_delta_rope_com_z <= 0.10
+        and metrics.max_support_penetration_m <= 0.003
+        and metrics.final_support_penetration_p99_m <= 0.001
+    )
+
+
+def _finger_passes(metrics: WindowMetrics) -> bool:
+    return _support_passes(metrics) and metrics.robot_table_contact_frames == 0
+
+
+def _candidate_score(metrics: WindowMetrics) -> tuple[float, float, float, float, float, float]:
+    return (
+        float(metrics.max_support_penetration_m),
+        float(metrics.final_support_penetration_p99_m),
+        -float(metrics.rope_table_contact_frames + metrics.rope_ground_contact_frames),
+        float(metrics.robot_table_contact_frames),
+        float(metrics.max_rope_com_z),
+        float(metrics.max_abs_delta_rope_com_z),
+    )
+
+
+def _evaluate_candidate(base_args: argparse.Namespace, candidate: CalibrationCandidate, *, freeze_robot: bool) -> WindowMetrics:
+    candidate_args = _clone_args(
+        base_args,
+        width=64,
+        height=64,
+        sim_substeps_rope=int(base_args.calibration_sim_substeps_rope),
+        ground_shape_contact_scale=candidate.ground_shape_contact_scale,
+        ground_shape_contact_damping_multiplier=candidate.ground_shape_contact_damping_multiplier,
+        table_shape_contact_scale=candidate.table_shape_contact_scale,
+        table_shape_contact_damping_multiplier=candidate.table_shape_contact_damping_multiplier,
+        finger_shape_contact_scale=candidate.finger_shape_contact_scale,
+        finger_shape_contact_damping_multiplier=candidate.finger_shape_contact_damping_multiplier,
+        table_edge_inset_y=candidate.table_edge_inset_y,
+        overhang_drop_factor=candidate.overhang_drop_factor,
+    )
+    demo = SplitDemo(candidate_args)
+    try:
+        return demo.evaluate_window(num_frames=30, freeze_robot=freeze_robot)
+    finally:
+        try:
+            demo.viewer.close()
+        except Exception:
+            pass
+
+
+def _select_calibrated_args(base_args: argparse.Namespace) -> argparse.Namespace:
+    best_support: tuple[CalibrationCandidate, WindowMetrics] | None = None
+    selected_support: CalibrationCandidate | None = None
+    for candidate in _support_candidates():
+        metrics = _evaluate_candidate(base_args, candidate, freeze_robot=True)
+        print(
+            "[support-calibration]",
+            json.dumps({"candidate": candidate.__dict__, "metrics": metrics.__dict__}),
+            flush=True,
+        )
+        if best_support is None or _candidate_score(metrics) < _candidate_score(best_support[1]):
+            best_support = (candidate, metrics)
+        if _support_passes(metrics):
+            selected_support = candidate
+            break
+    if selected_support is None or best_support is None:
+        raise RuntimeError(
+            "Light-rope support calibration failed. Best candidate: "
+            + json.dumps(
+                {
+                    "candidate": best_support[0].__dict__,
+                    "metrics": best_support[1].__dict__,
+                },
+                indent=2,
+            )
+        )
+
+    best_finger: tuple[CalibrationCandidate, WindowMetrics] | None = None
+    selected_candidate: CalibrationCandidate | None = None
+    for candidate in _finger_candidates(selected_support):
+        metrics = _evaluate_candidate(base_args, candidate, freeze_robot=False)
+        print(
+            "[finger-calibration]",
+            json.dumps({"candidate": candidate.__dict__, "metrics": metrics.__dict__}),
+            flush=True,
+        )
+        if best_finger is None or _candidate_score(metrics) < _candidate_score(best_finger[1]):
+            best_finger = (candidate, metrics)
+        if _finger_passes(metrics):
+            selected_candidate = candidate
+            break
+    if selected_candidate is None or best_finger is None:
+        raise RuntimeError(
+            "Light-rope finger calibration failed. Best candidate: "
+            + json.dumps(
+                {
+                    "candidate": best_finger[0].__dict__,
+                    "metrics": best_finger[1].__dict__,
+                },
+                indent=2,
+            )
+        )
+
+    return _clone_args(
+        base_args,
+        ground_shape_contact_scale=selected_candidate.ground_shape_contact_scale,
+        ground_shape_contact_damping_multiplier=selected_candidate.ground_shape_contact_damping_multiplier,
+        table_shape_contact_scale=selected_candidate.table_shape_contact_scale,
+        table_shape_contact_damping_multiplier=selected_candidate.table_shape_contact_damping_multiplier,
+        finger_shape_contact_scale=selected_candidate.finger_shape_contact_scale,
+        finger_shape_contact_damping_multiplier=selected_candidate.finger_shape_contact_damping_multiplier,
+        table_edge_inset_y=selected_candidate.table_edge_inset_y,
+        overhang_drop_factor=selected_candidate.overhang_drop_factor,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1160,17 +1587,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=170)
     parser.add_argument("--sim-substeps-rigid", type=int, default=10)
     parser.add_argument("--sim-substeps-rope", type=int, default=667)
+    parser.add_argument("--calibration-sim-substeps-rope", type=int, default=32)
     parser.add_argument("--rope-sim-dt", type=float, default=None)
+    parser.add_argument("--rope-preroll-seconds", type=float, default=2.0)
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--gravity-mag", type=float, default=9.8)
     parser.add_argument("--apply-drag", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--drag-damping-scale", type=float, default=1.0)
+    parser.add_argument("--auto-set-weight", type=float, default=0.1)
+    parser.add_argument("--mass-spring-scale", type=float, default=None)
+    parser.add_argument("--object-mass", type=float, default=1.0)
     parser.add_argument("--spring-ke-scale", type=float, default=1.0)
     parser.add_argument("--spring-kd-scale", type=float, default=1.0)
     parser.add_argument("--angular-damping", type=float, default=0.05)
     parser.add_argument("--friction-smoothing", type=float, default=1.0)
-    parser.add_argument("--particle-radius-scale", type=float, default=1.0)
+    parser.add_argument("--particle-radius-scale", type=float, default=0.2)
+    parser.add_argument("--ground-shape-contact-scale", type=float, default=1.0e-5)
+    parser.add_argument("--ground-shape-contact-damping-multiplier", type=float, default=8.0)
+    parser.add_argument("--table-shape-contact-scale", type=float, default=1.0e-5)
+    parser.add_argument("--table-shape-contact-damping-multiplier", type=float, default=8.0)
+    parser.add_argument("--finger-shape-contact-scale", type=float, default=0.1)
+    parser.add_argument("--finger-shape-contact-damping-multiplier", type=float, default=1.5)
+    parser.add_argument("--table-edge-inset-y", type=float, default=0.17)
+    parser.add_argument("--overhang-drop-factor", type=float, default=0.15)
+    parser.add_argument("--min-clearance-extra", type=float, default=0.002)
+    parser.add_argument("--auto-calibrate-light-rope", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gripper-opening", type=float, default=0.04)
     parser.add_argument("--push-clearance", type=float, default=0.029)
     parser.add_argument("--gripper-yaw", type=float, default=1.32079632679)
@@ -1182,6 +1624,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.auto_calibrate_light_rope:
+        args = _select_calibrated_args(args)
     demo = SplitDemo(args)
     summary = demo.run()
     print(json.dumps(summary, indent=2))
