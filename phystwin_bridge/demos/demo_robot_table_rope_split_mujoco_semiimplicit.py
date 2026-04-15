@@ -293,28 +293,27 @@ class NativePandaRigidSide:
         self._set_camera()
 
     def _build_scene(self) -> None:
+        sdf_max_resolution = 64
+        sdf_narrow_band_range = (-0.01, 0.01)
+
         shape_cfg = newton.ModelBuilder.ShapeConfig(
             kh=1e11,
-            sdf_max_resolution=64,
-            is_hydroelastic=True,
-            sdf_narrow_band_range=(-0.01, 0.01),
             gap=0.01,
             mu_torsional=0.0,
             mu_rolling=0.0,
         )
-        mesh_shape_cfg = copy.deepcopy(shape_cfg)
-        mesh_shape_cfg.sdf_max_resolution = None
-        mesh_shape_cfg.sdf_target_voxel_size = None
-        mesh_shape_cfg.sdf_narrow_band_range = (-0.1, 0.1)
-        hydro_mesh_sdf_max_resolution = 64
+        # Follow upstream panda_hydro style: keep a plain base config, then derive
+        # explicit hydroelastic configs for meshes and primitives.
+        shape_cfg_meshes = replace(shape_cfg, is_hydroelastic=True)
+        shape_cfg_primitives = replace(
+            shape_cfg,
+            is_hydroelastic=True,
+            sdf_max_resolution=sdf_max_resolution,
+            sdf_narrow_band_range=sdf_narrow_band_range,
+        )
 
         builder = newton.ModelBuilder()
-        urdf_shape_cfg = copy.deepcopy(shape_cfg)
-        urdf_shape_cfg.is_hydroelastic = False
-        urdf_shape_cfg.sdf_max_resolution = None
-        urdf_shape_cfg.sdf_target_voxel_size = None
-        urdf_shape_cfg.sdf_narrow_band_range = (-0.1, 0.1)
-        builder.default_shape_cfg = urdf_shape_cfg
+        builder.default_shape_cfg = shape_cfg
 
         builder.add_urdf(
             newton.utils.download_asset("franka_emika_panda") / "urdf/fr3_franka_hand.urdf",
@@ -322,7 +321,6 @@ class NativePandaRigidSide:
             enable_self_collisions=False,
             parse_visuals_as_colliders=True,
         )
-        builder.default_shape_cfg = shape_cfg
 
         def find_body(name: str) -> int:
             return next(i for i, lbl in enumerate(builder.body_label) if lbl.endswith(f"/{name}"))
@@ -348,14 +346,13 @@ class NativePandaRigidSide:
                         builder.shape_source[shape_idx] = mesh
                         builder.shape_scale[shape_idx] = (1.0, 1.0, 1.0)
                     mesh.build_sdf(
-                        max_resolution=hydro_mesh_sdf_max_resolution,
-                        narrow_band_range=shape_cfg.sdf_narrow_band_range,
-                        margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
+                        max_resolution=sdf_max_resolution,
+                        narrow_band_range=sdf_narrow_band_range,
+                        margin=shape_cfg.gap,
                     )
                 builder.shape_flags[shape_idx] |= newton.ShapeFlags.HYDROELASTIC
                 self.finger_shape_indices.append(shape_idx)
             elif body_idx >= 0:
-                builder.shape_flags[shape_idx] &= ~newton.ShapeFlags.HYDROELASTIC
                 self.nonfinger_shape_indices.append(shape_idx)
 
         builder.approximate_meshes(
@@ -393,9 +390,9 @@ class NativePandaRigidSide:
         if not np.allclose(pad_scale, 1.0):
             pad_mesh = pad_mesh.copy(vertices=pad_mesh.vertices * pad_scale, recompute_inertia=True)
         pad_mesh.build_sdf(
-            max_resolution=hydro_mesh_sdf_max_resolution,
-            narrow_band_range=shape_cfg.sdf_narrow_band_range,
-            margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
+            max_resolution=sdf_max_resolution,
+            narrow_band_range=sdf_narrow_band_range,
+            margin=shape_cfg.gap,
         )
         self.pad_xform = wp.transform(
             wp.vec3(0.0, 0.005, 0.045),
@@ -405,14 +402,14 @@ class NativePandaRigidSide:
             body=self.left_finger_body_idx,
             mesh=pad_mesh,
             xform=self.pad_xform,
-            cfg=mesh_shape_cfg,
+            cfg=shape_cfg_meshes,
             label="left_pad",
         )
         right_pad_shape = builder.add_shape_mesh(
             body=self.right_finger_body_idx,
             mesh=pad_mesh,
             xform=self.pad_xform,
-            cfg=mesh_shape_cfg,
+            cfg=shape_cfg_meshes,
             label="right_pad",
         )
         self.finger_shape_indices.extend([left_pad_shape, right_pad_shape])
@@ -427,19 +424,19 @@ class NativePandaRigidSide:
             compute_inertia=True,
         )
         table_mesh.build_sdf(
-            max_resolution=hydro_mesh_sdf_max_resolution,
-            narrow_band_range=shape_cfg.sdf_narrow_band_range,
-            margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
+            max_resolution=sdf_max_resolution,
+            narrow_band_range=sdf_narrow_band_range,
+            margin=shape_cfg.gap,
         )
         self.table_shape_idx = builder.add_shape_mesh(
             body=-1,
             mesh=table_mesh,
             xform=wp.transform(wp.vec3(*self.table_pos.tolist()), wp.quat_identity()),
-            cfg=mesh_shape_cfg,
+            cfg=shape_cfg_meshes,
             label="split_probe_table",
         )
 
-        builder.add_ground_plane()
+        builder.add_ground_plane(cfg=shape_cfg_primitives)
 
         for body_name, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx)):
             for shape_idx in builder.body_shapes[body_idx]:
