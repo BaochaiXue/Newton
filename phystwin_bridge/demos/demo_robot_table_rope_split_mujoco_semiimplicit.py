@@ -7,7 +7,7 @@ import csv
 import json
 import math
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1413,25 +1413,113 @@ def _clone_args(args: argparse.Namespace, **updates: Any) -> argparse.Namespace:
     return argparse.Namespace(**data)
 
 
-def _support_candidates() -> list[CalibrationCandidate]:
-    candidates: list[CalibrationCandidate] = []
-    for inset_y in (0.17, 0.15, 0.13, 0.11):
-        for overhang_drop in (0.15, 0.10, 0.05):
-            for support_scale in (1.0e-5, 5.0e-5, 1.0e-4, 5.0e-4, 1.0e-3):
-                for support_damping in (8.0, 4.0, 2.0):
+def _ordered_unique_floats(*values: float) -> list[float]:
+    ordered: list[float] = []
+    seen: set[float] = set()
+    for value in values:
+        val = float(value)
+        if val in seen:
+            continue
+        ordered.append(val)
+        seen.add(val)
+    return ordered
+
+
+def _candidate_key(candidate: CalibrationCandidate) -> tuple[float, ...]:
+    return (
+        float(candidate.ground_shape_contact_scale),
+        float(candidate.ground_shape_contact_damping_multiplier),
+        float(candidate.table_shape_contact_scale),
+        float(candidate.table_shape_contact_damping_multiplier),
+        float(candidate.finger_shape_contact_scale),
+        float(candidate.finger_shape_contact_damping_multiplier),
+        float(candidate.table_edge_inset_y),
+        float(candidate.overhang_drop_factor),
+    )
+
+
+def _dedupe_candidates(candidates: list[CalibrationCandidate]) -> list[CalibrationCandidate]:
+    out: list[CalibrationCandidate] = []
+    seen: set[tuple[float, ...]] = set()
+    for candidate in candidates:
+        key = _candidate_key(candidate)
+        if key in seen:
+            continue
+        out.append(candidate)
+        seen.add(key)
+    return out
+
+
+def _candidate_from_args(args: argparse.Namespace) -> CalibrationCandidate:
+    return CalibrationCandidate(
+        ground_shape_contact_scale=float(args.ground_shape_contact_scale),
+        ground_shape_contact_damping_multiplier=float(args.ground_shape_contact_damping_multiplier),
+        table_shape_contact_scale=float(args.table_shape_contact_scale),
+        table_shape_contact_damping_multiplier=float(args.table_shape_contact_damping_multiplier),
+        finger_shape_contact_scale=float(args.finger_shape_contact_scale),
+        finger_shape_contact_damping_multiplier=float(args.finger_shape_contact_damping_multiplier),
+        table_edge_inset_y=float(args.table_edge_inset_y),
+        overhang_drop_factor=float(args.overhang_drop_factor),
+    )
+
+
+def _support_candidates(base_args: argparse.Namespace) -> list[CalibrationCandidate]:
+    base = _candidate_from_args(base_args)
+    candidates: list[CalibrationCandidate] = [base]
+
+    ground_scales = _ordered_unique_floats(
+        base.ground_shape_contact_scale,
+        2.0e-5,
+        5.0e-5,
+        1.0e-4,
+        2.0e-4,
+        5.0e-4,
+        1.0e-3,
+    )
+    ground_dampings = _ordered_unique_floats(
+        base.ground_shape_contact_damping_multiplier,
+        12.0,
+        16.0,
+        20.0,
+    )
+
+    for ground_scale in ground_scales:
+        for ground_damping in ground_dampings:
+            candidates.append(
+                replace(
+                    base,
+                    ground_shape_contact_scale=ground_scale,
+                    ground_shape_contact_damping_multiplier=ground_damping,
+                )
+            )
+
+    for overhang_drop in _ordered_unique_floats(base.overhang_drop_factor, 0.10, 0.05):
+        for ground_scale in ground_scales[1:5]:
+            for ground_damping in ground_dampings[:3]:
+                candidates.append(
+                    replace(
+                        base,
+                        ground_shape_contact_scale=ground_scale,
+                        ground_shape_contact_damping_multiplier=ground_damping,
+                        overhang_drop_factor=overhang_drop,
+                    )
+                )
+
+    for inset_y in _ordered_unique_floats(base.table_edge_inset_y, 0.18, 0.16):
+        for overhang_drop in _ordered_unique_floats(base.overhang_drop_factor, 0.10):
+            for ground_scale in ground_scales[1:4]:
+                for ground_damping in ground_dampings[:2]:
                     candidates.append(
-                        CalibrationCandidate(
-                            ground_shape_contact_scale=support_scale,
-                            ground_shape_contact_damping_multiplier=support_damping,
-                            table_shape_contact_scale=support_scale,
-                            table_shape_contact_damping_multiplier=support_damping,
-                            finger_shape_contact_scale=0.10,
-                            finger_shape_contact_damping_multiplier=1.5,
+                        replace(
+                            base,
+                            ground_shape_contact_scale=ground_scale,
+                            ground_shape_contact_damping_multiplier=ground_damping,
                             table_edge_inset_y=inset_y,
                             overhang_drop_factor=overhang_drop,
                         )
                     )
-    return candidates
+
+    return _dedupe_candidates(candidates)
 
 
 def _finger_candidates(base: CalibrationCandidate) -> list[CalibrationCandidate]:
@@ -1464,6 +1552,17 @@ def _support_passes(metrics: WindowMetrics) -> bool:
     )
 
 
+def _support_precheck_passes(metrics: WindowMetrics) -> bool:
+    return (
+        metrics.rope_table_contact_frames >= 8
+        and metrics.rope_ground_contact_frames >= 8
+        and metrics.max_rope_com_z <= 0.25
+        and metrics.max_abs_delta_rope_com_z <= 0.10
+        and metrics.max_support_penetration_m <= 0.010
+        and metrics.final_support_penetration_p99_m <= 0.005
+    )
+
+
 def _finger_passes(metrics: WindowMetrics) -> bool:
     return _support_passes(metrics) and metrics.robot_table_contact_frames == 0
 
@@ -1479,12 +1578,21 @@ def _candidate_score(metrics: WindowMetrics) -> tuple[float, float, float, float
     )
 
 
-def _evaluate_candidate(base_args: argparse.Namespace, candidate: CalibrationCandidate, *, freeze_robot: bool) -> WindowMetrics:
+def _evaluate_candidate(
+    base_args: argparse.Namespace,
+    candidate: CalibrationCandidate,
+    *,
+    freeze_robot: bool,
+    sim_substeps_rope: int | None = None,
+    num_frames: int = 30,
+) -> WindowMetrics:
+    sim_substeps = int(base_args.sim_substeps_rope if sim_substeps_rope is None else sim_substeps_rope)
     candidate_args = _clone_args(
         base_args,
         width=64,
         height=64,
-        sim_substeps_rope=int(base_args.calibration_sim_substeps_rope),
+        rope_sim_dt=None,
+        sim_substeps_rope=sim_substeps,
         ground_shape_contact_scale=candidate.ground_shape_contact_scale,
         ground_shape_contact_damping_multiplier=candidate.ground_shape_contact_damping_multiplier,
         table_shape_contact_scale=candidate.table_shape_contact_scale,
@@ -1496,7 +1604,7 @@ def _evaluate_candidate(base_args: argparse.Namespace, candidate: CalibrationCan
     )
     demo = SplitDemo(candidate_args)
     try:
-        return demo.evaluate_window(num_frames=30, freeze_robot=freeze_robot)
+        return demo.evaluate_window(num_frames=int(num_frames), freeze_robot=freeze_robot)
     finally:
         try:
             demo.viewer.close()
@@ -1504,14 +1612,49 @@ def _evaluate_candidate(base_args: argparse.Namespace, candidate: CalibrationCan
             pass
 
 
-def _select_calibrated_args(base_args: argparse.Namespace) -> argparse.Namespace:
+def _select_support_args(base_args: argparse.Namespace) -> argparse.Namespace:
     best_support: tuple[CalibrationCandidate, WindowMetrics] | None = None
     selected_support: CalibrationCandidate | None = None
-    for candidate in _support_candidates():
-        metrics = _evaluate_candidate(base_args, candidate, freeze_robot=True)
+    for candidate in _support_candidates(base_args):
+        precheck = _evaluate_candidate(
+            base_args,
+            candidate,
+            freeze_robot=False,
+            sim_substeps_rope=int(base_args.sim_substeps_rope),
+            num_frames=10,
+        )
+        print(
+            "[support-calibration-precheck]",
+            json.dumps(
+                {
+                    "candidate": candidate.__dict__,
+                    "metrics": precheck.__dict__,
+                    "sim_substeps_rope": int(base_args.sim_substeps_rope),
+                }
+            ),
+            flush=True,
+        )
+        if not _support_precheck_passes(precheck):
+            if best_support is None or _candidate_score(precheck) < _candidate_score(best_support[1]):
+                best_support = (candidate, precheck)
+            continue
+
+        metrics = _evaluate_candidate(
+            base_args,
+            candidate,
+            freeze_robot=False,
+            sim_substeps_rope=int(base_args.sim_substeps_rope),
+            num_frames=30,
+        )
         print(
             "[support-calibration]",
-            json.dumps({"candidate": candidate.__dict__, "metrics": metrics.__dict__}),
+            json.dumps(
+                {
+                    "candidate": candidate.__dict__,
+                    "metrics": metrics.__dict__,
+                    "sim_substeps_rope": int(base_args.sim_substeps_rope),
+                }
+            ),
             flush=True,
         )
         if best_support is None or _candidate_score(metrics) < _candidate_score(best_support[1]):
@@ -1531,10 +1674,30 @@ def _select_calibrated_args(base_args: argparse.Namespace) -> argparse.Namespace
             )
         )
 
+    return _clone_args(
+        base_args,
+        ground_shape_contact_scale=selected_support.ground_shape_contact_scale,
+        ground_shape_contact_damping_multiplier=selected_support.ground_shape_contact_damping_multiplier,
+        table_shape_contact_scale=selected_support.table_shape_contact_scale,
+        table_shape_contact_damping_multiplier=selected_support.table_shape_contact_damping_multiplier,
+        table_edge_inset_y=selected_support.table_edge_inset_y,
+        overhang_drop_factor=selected_support.overhang_drop_factor,
+    )
+
+
+def _select_finger_args(base_args: argparse.Namespace) -> argparse.Namespace:
+    support_args = _select_support_args(base_args)
+    selected_support = _candidate_from_args(support_args)
+
     best_finger: tuple[CalibrationCandidate, WindowMetrics] | None = None
     selected_candidate: CalibrationCandidate | None = None
     for candidate in _finger_candidates(selected_support):
-        metrics = _evaluate_candidate(base_args, candidate, freeze_robot=False)
+        metrics = _evaluate_candidate(
+            support_args,
+            candidate,
+            freeze_robot=False,
+            sim_substeps_rope=int(support_args.calibration_sim_substeps_rope),
+        )
         print(
             "[finger-calibration]",
             json.dumps({"candidate": candidate.__dict__, "metrics": metrics.__dict__}),
@@ -1558,7 +1721,7 @@ def _select_calibrated_args(base_args: argparse.Namespace) -> argparse.Namespace
         )
 
     return _clone_args(
-        base_args,
+        support_args,
         ground_shape_contact_scale=selected_candidate.ground_shape_contact_scale,
         ground_shape_contact_damping_multiplier=selected_candidate.ground_shape_contact_damping_multiplier,
         table_shape_contact_scale=selected_candidate.table_shape_contact_scale,
@@ -1568,6 +1731,10 @@ def _select_calibrated_args(base_args: argparse.Namespace) -> argparse.Namespace
         table_edge_inset_y=selected_candidate.table_edge_inset_y,
         overhang_drop_factor=selected_candidate.overhang_drop_factor,
     )
+
+
+def _select_calibrated_args(base_args: argparse.Namespace) -> argparse.Namespace:
+    return _select_finger_args(base_args)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1603,15 +1770,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--angular-damping", type=float, default=0.05)
     parser.add_argument("--friction-smoothing", type=float, default=1.0)
     parser.add_argument("--particle-radius-scale", type=float, default=0.2)
-    parser.add_argument("--ground-shape-contact-scale", type=float, default=1.0e-5)
-    parser.add_argument("--ground-shape-contact-damping-multiplier", type=float, default=8.0)
-    parser.add_argument("--table-shape-contact-scale", type=float, default=1.0e-5)
-    parser.add_argument("--table-shape-contact-damping-multiplier", type=float, default=8.0)
+    parser.add_argument("--ground-shape-contact-scale", type=float, default=1.0e-3)
+    parser.add_argument("--ground-shape-contact-damping-multiplier", type=float, default=64.0)
+    parser.add_argument("--table-shape-contact-scale", type=float, default=1.0e-3)
+    parser.add_argument("--table-shape-contact-damping-multiplier", type=float, default=64.0)
     parser.add_argument("--finger-shape-contact-scale", type=float, default=0.1)
     parser.add_argument("--finger-shape-contact-damping-multiplier", type=float, default=1.5)
     parser.add_argument("--table-edge-inset-y", type=float, default=0.17)
-    parser.add_argument("--overhang-drop-factor", type=float, default=0.15)
+    parser.add_argument("--overhang-drop-factor", type=float, default=0.02)
     parser.add_argument("--min-clearance-extra", type=float, default=0.002)
+    parser.add_argument("--auto-calibrate-support", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-calibrate-light-rope", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gripper-opening", type=float, default=0.04)
     parser.add_argument("--push-clearance", type=float, default=0.029)
@@ -1624,6 +1792,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.auto_calibrate_support:
+        args = _select_support_args(args)
     if args.auto_calibrate_light_rope:
         args = _select_calibrated_args(args)
     demo = SplitDemo(args)
