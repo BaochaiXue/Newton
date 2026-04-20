@@ -172,6 +172,8 @@ class RigidStepMetrics:
     frame: int
     time_s: float
     target_xyz: np.ndarray
+    actual_target_xyz: np.ndarray
+    target_error_m: float
     actual_ee_xyz: np.ndarray
     ee_error_m: float
     robot_table_contacts: int
@@ -287,6 +289,11 @@ class NativePandaRigidSide:
         self.table_top_z = float(self.table_pos[2] + self.table_half_extents[2])
 
         self.push_direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        self.presentation_contact_point: np.ndarray | None = None
+        self.presentation_scene_center: np.ndarray | None = None
+        self.position_target_link_index = -1
+        self.position_target_local_offset = np.zeros(3, dtype=np.float32)
+        self.drive_target_is_pad_center = False
         self._build_scene()
         self._setup_ik()
         self._setup_motion_defaults()
@@ -494,9 +501,14 @@ class NativePandaRigidSide:
         self.viewer.set_model(self.model)
 
     def _setup_motion_defaults(self) -> None:
-        self.settle_frames = int(round(2.0 / self.frame_dt))
-        self.approach_frames = int(round(0.5 / self.frame_dt))
-        self.retract_frames = int(round(1.0 / self.frame_dt))
+        if str(self.args.video_mode) == "presentation_lifted":
+            self.settle_frames = int(round(float(self.args.presentation_opening_seconds) / self.frame_dt))
+            self.approach_frames = int(round(float(self.args.presentation_approach_seconds) / self.frame_dt))
+            self.retract_frames = int(round(float(self.args.presentation_retract_seconds) / self.frame_dt))
+        else:
+            self.settle_frames = int(round(2.0 / self.frame_dt))
+            self.approach_frames = int(round(0.5 / self.frame_dt))
+            self.retract_frames = int(round(1.0 / self.frame_dt))
         self.push_path_length_m = 0.08
         self.push_speed_mps = 0.03
         self.push_frames = max(1, int(round(self.push_path_length_m / (self.push_speed_mps * self.frame_dt))))
@@ -529,7 +541,71 @@ class NativePandaRigidSide:
         )
         self._calibrate_pad_offset()
 
-    def _solve_single_fk(self, ee_target_xyz: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
+    def configure_presentation_for_rope(self, rope_points: np.ndarray, rope_radius_m: float) -> None:
+        points = np.asarray(rope_points, dtype=np.float32)
+        if points.size == 0:
+            return
+        overall_center = np.asarray(points.mean(axis=0), dtype=np.float32)
+        self.presentation_scene_center = overall_center.copy()
+        table_hover_z = float(self.table_top_z + max(float(rope_radius_m) * 2.5, 0.012))
+        contact_point = np.array(
+            [
+                float(overall_center[0]),
+                float(overall_center[1]),
+                float(table_hover_z + 0.03),
+            ],
+            dtype=np.float32,
+        )
+        self.presentation_contact_point = contact_point.copy()
+
+        contact_offset_x = max(float(rope_radius_m) * 3.0, 0.018)
+        standoff_x = contact_offset_x + 0.03
+        standoff_z = max(float(rope_radius_m) * 5.0, 0.035)
+        standoff_y = 0.015
+        contact_lift = max(float(rope_radius_m) * 1.0, 0.006)
+        push_distance = float(self.args.presentation_push_distance)
+        start_y = float(contact_point[1] - 0.005)
+        end_y = float(contact_point[1] + 0.08)
+        push_start_z = float(max(float(contact_point[2] + contact_lift), table_hover_z + 0.02))
+        push_end_z = float(table_hover_z)
+        self.target_y = start_y
+        self.push_path_length_m = float(push_distance + contact_offset_x)
+        self.push_speed_mps = float(self.args.presentation_push_speed_mps)
+        self.push_frames = max(1, int(round(self.push_path_length_m / (self.push_speed_mps * self.frame_dt))))
+        self.total_frames = self.settle_frames + self.approach_frames + self.push_frames + self.retract_frames
+        self.pad_far_xyz = np.array(
+            [
+                float(contact_point[0] - standoff_x),
+                float(start_y - standoff_y),
+                float(push_start_z + standoff_z),
+            ],
+            dtype=np.float32,
+        )
+        self.pad_push_start_xyz = np.array(
+            [
+                float(contact_point[0] - contact_offset_x),
+                float(start_y),
+                float(push_start_z),
+            ],
+            dtype=np.float32,
+        )
+        self.pad_push_end_xyz = np.array(
+            [
+                float(contact_point[0] + push_distance),
+                float(end_y),
+                float(push_end_z),
+            ],
+            dtype=np.float32,
+        )
+        self.prepush_z = float(self.pad_push_start_xyz[2])
+        self.retract_z = float(self.pad_push_end_xyz[2] + 0.05)
+        self._calibrate_pad_offset()
+        self._snap_to_target_position(self.pad_far_xyz)
+        self._set_camera()
+
+    def _solve_single_fk(
+        self, ee_target_xyz: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
         self.pos_obj.set_target_positions(wp.array([ee_target_xyz], dtype=wp.vec3))
         self.rot_obj.set_target_rotations(wp.array([quat_to_vec4(self.target_rotation)], dtype=wp.vec4))
         self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
@@ -546,14 +622,19 @@ class NativePandaRigidSide:
             center = _transform_point_np(body_q_np[body_idx], self.pad_center_locals[side])
             side_centers[side] = center
             side_body_q[side] = body_q_np[body_idx].copy()
-        return ee_xyz, side_centers, side_body_q
+        return q_np, ee_xyz, side_centers, side_body_q
 
     def _calibrate_pad_offset(self) -> None:
         nominal_ee = self.pad_push_start_xyz.copy()
-        ee_xyz, side_centers, _ = self._solve_single_fk(nominal_ee)
+        _, ee_xyz, side_centers, _ = self._solve_single_fk(nominal_ee)
         projections = {side: float(np.dot(center, self.push_direction)) for side, center in side_centers.items()}
         self.leading_side_name = max(projections, key=projections.get)
         self.leading_pad_offset_world = ee_xyz - side_centers[self.leading_side_name]
+        if str(self.args.video_mode) == "presentation_lifted":
+            leading_body_idx = self.right_finger_body_idx if self.leading_side_name == "right" else self.left_finger_body_idx
+            self._configure_position_target_ik(leading_body_idx, self.pad_center_locals[self.leading_side_name])
+        else:
+            self._configure_position_target_ik(self.ee_index, np.zeros(3, dtype=np.float32))
         self.parking_mirror_state = {
             "left": {
                 "body_q": np.asarray([-0.55, -0.95, 0.45, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
@@ -565,17 +646,43 @@ class NativePandaRigidSide:
             },
         }
 
+    def _snap_to_target_position(self, ee_target_xyz: np.ndarray) -> None:
+        q_np, _, _, _ = self._solve_single_fk(np.asarray(ee_target_xyz, dtype=np.float32))
+        q_np = np.asarray(q_np, dtype=np.float32).reshape(-1)
+        q_single = q_np.reshape(1, -1)
+        q_full = self.model.joint_q.numpy().astype(np.float32, copy=False)
+        qd_full = self.model.joint_qd.numpy().astype(np.float32, copy=False)
+        q_full[: q_np.shape[0]] = q_np
+        qd_full[:] = 0.0
+        self.model.joint_q.assign(q_full)
+        self.model.joint_qd.assign(qd_full)
+
+        q_wp = wp.array(q_full, dtype=wp.float32, device=self.model.device)
+        qd_wp = wp.array(qd_full, dtype=wp.float32, device=self.model.device)
+        self.state_0.joint_q.assign(q_full)
+        self.state_0.joint_qd.assign(qd_full)
+        self.state_1.joint_q.assign(q_full)
+        self.state_1.joint_qd.assign(qd_full)
+        newton.eval_fk(self.model, q_wp, qd_wp, self.state_0)
+        newton.eval_fk(self.model, q_wp, qd_wp, self.state_1)
+        self.model_single.joint_q.assign(q_np)
+        self.model_single.joint_qd.zero_()
+        newton.eval_fk(self.model_single, self.model_single.joint_q, self.model_single.joint_qd, self.state_single)
+        self.joint_q_ik = wp.array(q_single, dtype=wp.float32, device=self.model_single.device)
+        self.pos_obj.set_target_positions(wp.array([ee_target_xyz], dtype=wp.vec3))
+        self.rot_obj.set_target_rotations(wp.array([quat_to_vec4(self.target_rotation)], dtype=wp.vec4))
+        self.control.joint_target_pos.zero_()
+        wp.copy(self.control.joint_target_pos, wp.array(q_np, dtype=wp.float32, device=self.model.device))
+        self.control.joint_target_pos[7:9].fill_(self.gripper_opening)
+        self.sim_time = 0.0
+        self.frame_idx = 0
+
     def _setup_ik(self) -> None:
         self.state_single = self.model_single.state()
         newton.eval_fk(self.model_single, self.model_single.joint_q, self.model_single.joint_qd, self.state_single)
         body_q_np = self.state_single.body_q.numpy()
         self.ee_tf = wp.transform(*body_q_np[self.ee_index])
 
-        self.pos_obj = ik.IKObjectivePosition(
-            link_index=self.ee_index,
-            link_offset=wp.vec3(0.0, 0.0, 0.0),
-            target_positions=wp.array([wp.transform_get_translation(self.ee_tf)], dtype=wp.vec3),
-        )
         self.rot_obj = ik.IKObjectiveRotation(
             link_index=self.ee_index,
             link_offset_rotation=wp.quat_identity(),
@@ -586,6 +693,21 @@ class NativePandaRigidSide:
             joint_limit_upper=self.model_single.joint_limit_upper,
         )
         self.joint_q_ik = wp.array(self.model_single.joint_q, shape=(1, self.model_single.joint_coord_count))
+        self.ik_iters = 24
+        self._configure_position_target_ik(self.ee_index, np.zeros(3, dtype=np.float32))
+
+    def _configure_position_target_ik(self, link_index: int, local_offset: np.ndarray) -> None:
+        local_offset = np.asarray(local_offset, dtype=np.float32).reshape(3)
+        body_q_np = self.state_single.body_q.numpy()
+        target_world = _transform_point_np(body_q_np[link_index], local_offset)
+        self.position_target_link_index = int(link_index)
+        self.position_target_local_offset = local_offset.copy()
+        self.drive_target_is_pad_center = bool(link_index != self.ee_index or np.linalg.norm(local_offset) > 0.0)
+        self.pos_obj = ik.IKObjectivePosition(
+            link_index=link_index,
+            link_offset=wp.vec3(float(local_offset[0]), float(local_offset[1]), float(local_offset[2])),
+            target_positions=wp.array([target_world], dtype=wp.vec3),
+        )
         self.ik_solver = ik.IKSolver(
             model=self.model_single,
             n_problems=1,
@@ -593,12 +715,23 @@ class NativePandaRigidSide:
             lambda_initial=0.1,
             jacobian_mode=ik.IKJacobianType.ANALYTIC,
         )
-        self.ik_iters = 24
 
     def _set_camera(self) -> None:
-        self.viewer.set_camera(wp.vec3(0.36, -0.03, 0.33), -14.0, -120.0)
+        if str(self.args.video_mode) == "presentation_lifted" and self.presentation_contact_point is not None:
+            focus = (
+                np.asarray(self.presentation_scene_center, dtype=np.float32)
+                if self.presentation_scene_center is not None
+                else np.asarray(self.presentation_contact_point, dtype=np.float32)
+            )
+            self.viewer.set_camera(
+                wp.vec3(float(focus[0] + 0.44), float(focus[1] + 0.18), float(focus[2] + 0.25)),
+                -18.0,
+                -144.0,
+            )
+        else:
+            self.viewer.set_camera(wp.vec3(0.36, -0.03, 0.33), -14.0, -120.0)
         if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "fov"):
-            self.viewer.camera.fov = 68.0
+            self.viewer.camera.fov = 82.0 if str(self.args.video_mode) == "presentation_lifted" else 68.0
 
     def current_target_position(self) -> np.ndarray:
         if self.frame_idx < self.settle_frames:
@@ -612,7 +745,14 @@ class NativePandaRigidSide:
         else:
             alpha = (self.frame_idx - self.settle_frames - self.approach_frames - self.push_frames) / max(self.retract_frames - 1, 1)
             pad_xyz = (1.0 - alpha) * self.pad_push_end_xyz + alpha * (self.pad_far_xyz + np.array([0.02, 0.0, 0.0], dtype=np.float32))
+        if self.drive_target_is_pad_center:
+            return np.asarray(pad_xyz, dtype=np.float32).copy()
         return pad_xyz + self.leading_pad_offset_world
+
+    def _actual_position_target_world(self, body_q: np.ndarray) -> np.ndarray:
+        if self.position_target_link_index == self.ee_index and np.linalg.norm(self.position_target_local_offset) == 0.0:
+            return np.asarray(body_q[self.ee_index][:3], dtype=np.float32)
+        return _transform_point_np(body_q[self.position_target_link_index], self.position_target_local_offset)
 
     def _robot_table_counts(self) -> tuple[int, int, int]:
         count = _parse_contact_count(self.contacts.rigid_contact_count)
@@ -664,12 +804,17 @@ class NativePandaRigidSide:
 
         body_q = self.state_0.body_q.numpy()
         actual_ee = np.asarray(body_q[self.ee_index][:3], dtype=np.float32)
+        actual_target = self._actual_position_target_world(body_q)
         robot_total, finger_count, nonfinger_count = self._robot_table_counts()
-        ee_error = float(np.linalg.norm(target_position - actual_ee))
+        target_error = float(np.linalg.norm(target_position - actual_target))
+        ee_target = target_position if not self.drive_target_is_pad_center else (target_position + self.leading_pad_offset_world)
+        ee_error = float(np.linalg.norm(ee_target - actual_ee))
         metrics = RigidStepMetrics(
             frame=int(self.frame_idx),
             time_s=float(self.sim_time),
             target_xyz=target_position,
+            actual_target_xyz=actual_target,
+            target_error_m=target_error,
             actual_ee_xyz=actual_ee,
             ee_error_m=ee_error,
             robot_table_contacts=robot_total,
@@ -679,6 +824,16 @@ class NativePandaRigidSide:
         self.frame_idx += 1
         self.sim_time += self.frame_dt
         return metrics
+
+    def pad_centers_world(self) -> dict[str, np.ndarray]:
+        body_q = self.state_0.body_q.numpy().astype(np.float32, copy=False)
+        return {
+            side: _transform_point_np(body_q[body_idx], self.pad_center_locals[side])
+            for side, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx))
+        }
+
+    def leading_pad_world_xyz(self) -> np.ndarray:
+        return self.pad_centers_world()[self.leading_side_name].copy()
 
     def render(self) -> None:
         self.viewer.begin_frame(self.sim_time)
@@ -735,19 +890,44 @@ class SemiImplicitRopeSide:
 
         target_center = np.array(
             [
-                self.rigid.prepush_x + 0.05,
-                self.rigid.table_pos[1] - self.rigid.table_half_extents[1] + float(self.args.table_edge_inset_y),
+                (
+                    max(
+                        float(self.rigid.prepush_x + 0.05),
+                        float(
+                            self.rigid.table_pos[0]
+                            - self.rigid.table_half_extents[0]
+                            + 0.5 * float(bbox_max[0] - bbox_min[0])
+                            + float(self.args.min_clearance_extra)
+                        ),
+                    )
+                    if str(self.args.video_mode) == "presentation_lifted"
+                    else float(self.rigid.prepush_x + 0.05)
+                ),
+                self.rigid.table_pos[1]
+                - self.rigid.table_half_extents[1]
+                + (
+                    float(self.args.presentation_table_edge_inset_y)
+                    if str(self.args.video_mode) == "presentation_lifted"
+                    else float(self.args.table_edge_inset_y)
+                ),
                 center_z_for_table_clearance,
             ],
             dtype=np.float32,
         )
+        if str(self.args.video_mode) == "presentation_lifted":
+            target_center[2] += float(self.args.presentation_lift_height)
         shift = target_center - center
         shifted = (x0 + shift).astype(np.float32, copy=False)
         table_edge_y = float(self.rigid.table_pos[1] - self.rigid.table_half_extents[1])
         overhang_mask = shifted[:, 1] < table_edge_y
         if np.any(overhang_mask):
             hang = (table_edge_y - shifted[overhang_mask, 1]).astype(np.float32, copy=False)
-            shifted[overhang_mask, 2] -= float(self.args.overhang_drop_factor) * hang
+            drop_factor = (
+                float(self.args.presentation_overhang_drop_factor)
+                if str(self.args.video_mode) == "presentation_lifted"
+                else float(self.args.overhang_drop_factor)
+            )
+            shifted[overhang_mask, 2] -= drop_factor * hang
             min_clearance = rope_radius_m + float(self.args.min_clearance_extra)
             shifted[:, 2] = np.maximum(shifted[:, 2], min_clearance)
         rope_ir["x0"] = shifted
@@ -1045,6 +1225,11 @@ class SplitDemo:
             rope_line_center_x=float(self.rope.rope_center_target_x),
             rope_line_y=float(self.rope.rope_line_target_y),
         )
+        if str(self.args.video_mode) == "presentation_lifted":
+            self.rigid.configure_presentation_for_rope(
+                rope_points=np.asarray(self.rope.rope_ir["x0"], dtype=np.float32),
+                rope_radius_m=float(np.mean(self.rope.physical_radius)),
+            )
         try:
             apply_viewer_shape_colors(self.viewer, self.rigid.model)
         except Exception:
@@ -1057,15 +1242,34 @@ class SplitDemo:
         self.first_rope_motion_frame: int | None = None
         self.first_contact_side: str | None = None
         self.first_contact_reaction_nonzero: int | None = None
+        self.first_leading_pad_proximity_frame: int | None = None
         self.baseline_com_x = None
         self.preview_frames: list[np.ndarray] = []
         self.first_30_frames: list[np.ndarray] = []
-        self.preview_indices = sorted(set(np.linspace(0, max(args.num_frames - 1, 0), 6, dtype=int).tolist()))
+        self.render_frame_count = self._resolve_render_frame_count()
+        self.preview_indices = sorted(set(np.linspace(0, max(self.render_frame_count - 1, 0), 6, dtype=int).tolist()))
+
+    def _record_start_mode(self) -> str:
+        return "visible_opening" if str(self.args.video_mode) == "presentation_lifted" else "post_settle"
+
+    def _effective_preroll_seconds(self) -> float:
+        return 0.0 if str(self.args.video_mode) == "presentation_lifted" else float(self.args.rope_preroll_seconds)
+
+    def _resolve_render_frame_count(self) -> int:
+        requested = max(0, int(self.args.num_frames))
+        if str(self.args.video_mode) == "presentation_lifted":
+            full_cycle = int(self.rigid.total_frames + int(self.args.presentation_tail_frames))
+            return max(requested, full_cycle)
+        return requested
 
     def _current_mirror_state(self, control_frame: int) -> dict[str, dict[str, np.ndarray]]:
+        if str(self.args.video_mode) == "presentation_lifted":
+            return self.rigid.mirror_body_state()
         return self.rigid.parked_mirror_state() if control_frame < self.rigid.settle_frames else self.rigid.mirror_body_state()
 
-    def _advance_one_frame(self, pending_world_wrench: dict[str, np.ndarray]) -> tuple[RigidStepMetrics, dict[str, Any], np.ndarray, float, dict[str, np.ndarray], int]:
+    def _advance_one_frame(
+        self, pending_world_wrench: dict[str, np.ndarray]
+    ) -> tuple[RigidStepMetrics, dict[str, Any], np.ndarray, float, dict[str, np.ndarray], int, dict[str, Any]]:
         control_frame = int(self.rigid.frame_idx)
         rigid_metrics = self.rigid.step(
             external_world_wrenches=(pending_world_wrench if self.args.coupling_mode == "two_way" else None)
@@ -1074,17 +1278,33 @@ class SplitDemo:
         rope_metrics = self.rope.step_frame(mirror_state)
         rope_q = rope_metrics["particle_q"]
         rope_com = rope_q.mean(axis=0)
+        pad_centers = self.rigid.pad_centers_world()
+        left_pad_center = np.asarray(pad_centers["left"], dtype=np.float32)
+        right_pad_center = np.asarray(pad_centers["right"], dtype=np.float32)
+        left_pad_min_distance = float(np.min(np.linalg.norm(rope_q - left_pad_center[None, :], axis=1)))
+        right_pad_min_distance = float(np.min(np.linalg.norm(rope_q - right_pad_center[None, :], axis=1)))
+        leading_pad_center = left_pad_center if self.leading_side == "left" else right_pad_center
+        leading_pad_min_distance = left_pad_min_distance if self.leading_side == "left" else right_pad_min_distance
+        pad_metrics = {
+            "left_pad_center_xyz": left_pad_center,
+            "right_pad_center_xyz": right_pad_center,
+            "leading_pad_center_xyz": leading_pad_center,
+            "left_pad_to_rope_min_distance_m": left_pad_min_distance,
+            "right_pad_to_rope_min_distance_m": right_pad_min_distance,
+            "leading_pad_to_rope_min_distance_m": float(leading_pad_min_distance),
+        }
         if control_frame == self.rigid.settle_frames - 1 and self.baseline_com_x is None:
             self.baseline_com_x = float(rope_com[0])
         rope_com_shift_x = 0.0 if self.baseline_com_x is None else float(rope_com[0] - self.baseline_com_x)
         next_pending_world_wrench = rope_metrics["reaction_world"]
-        return rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, next_pending_world_wrench, control_frame
+        return rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, next_pending_world_wrench, control_frame, pad_metrics
 
     def _record_metrics(
         self,
         frame_idx: int,
         rigid_metrics: RigidStepMetrics,
         rope_metrics: dict[str, Any],
+        pad_metrics: dict[str, Any],
         rope_com: np.ndarray,
         rope_com_shift_x: float,
         penetration: dict[str, np.ndarray | float],
@@ -1109,6 +1329,12 @@ class SplitDemo:
         ):
             self.first_contact_reaction_nonzero = frame_idx
 
+        if (
+            self.first_leading_pad_proximity_frame is None
+            and float(pad_metrics["leading_pad_to_rope_min_distance_m"]) <= float(self.args.presentation_proximity_threshold)
+        ):
+            self.first_leading_pad_proximity_frame = frame_idx
+
         self.timeseries.append(
             {
                 "frame": int(frame_idx),
@@ -1116,6 +1342,10 @@ class SplitDemo:
                 "target_x_m": float(rigid_metrics.target_xyz[0]),
                 "target_y_m": float(rigid_metrics.target_xyz[1]),
                 "target_z_m": float(rigid_metrics.target_xyz[2]),
+                "actual_target_x_m": float(rigid_metrics.actual_target_xyz[0]),
+                "actual_target_y_m": float(rigid_metrics.actual_target_xyz[1]),
+                "actual_target_z_m": float(rigid_metrics.actual_target_xyz[2]),
+                "target_error_m": float(rigid_metrics.target_error_m),
                 "actual_ee_x_m": float(rigid_metrics.actual_ee_xyz[0]),
                 "actual_ee_y_m": float(rigid_metrics.actual_ee_xyz[1]),
                 "actual_ee_z_m": float(rigid_metrics.actual_ee_xyz[2]),
@@ -1125,6 +1355,18 @@ class SplitDemo:
                 "rope_ground_contact_frames": int(contact_any["ground"] > 0),
                 "left_finger_rope_contacts": int(contact_any["left"]),
                 "right_finger_rope_contacts": int(contact_any["right"]),
+                "left_pad_center_x_m": float(pad_metrics["left_pad_center_xyz"][0]),
+                "left_pad_center_y_m": float(pad_metrics["left_pad_center_xyz"][1]),
+                "left_pad_center_z_m": float(pad_metrics["left_pad_center_xyz"][2]),
+                "right_pad_center_x_m": float(pad_metrics["right_pad_center_xyz"][0]),
+                "right_pad_center_y_m": float(pad_metrics["right_pad_center_xyz"][1]),
+                "right_pad_center_z_m": float(pad_metrics["right_pad_center_xyz"][2]),
+                "leading_pad_center_x_m": float(pad_metrics["leading_pad_center_xyz"][0]),
+                "leading_pad_center_y_m": float(pad_metrics["leading_pad_center_xyz"][1]),
+                "leading_pad_center_z_m": float(pad_metrics["leading_pad_center_xyz"][2]),
+                "left_pad_to_rope_min_distance_m": float(pad_metrics["left_pad_to_rope_min_distance_m"]),
+                "right_pad_to_rope_min_distance_m": float(pad_metrics["right_pad_to_rope_min_distance_m"]),
+                "leading_pad_to_rope_min_distance_m": float(pad_metrics["leading_pad_to_rope_min_distance_m"]),
                 "rope_com_x_m": float(rope_com[0]),
                 "rope_com_y_m": float(rope_com[1]),
                 "rope_com_z_m": float(rope_com[2]),
@@ -1164,10 +1406,10 @@ class SplitDemo:
             self.first_30_frames.append(frame.copy())
 
     def _run_preroll(self) -> dict[str, np.ndarray]:
-        pre_frames = max(0, int(round(float(self.args.rope_preroll_seconds) * float(self.args.video_fps))))
+        pre_frames = max(0, int(round(self._effective_preroll_seconds() * float(self.args.video_fps))))
         pending_world_wrench = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
         for _ in range(pre_frames):
-            _, rope_metrics, rope_com, _, pending_world_wrench, _ = self._advance_one_frame(pending_world_wrench)
+            _, rope_metrics, rope_com, _, pending_world_wrench, _, _ = self._advance_one_frame(pending_world_wrench)
             if not np.all(np.isfinite(rope_com)) or float(rope_com[2]) > 0.5:
                 break
         self.rigid.sim_time = 0.0
@@ -1192,7 +1434,7 @@ class SplitDemo:
                 rope_com = rope_metrics["particle_q"].mean(axis=0)
                 robot_table_contact = 0
             else:
-                rigid_metrics, rope_metrics, rope_com, _, pending_world_wrench, _ = self._advance_one_frame(pending_world_wrench)
+                rigid_metrics, rope_metrics, rope_com, _, pending_world_wrench, _, _ = self._advance_one_frame(pending_world_wrench)
                 robot_table_contact = int(rigid_metrics.robot_table_contacts > 0)
             rope_z = float(rope_com[2])
             rope_z_values.append(rope_z)
@@ -1240,10 +1482,10 @@ class SplitDemo:
 
         pending_world_wrench = self._run_preroll()
         try:
-            for frame_idx in range(int(self.args.num_frames)):
-                rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, pending_world_wrench, _ = self._advance_one_frame(pending_world_wrench)
+            for frame_idx in range(int(self.render_frame_count)):
+                rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, pending_world_wrench, _, pad_metrics = self._advance_one_frame(pending_world_wrench)
                 penetration = self.rope.support_penetration_proxy(rope_metrics["particle_q"])
-                self._record_metrics(frame_idx, rigid_metrics, rope_metrics, rope_com, rope_com_shift_x, penetration)
+                self._record_metrics(frame_idx, rigid_metrics, rope_metrics, pad_metrics, rope_com, rope_com_shift_x, penetration)
                 self._render_current_frame(ffmpeg, frame_idx)
         finally:
             ffmpeg.stdin.close()
@@ -1276,6 +1518,9 @@ class SplitDemo:
         final_ground_penetration_p99_m = float(arr[-1]["p99_ground_penetration_m"]) if arr else 0.0
         final_table_penetration_p99_m = float(arr[-1]["p99_table_penetration_m"]) if arr else 0.0
         final_support_penetration_p99_m = float(arr[-1]["p99_support_penetration_m"]) if arr else 0.0
+        min_leading_pad_to_rope_distance_m = (
+            float(min(float(row["leading_pad_to_rope_min_distance_m"]) for row in arr)) if arr else 0.0
+        )
         rope_motion_after_contact = bool(
             self.first_finger_contact_frame is not None
             and self.first_rope_motion_frame is not None
@@ -1301,14 +1546,16 @@ class SplitDemo:
             "scene_topology": str(self.args.scene_topology),
             "motion_pattern": str(self.args.motion_pattern),
             "rope_render_mode": str(self.args.rope_render_mode),
-            "record_start_mode": "post_settle",
-            "rope_preroll_seconds": float(self.args.rope_preroll_seconds),
+            "video_mode": str(self.args.video_mode),
+            "record_start_mode": self._record_start_mode(),
+            "rope_preroll_seconds": float(self._effective_preroll_seconds()),
             "finger_contact_set": str(self.args.finger_contact_set),
             "leading_side_expected": self.leading_side,
             "first_contact_side": self.first_contact_side,
             "leading_side_first_contact": bool(leading_side_is_first),
             "first_finger_rope_contact_frame": self.first_finger_contact_frame,
             "first_rope_motion_frame": self.first_rope_motion_frame,
+            "first_leading_pad_proximity_frame": self.first_leading_pad_proximity_frame,
             "rope_motion_after_contact": rope_motion_after_contact,
             "robot_table_contact_frames": robot_table_contact_frames,
             "rope_table_contact_frames": rope_table_contact_frames,
@@ -1333,6 +1580,7 @@ class SplitDemo:
             "table_edge_inset_y": float(self.args.table_edge_inset_y),
             "overhang_drop_factor": float(self.args.overhang_drop_factor),
             "min_clearance_extra": float(self.args.min_clearance_extra),
+            "presentation_table_edge_inset_y": float(self.args.presentation_table_edge_inset_y),
             "max_rope_com_z_first_30": float(max_rope_com_z_first_30),
             "max_abs_delta_rope_com_z_first_30": float(max_abs_delta_rope_com_z_first_30),
             "max_ground_penetration_m": float(max_ground_penetration_m),
@@ -1341,6 +1589,16 @@ class SplitDemo:
             "final_ground_penetration_p99_m": float(final_ground_penetration_p99_m),
             "final_table_penetration_p99_m": float(final_table_penetration_p99_m),
             "final_support_penetration_p99_m": float(final_support_penetration_p99_m),
+            "min_leading_pad_to_rope_distance_m": float(min_leading_pad_to_rope_distance_m),
+            "presentation_contact_target_x_m": (
+                None if self.rigid.presentation_contact_point is None else float(self.rigid.presentation_contact_point[0])
+            ),
+            "presentation_contact_target_y_m": (
+                None if self.rigid.presentation_contact_point is None else float(self.rigid.presentation_contact_point[1])
+            ),
+            "presentation_contact_target_z_m": (
+                None if self.rigid.presentation_contact_point is None else float(self.rigid.presentation_contact_point[2])
+            ),
             "rope_physical_radius_m": float(np.mean(self.rope.physical_radius)),
             "rope_render_radius_m": float(np.mean(self.rope.render_radius)),
             "rope_render_matches_physics": rope_render_matches_physics,
@@ -1348,6 +1606,7 @@ class SplitDemo:
             "push_speed_mps": float(self.rigid.push_speed_mps),
             "push_path_length_m": float(self.rigid.push_path_length_m),
             "table_top_z_m": float(self.rigid.table_top_z),
+            "render_frame_count": int(self.render_frame_count),
             "artifacts": {
                 "scene_npz": str(out_dir / "scene.npz"),
                 "timeseries_csv": str(out_dir / "timeseries.csv"),
@@ -1363,6 +1622,9 @@ class SplitDemo:
             out_dir / "scene.npz",
             frame=np.asarray([row["frame"] for row in arr], dtype=np.int32),
             target_xyz=np.asarray([[row["target_x_m"], row["target_y_m"], row["target_z_m"]] for row in arr], dtype=np.float32),
+            actual_target_xyz=np.asarray(
+                [[row["actual_target_x_m"], row["actual_target_y_m"], row["actual_target_z_m"]] for row in arr], dtype=np.float32
+            ),
             actual_ee_xyz=np.asarray([[row["actual_ee_x_m"], row["actual_ee_y_m"], row["actual_ee_z_m"]] for row in arr], dtype=np.float32),
             rope_com_xyz=np.asarray([[row["rope_com_x_m"], row["rope_com_y_m"], row["rope_com_z_m"]] for row in arr], dtype=np.float32),
             rope_physical_radius=self.rope.physical_radius.astype(np.float32, copy=False),
@@ -1380,13 +1642,16 @@ class SplitDemo:
                     f"- Coupling mode: `{self.args.coupling_mode}`",
                     f"- Scene topology: `{self.args.scene_topology}`",
                     f"- Motion pattern: `{self.args.motion_pattern}`",
+                    f"- Video mode: `{self.args.video_mode}`",
                     f"- Rope render mode: `{self.args.rope_render_mode}`",
                     f"- First finger contact frame: `{self.first_finger_contact_frame}`",
                     f"- First rope motion frame: `{self.first_rope_motion_frame}`",
                     f"- Rope motion after contact: `{rope_motion_after_contact}`",
+                    f"- Min leading-pad distance to rope: `{min_leading_pad_to_rope_distance_m:.6f}`",
                     f"- Rope render matches physics: `{rope_render_matches_physics}`",
-                    f"- Record start mode: `post_settle`",
-                    f"- Rope pre-roll seconds: `{float(self.args.rope_preroll_seconds):.3f}`",
+                    f"- Record start mode: `{self._record_start_mode()}`",
+                    f"- Rope pre-roll seconds: `{self._effective_preroll_seconds():.3f}`",
+                    f"- Presentation table-edge inset y (m): `{self.args.presentation_table_edge_inset_y:.3f}`",
                     "",
                     "Artifacts:",
                     "- `summary.json`",
@@ -1746,6 +2011,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-topology", choices=["table_edge_drape"], default="table_edge_drape")
     parser.add_argument("--motion-pattern", choices=["side_finger_push"], default="side_finger_push")
     parser.add_argument("--rope-render-mode", choices=["physical_only"], default="physical_only")
+    parser.add_argument("--video-mode", choices=["support_default", "presentation_lifted"], default="support_default")
     parser.add_argument("--finger-contact-set", choices=["fingers_plus_pads"], default="fingers_plus_pads")
     parser.add_argument("--video-fps", type=int, default=30)
     parser.add_argument("--num-frames", type=int, default=170)
@@ -1754,6 +2020,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration-sim-substeps-rope", type=int, default=32)
     parser.add_argument("--rope-sim-dt", type=float, default=None)
     parser.add_argument("--rope-preroll-seconds", type=float, default=2.0)
+    parser.add_argument("--presentation-lift-height", type=float, default=0.08)
+    parser.add_argument("--presentation-table-edge-inset-y", type=float, default=0.22)
+    parser.add_argument("--presentation-overhang-drop-factor", type=float, default=0.0)
+    parser.add_argument("--presentation-opening-seconds", type=float, default=0.1)
+    parser.add_argument("--presentation-approach-seconds", type=float, default=0.2)
+    parser.add_argument("--presentation-retract-seconds", type=float, default=0.6)
+    parser.add_argument("--presentation-push-distance", type=float, default=0.05)
+    parser.add_argument("--presentation-push-speed-mps", type=float, default=0.02)
+    parser.add_argument("--presentation-tail-frames", type=int, default=15)
+    parser.add_argument("--presentation-proximity-threshold", type=float, default=0.015)
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--gravity-mag", type=float, default=9.8)
