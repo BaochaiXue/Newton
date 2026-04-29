@@ -146,6 +146,13 @@ def _transform_point_np(tf_xyzw: np.ndarray, p_local: np.ndarray) -> np.ndarray:
     return pos + _quat_rotate_np(quat, p_local)
 
 
+def _inverse_transform_point_np(tf_xyzw: np.ndarray, p_world: np.ndarray) -> np.ndarray:
+    pos = np.asarray(tf_xyzw[:3], dtype=np.float32)
+    quat = np.asarray(tf_xyzw[3:7], dtype=np.float32)
+    rot = _quat_xyzw_to_rotmat(quat)
+    return rot.T @ (np.asarray(p_world, dtype=np.float32) - pos)
+
+
 def _transform_wrench_body_to_world(tf_xyzw: np.ndarray, wrench_body: np.ndarray) -> np.ndarray:
     quat = np.asarray(tf_xyzw[3:7], dtype=np.float32)
     f_world = _quat_rotate_np(quat, wrench_body[:3])
@@ -157,10 +164,67 @@ def _parse_contact_count(count_array: wp.array) -> int:
     return int(np.asarray(count_array.numpy()).reshape(-1)[0])
 
 
+def _is_presentation_mode(args: argparse.Namespace) -> bool:
+    return str(args.video_mode).startswith("presentation_")
+
+
+def _is_pick_place_mode(args: argparse.Namespace) -> bool:
+    return str(args.motion_pattern) == "grasp_lift_place"
+
+
+def _uses_rope_cradle_geometry(args: argparse.Namespace) -> bool:
+    return _is_pick_place_mode(args) and str(args.presentation_gripper_geometry) == "rope_cradle"
+
+
+def _uses_aux_panda_pad_geometry(args: argparse.Namespace) -> bool:
+    return str(args.presentation_gripper_geometry) == "panda_pads"
+
+
+def _effective_table_shape_contact_scale(args: argparse.Namespace) -> float:
+    if _is_pick_place_mode(args):
+        return float(args.presentation_table_shape_contact_scale)
+    return float(args.table_shape_contact_scale)
+
+
+def _effective_table_shape_contact_damping_multiplier(args: argparse.Namespace) -> float:
+    if _is_pick_place_mode(args):
+        return float(args.presentation_table_shape_contact_damping_multiplier)
+    return float(args.table_shape_contact_damping_multiplier)
+
+
+def _lerp_np(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
+    return (1.0 - float(alpha)) * np.asarray(a, dtype=np.float32) + float(alpha) * np.asarray(b, dtype=np.float32)
+
+
+@wp.kernel
+def _apply_grasp_assist_kernel(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_indices: wp.array(dtype=wp.int32),
+    particle_offsets: wp.array(dtype=wp.vec3),
+    target_center: wp.vec3,
+    ke: float,
+    kd: float,
+    max_force: float,
+    strength: float,
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    particle_idx = particle_indices[tid]
+    desired = target_center + particle_offsets[tid]
+    delta = desired - particle_q[particle_idx]
+    force = strength * (ke * delta - kd * particle_qd[particle_idx])
+    force_norm = wp.length(force)
+    if force_norm > max_force:
+        force = force * (max_force / (force_norm + 1.0e-8))
+    wp.atomic_add(particle_f, particle_idx, force)
+
+
 @dataclass
 class FingerShapeSpec:
     body_name: str
-    mesh: Any
+    shape_type: Any
+    mesh: Any | None
     local_xform: Any
     scale: tuple[float, float, float]
     label: str
@@ -171,11 +235,14 @@ class FingerShapeSpec:
 class RigidStepMetrics:
     frame: int
     time_s: float
+    motion_phase: str
+    motion_phase_alpha: float
     target_xyz: np.ndarray
     actual_target_xyz: np.ndarray
     target_error_m: float
     actual_ee_xyz: np.ndarray
     ee_error_m: float
+    gripper_opening_m: float
     robot_table_contacts: int
     finger_table_contacts: int
     nonfinger_table_contacts: int
@@ -230,9 +297,9 @@ def _penetration_stats(depths: np.ndarray) -> tuple[float, float]:
 
 
 def _support_soft_contact_scale(args: argparse.Namespace) -> tuple[float, float]:
-    support_scale = 0.5 * (float(args.ground_shape_contact_scale) + float(args.table_shape_contact_scale))
+    support_scale = 0.5 * (float(args.ground_shape_contact_scale) + _effective_table_shape_contact_scale(args))
     support_damping = 0.5 * (
-        float(args.ground_shape_contact_damping_multiplier) + float(args.table_shape_contact_damping_multiplier)
+        float(args.ground_shape_contact_damping_multiplier) + _effective_table_shape_contact_damping_multiplier(args)
     )
     return support_scale, support_damping
 
@@ -259,8 +326,8 @@ def _apply_split_shape_contact_scaling(model: Any, args: argparse.Namespace) -> 
                 scale = float(args.ground_shape_contact_scale)
                 damping_mult = float(args.ground_shape_contact_damping_multiplier)
             elif "rope_table" in label or "table" in label:
-                scale = float(args.table_shape_contact_scale)
-                damping_mult = float(args.table_shape_contact_damping_multiplier)
+                scale = _effective_table_shape_contact_scale(args)
+                damping_mult = _effective_table_shape_contact_damping_multiplier(args)
             elif "mirror_" in label:
                 scale = float(args.finger_shape_contact_scale)
                 damping_mult = float(args.finger_shape_contact_damping_multiplier)
@@ -271,6 +338,11 @@ def _apply_split_shape_contact_scaling(model: Any, args: argparse.Namespace) -> 
             if arr_name != "shape_material_ke":
                 vals[idx] *= np.float32(damping_mult)
         arr.assign(vals)
+    mu_vals = model.shape_material_mu.numpy().astype(np.float32, copy=False).copy()
+    for idx, label in enumerate(labels):
+        if "mirror_" in label:
+            mu_vals[idx] *= np.float32(float(args.finger_shape_friction_multiplier))
+    model.shape_material_mu.assign(mu_vals)
 
 
 class NativePandaRigidSide:
@@ -294,6 +366,11 @@ class NativePandaRigidSide:
         self.position_target_link_index = -1
         self.position_target_local_offset = np.zeros(3, dtype=np.float32)
         self.drive_target_is_pad_center = False
+        self.grasp_center_local_offset = np.zeros(3, dtype=np.float32)
+        self.pick_place_phase_frames: dict[str, int] = {}
+        self.pick_place_targets: dict[str, np.ndarray] = {}
+        self.gripper_opening_open = 0.04
+        self.gripper_opening_closed = 0.006
         self._build_scene()
         self._setup_ik()
         self._setup_motion_defaults()
@@ -340,8 +417,11 @@ class NativePandaRigidSide:
         finger_body_indices = {self.left_finger_body_idx, self.right_finger_body_idx, self.hand_body_idx}
         self.finger_shape_indices: list[int] = []
         self.nonfinger_shape_indices: list[int] = []
+        self.presentation_gripper_geometry = str(self.args.presentation_gripper_geometry)
+        self.gripper_geometry_shape_indices: list[int] = []
         self.contact_shape_specs: list[FingerShapeSpec] = []
         self.pad_center_locals: dict[str, np.ndarray] = {}
+        self.grasp_contact_locals: dict[str, np.ndarray] = {}
 
         for shape_idx, body_idx in enumerate(builder.shape_body):
             if body_idx in finger_body_indices and builder.shape_type[shape_idx] == newton.GeoType.MESH:
@@ -379,47 +459,56 @@ class NativePandaRigidSide:
         ]
         builder.joint_q[:9] = [*init_q, 0.04, 0.04]
         builder.joint_target_pos[:9] = [*init_q, 0.04, 0.04]
-        builder.joint_target_ke[:9] = [650.0] * 9
-        builder.joint_target_kd[:9] = [100.0] * 9
-        builder.joint_effort_limit[:7] = [80.0] * 7
-        builder.joint_effort_limit[7:9] = [20.0] * 2
+        builder.joint_target_ke[:7] = [float(self.args.arm_joint_target_ke)] * 7
+        builder.joint_target_kd[:7] = [float(self.args.arm_joint_target_kd)] * 7
+        builder.joint_target_ke[7:9] = [float(self.args.finger_joint_target_ke)] * 2
+        builder.joint_target_kd[7:9] = [float(self.args.finger_joint_target_kd)] * 2
+        builder.joint_effort_limit[:7] = [float(self.args.arm_joint_effort_limit)] * 7
+        builder.joint_effort_limit[7:9] = [float(self.args.finger_joint_effort_limit)] * 2
         builder.joint_armature[:7] = [0.1] * 7
         builder.joint_armature[7:9] = [0.5] * 2
 
-        pad_asset_path = newton.utils.download_asset("manipulation_objects/pad")
-        pad_stage = Usd.Stage.Open(str(pad_asset_path / "model.usda"))
-        pad_mesh = newton.usd.get_mesh(
-            pad_stage.GetPrimAtPath("/root/Model/Model"),
-            load_normals=True,
-            face_varying_normal_conversion="vertex_splitting",
-        )
-        pad_scale = np.asarray(newton.usd.get_scale(pad_stage.GetPrimAtPath("/root/Model")), dtype=np.float32)
-        if not np.allclose(pad_scale, 1.0):
-            pad_mesh = pad_mesh.copy(vertices=pad_mesh.vertices * pad_scale, recompute_inertia=True)
-        pad_mesh.build_sdf(
-            max_resolution=sdf_max_resolution,
-            narrow_band_range=sdf_narrow_band_range,
-            margin=shape_cfg.gap,
-        )
         self.pad_xform = wp.transform(
-            wp.vec3(0.0, 0.005, 0.045),
+            wp.vec3(
+                float(self.args.presentation_panda_finger_grasp_local_x),
+                float(self.args.presentation_panda_finger_grasp_local_y),
+                float(self.args.presentation_panda_finger_grasp_local_z),
+            ),
             wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -np.pi),
         )
-        left_pad_shape = builder.add_shape_mesh(
-            body=self.left_finger_body_idx,
-            mesh=pad_mesh,
-            xform=self.pad_xform,
-            cfg=shape_cfg_meshes,
-            label="left_pad",
-        )
-        right_pad_shape = builder.add_shape_mesh(
-            body=self.right_finger_body_idx,
-            mesh=pad_mesh,
-            xform=self.pad_xform,
-            cfg=shape_cfg_meshes,
-            label="right_pad",
-        )
-        self.finger_shape_indices.extend([left_pad_shape, right_pad_shape])
+        if _uses_aux_panda_pad_geometry(self.args):
+            pad_asset_path = newton.utils.download_asset("manipulation_objects/pad")
+            pad_stage = Usd.Stage.Open(str(pad_asset_path / "model.usda"))
+            pad_mesh = newton.usd.get_mesh(
+                pad_stage.GetPrimAtPath("/root/Model/Model"),
+                load_normals=True,
+                face_varying_normal_conversion="vertex_splitting",
+            )
+            pad_scale = np.asarray(newton.usd.get_scale(pad_stage.GetPrimAtPath("/root/Model")), dtype=np.float32)
+            if not np.allclose(pad_scale, 1.0):
+                pad_mesh = pad_mesh.copy(vertices=pad_mesh.vertices * pad_scale, recompute_inertia=True)
+            pad_mesh.build_sdf(
+                max_resolution=sdf_max_resolution,
+                narrow_band_range=sdf_narrow_band_range,
+                margin=shape_cfg.gap,
+            )
+            left_pad_shape = builder.add_shape_mesh(
+                body=self.left_finger_body_idx,
+                mesh=pad_mesh,
+                xform=self.pad_xform,
+                cfg=shape_cfg_meshes,
+                label="left_pad",
+            )
+            right_pad_shape = builder.add_shape_mesh(
+                body=self.right_finger_body_idx,
+                mesh=pad_mesh,
+                xform=self.pad_xform,
+                cfg=shape_cfg_meshes,
+                label="right_pad",
+            )
+            self.finger_shape_indices.extend([left_pad_shape, right_pad_shape])
+        if _uses_rope_cradle_geometry(self.args):
+            self._add_rope_cradle_geometry(builder, shape_cfg_primitives, sdf_max_resolution, sdf_narrow_band_range)
 
         table_mesh = newton.Mesh.create_box(
             float(self.table_half_extents[0]),
@@ -447,18 +536,21 @@ class NativePandaRigidSide:
 
         for body_name, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx)):
             for shape_idx in builder.body_shapes[body_idx]:
-                if builder.shape_type[shape_idx] != newton.GeoType.MESH:
+                shape_type = builder.shape_type[shape_idx]
+                label = str(builder.shape_label[shape_idx])
+                is_cradle_primitive = shape_type == newton.GeoType.BOX and "rope_cradle" in label
+                if shape_type != newton.GeoType.MESH and not is_cradle_primitive:
                     continue
                 mesh = builder.shape_source[shape_idx]
-                if mesh is None:
+                if shape_type == newton.GeoType.MESH and mesh is None:
                     continue
-                label = str(builder.shape_label[shape_idx])
                 is_pad = "pad" in label
                 local_xform = builder.shape_transform[shape_idx]
                 scale = tuple(float(v) for v in builder.shape_scale[shape_idx])
                 self.contact_shape_specs.append(
                     FingerShapeSpec(
                         body_name=body_name,
+                        shape_type=shape_type,
                         mesh=mesh,
                         local_xform=local_xform,
                         scale=scale,
@@ -468,6 +560,18 @@ class NativePandaRigidSide:
                 )
                 if is_pad:
                     self.pad_center_locals[body_name] = np.asarray(local_xform[:3], dtype=np.float32)
+        if not self.pad_center_locals:
+            native_tip_local = np.asarray(self.pad_xform[:3], dtype=np.float32)
+            self.pad_center_locals = {
+                "left": native_tip_local.copy(),
+                "right": native_tip_local.copy(),
+            }
+        if not self.grasp_contact_locals:
+            self.grasp_contact_locals = {
+                side: self.pad_center_locals[side].copy()
+                for side in ("left", "right")
+                if side in self.pad_center_locals
+            }
 
         self.model_single = copy.deepcopy(builder).finalize()
         self.model = builder.finalize()
@@ -476,6 +580,8 @@ class NativePandaRigidSide:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
         sdf_hydroelastic_config = HydroelasticSDF.Config(
+            buffer_mult_iso=int(self.args.rigid_hydro_buffer_mult_iso),
+            buffer_mult_contact=int(self.args.rigid_hydro_buffer_mult_contact),
             output_contact_surface=hasattr(self.viewer, "renderer"),
         )
         self.collision_pipeline = newton.CollisionPipeline(
@@ -491,8 +597,8 @@ class NativePandaRigidSide:
             solver="newton",
             integrator="implicitfast",
             cone="elliptic",
-            njmax=500,
-            nconmax=500,
+            njmax=int(self.args.rigid_njmax),
+            nconmax=int(self.args.rigid_nconmax),
             iterations=15,
             ls_iterations=100,
             impratio=1000.0,
@@ -500,8 +606,65 @@ class NativePandaRigidSide:
         self.control = self.model.control()
         self.viewer.set_model(self.model)
 
+    def _add_rope_cradle_geometry(
+        self,
+        builder: Any,
+        shape_cfg_meshes: Any,
+        sdf_max_resolution: int,
+        sdf_narrow_band_range: tuple[float, float],
+    ) -> None:
+        """Add visible, physical finger extensions that can support a rope segment.
+
+        The Panda finger meshes are mostly flat pads; they contact and push the
+        rope but do not create a lower support surface.  The cradle is explicit
+        gripper hardware: two small L-shaped mesh additions, mirrored into the
+        rope model as ordinary collision shapes.
+        """
+
+        lip_hx = max(1.0e-4, 0.5 * float(self.args.presentation_cradle_lip_length))
+        lip_hy = max(1.0e-4, 0.5 * float(self.args.presentation_cradle_lip_depth))
+        lip_hz = max(1.0e-4, 0.5 * float(self.args.presentation_cradle_lip_thickness))
+        wall_hx = max(1.0e-4, 0.5 * float(self.args.presentation_cradle_lip_length))
+        wall_hy = max(1.0e-4, 0.5 * float(self.args.presentation_cradle_wall_thickness))
+        wall_hz = max(1.0e-4, 0.5 * float(self.args.presentation_cradle_wall_height))
+
+        lip_local_y = -0.5 * float(self.args.presentation_cradle_lip_depth)
+        lip_local_z = float(self.args.presentation_cradle_lip_local_z)
+        wall_local_y = -float(self.args.presentation_cradle_lip_depth) - 0.5 * float(
+            self.args.presentation_cradle_wall_thickness
+        )
+        wall_local_z = lip_local_z - lip_hz + wall_hz
+        bite_local = np.array([0.0, lip_local_y, lip_local_z - lip_hz], dtype=np.float32)
+
+        cradle_color = (0.05, 0.68, 0.62)
+        for side, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx)):
+            lip_shape = builder.add_shape_box(
+                body=body_idx,
+                xform=wp.transform(wp.vec3(0.0, float(lip_local_y), float(lip_local_z)), wp.quat_identity()),
+                hx=lip_hx,
+                hy=lip_hy,
+                hz=lip_hz,
+                cfg=shape_cfg_meshes,
+                color=cradle_color,
+                label=f"{side}_rope_cradle_lip",
+            )
+            wall_shape = builder.add_shape_box(
+                body=body_idx,
+                xform=wp.transform(wp.vec3(0.0, float(wall_local_y), float(wall_local_z)), wp.quat_identity()),
+                hx=wall_hx,
+                hy=wall_hy,
+                hz=wall_hz,
+                cfg=shape_cfg_meshes,
+                color=cradle_color,
+                label=f"{side}_rope_cradle_wall",
+            )
+            self.finger_shape_indices.extend([lip_shape, wall_shape])
+            self.gripper_geometry_shape_indices.extend([lip_shape, wall_shape])
+            self.grasp_contact_locals[side] = bite_local.copy()
+        self.presentation_gripper_geometry = "rope_cradle"
+
     def _setup_motion_defaults(self) -> None:
-        if str(self.args.video_mode) == "presentation_lifted":
+        if _is_presentation_mode(self.args):
             self.settle_frames = int(round(float(self.args.presentation_opening_seconds) / self.frame_dt))
             self.approach_frames = int(round(float(self.args.presentation_approach_seconds) / self.frame_dt))
             self.retract_frames = int(round(float(self.args.presentation_retract_seconds) / self.frame_dt))
@@ -528,6 +691,35 @@ class NativePandaRigidSide:
         self.pad_far_xyz = np.array([self.prepush_x - 0.12, self.target_y - 0.03, self.prepush_z + 0.08], dtype=np.float32)
         self.pad_push_start_xyz = np.array([self.prepush_x, self.target_y, self.prepush_z], dtype=np.float32)
         self.pad_push_end_xyz = np.array([self.push_end_x, self.target_y, self.prepush_z], dtype=np.float32)
+        self.gripper_opening_open = float(self.args.presentation_grasp_opening)
+        self.gripper_opening_closed = float(self.args.presentation_grasp_closed_opening)
+        if _is_pick_place_mode(self.args):
+            self._setup_pick_place_timing()
+
+    def _setup_pick_place_timing(self) -> None:
+        self.pick_place_phase_frames = {
+            "opening": max(1, int(round(float(self.args.presentation_opening_seconds) / self.frame_dt))),
+            "approach": max(1, int(round(float(self.args.presentation_approach_seconds) / self.frame_dt))),
+            "lower": max(1, int(round(float(self.args.presentation_grasp_lower_seconds) / self.frame_dt))),
+            "close": max(1, int(round(float(self.args.presentation_grasp_close_seconds) / self.frame_dt))),
+            "lift": max(1, int(round(float(self.args.presentation_lift_seconds) / self.frame_dt))),
+            "transfer": max(1, int(round(float(self.args.presentation_transfer_seconds) / self.frame_dt))),
+            "place_lower": max(1, int(round(float(self.args.presentation_place_lower_seconds) / self.frame_dt))),
+            "release": max(1, int(round(float(self.args.presentation_release_seconds) / self.frame_dt))),
+            "retract": max(1, int(round(float(self.args.presentation_retract_seconds) / self.frame_dt))),
+        }
+        self.settle_frames = self.pick_place_phase_frames["opening"]
+        self.approach_frames = self.pick_place_phase_frames["approach"]
+        self.retract_frames = self.pick_place_phase_frames["retract"]
+        self.push_frames = (
+            self.pick_place_phase_frames["lower"]
+            + self.pick_place_phase_frames["close"]
+            + self.pick_place_phase_frames["lift"]
+            + self.pick_place_phase_frames["transfer"]
+            + self.pick_place_phase_frames["place_lower"]
+            + self.pick_place_phase_frames["release"]
+        )
+        self.total_frames = int(sum(self.pick_place_phase_frames.values()))
 
     def configure_for_rope(self, rope_radius_m: float, rope_line_center_x: float, rope_line_y: float) -> None:
         self.target_y = float(rope_line_y)
@@ -547,6 +739,10 @@ class NativePandaRigidSide:
             return
         overall_center = np.asarray(points.mean(axis=0), dtype=np.float32)
         self.presentation_scene_center = overall_center.copy()
+        if _is_pick_place_mode(self.args):
+            self._configure_pick_place_for_rope(points, rope_radius_m)
+            return
+
         table_hover_z = float(self.table_top_z + max(float(rope_radius_m) * 2.5, 0.012))
         contact_point = np.array(
             [
@@ -603,6 +799,128 @@ class NativePandaRigidSide:
         self._snap_to_target_position(self.pad_far_xyz)
         self._set_camera()
 
+    def _configure_grasp_center_target(self) -> None:
+        body_q_np = self.state_single.body_q.numpy()
+        left_local = self.grasp_contact_locals.get("left", self.pad_center_locals["left"])
+        right_local = self.grasp_contact_locals.get("right", self.pad_center_locals["right"])
+        left_center = _transform_point_np(body_q_np[self.left_finger_body_idx], left_local)
+        right_center = _transform_point_np(body_q_np[self.right_finger_body_idx], right_local)
+        center_world = 0.5 * (left_center + right_center)
+        self.grasp_center_local_offset = _inverse_transform_point_np(body_q_np[self.ee_index], center_world).astype(
+            np.float32,
+            copy=False,
+        )
+        self._configure_position_target_ik(self.ee_index, self.grasp_center_local_offset)
+
+    def _configure_pick_place_for_rope(self, points: np.ndarray, rope_radius_m: float) -> None:
+        table_min = self.table_pos - self.table_half_extents
+        table_max = self.table_pos + self.table_half_extents
+        table_edge_y = float(table_min[1])
+        table_mask = (
+            (points[:, 0] >= table_min[0] - 0.01)
+            & (points[:, 0] <= table_max[0] + 0.01)
+            & (points[:, 1] >= table_min[1] - 0.01)
+            & (points[:, 1] <= table_max[1] + 0.01)
+        )
+        edge_band = np.abs(points[:, 1] - table_edge_y) <= max(0.025, float(rope_radius_m) * 4.0)
+        grasp_cloud = points[edge_band] if np.any(edge_band) else (points[table_mask] if np.any(table_mask) else points)
+        grasp_x = float(np.median(grasp_cloud[:, 0]) + float(self.args.presentation_grasp_x_offset))
+        # A real gripper cannot close around a rope segment that is fully backed by
+        # the table. The presentation grasp targets the table-edge segment so the
+        # lower jaw has free space outside the support.
+        grasp_y = float(
+            table_edge_y
+            - float(self.args.presentation_edge_grasp_outset_y)
+            + float(self.args.presentation_grasp_y_offset)
+        )
+        grasp_z_clearance = (
+            float(self.args.presentation_cradle_grasp_z_clearance)
+            if _uses_rope_cradle_geometry(self.args)
+            else float(self.args.presentation_grasp_z_clearance)
+        )
+        grasp_z = float(
+            self.table_top_z
+            + float(rope_radius_m)
+            + grasp_z_clearance
+            + float(self.args.presentation_grasp_z_offset)
+        )
+        grasp_center = np.array([grasp_x, grasp_y, grasp_z], dtype=np.float32)
+
+        carry_z = float(self.table_top_z + float(self.args.presentation_carry_height))
+        ground_place_y = float(table_edge_y - abs(float(self.args.presentation_place_y_offset)))
+        place_center = np.array(
+            [
+                float(grasp_center[0] + float(self.args.presentation_place_x_offset)),
+                ground_place_y,
+                float(float(rope_radius_m) + float(self.args.presentation_place_ground_clearance)),
+            ],
+            dtype=np.float32,
+        )
+
+        pregrasp = grasp_center + np.array(
+            [
+                0.0,
+                -abs(float(self.args.presentation_pregrasp_y_standoff)),
+                float(self.args.presentation_pregrasp_z_offset),
+            ],
+            dtype=np.float32,
+        )
+        approach_offset = np.array(
+            [
+                -abs(float(self.args.presentation_approach_x_offset)),
+                -abs(float(self.args.presentation_approach_y_offset)),
+                float(self.args.presentation_approach_z_offset),
+            ],
+            dtype=np.float32,
+        )
+        above_grasp = pregrasp
+        far = pregrasp + approach_offset
+        lifted = np.array([grasp_center[0], grasp_center[1], carry_z], dtype=np.float32)
+        carry = np.array([place_center[0], place_center[1], carry_z], dtype=np.float32)
+        # After release, retreat from the placement pose.  First clear vertically
+        # before moving back across the table edge; a single low diagonal retract
+        # can make the open cradle sweep the table and re-hook the rope.
+        retract_clear = place_center + np.array(
+            [
+                0.0,
+                0.0,
+                float(self.args.presentation_retract_z_offset),
+            ],
+            dtype=np.float32,
+        )
+        retract = place_center + np.array(
+            [
+                -abs(float(self.args.presentation_retract_x_offset)),
+                float(self.args.presentation_retract_y_offset),
+                float(self.args.presentation_retract_z_offset),
+            ],
+            dtype=np.float32,
+        )
+
+        self.pick_place_targets = {
+            "far": far,
+            "above_grasp": above_grasp,
+            "grasp": grasp_center,
+            "lifted": lifted,
+            "carry": carry,
+            "place": place_center,
+            "retract_clear": retract_clear,
+            "retract": retract,
+        }
+        self.presentation_contact_point = grasp_center.copy()
+        self.presentation_scene_center = 0.5 * (grasp_center + place_center)
+        self.pad_far_xyz = far.copy()
+        self.pad_push_start_xyz = grasp_center.copy()
+        self.pad_push_end_xyz = place_center.copy()
+        self.prepush_z = float(grasp_center[2])
+        self.retract_z = float(retract[2])
+        self.push_path_length_m = float(np.linalg.norm(place_center - grasp_center))
+        self.push_speed_mps = float(self.args.presentation_push_speed_mps)
+        self._setup_pick_place_timing()
+        self._configure_grasp_center_target()
+        self._snap_to_target_position(far)
+        self._set_camera()
+
     def _solve_single_fk(
         self, ee_target_xyz: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
@@ -610,6 +928,8 @@ class NativePandaRigidSide:
         self.rot_obj.set_target_rotations(wp.array([quat_to_vec4(self.target_rotation)], dtype=wp.vec4))
         self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
         q_np = self.joint_q_ik.numpy().astype(np.float32, copy=False).reshape(-1)
+        if q_np.shape[0] >= 9:
+            q_np[7:9] = float(self.current_gripper_opening())
         state_tmp = self.model_single.state()
         q_wp = wp.array(q_np, dtype=wp.float32, device=self.model_single.device)
         qd_wp = wp.zeros(self.model_single.joint_dof_count, dtype=wp.float32, device=self.model_single.device)
@@ -630,7 +950,7 @@ class NativePandaRigidSide:
         projections = {side: float(np.dot(center, self.push_direction)) for side, center in side_centers.items()}
         self.leading_side_name = max(projections, key=projections.get)
         self.leading_pad_offset_world = ee_xyz - side_centers[self.leading_side_name]
-        if str(self.args.video_mode) == "presentation_lifted":
+        if _is_presentation_mode(self.args) and not _is_pick_place_mode(self.args):
             leading_body_idx = self.right_finger_body_idx if self.leading_side_name == "right" else self.left_finger_body_idx
             self._configure_position_target_ik(leading_body_idx, self.pad_center_locals[self.leading_side_name])
         else:
@@ -649,6 +969,8 @@ class NativePandaRigidSide:
     def _snap_to_target_position(self, ee_target_xyz: np.ndarray) -> None:
         q_np, _, _, _ = self._solve_single_fk(np.asarray(ee_target_xyz, dtype=np.float32))
         q_np = np.asarray(q_np, dtype=np.float32).reshape(-1)
+        if q_np.shape[0] >= 9:
+            q_np[7:9] = float(self.current_gripper_opening())
         q_single = q_np.reshape(1, -1)
         q_full = self.model.joint_q.numpy().astype(np.float32, copy=False)
         qd_full = self.model.joint_qd.numpy().astype(np.float32, copy=False)
@@ -673,7 +995,7 @@ class NativePandaRigidSide:
         self.rot_obj.set_target_rotations(wp.array([quat_to_vec4(self.target_rotation)], dtype=wp.vec4))
         self.control.joint_target_pos.zero_()
         wp.copy(self.control.joint_target_pos, wp.array(q_np, dtype=wp.float32, device=self.model.device))
-        self.control.joint_target_pos[7:9].fill_(self.gripper_opening)
+        self.control.joint_target_pos[7:9].fill_(float(self.current_gripper_opening()))
         self.sim_time = 0.0
         self.frame_idx = 0
 
@@ -717,7 +1039,7 @@ class NativePandaRigidSide:
         )
 
     def _set_camera(self) -> None:
-        if str(self.args.video_mode) == "presentation_lifted" and self.presentation_contact_point is not None:
+        if _is_presentation_mode(self.args) and self.presentation_contact_point is not None:
             focus = (
                 np.asarray(self.presentation_scene_center, dtype=np.float32)
                 if self.presentation_scene_center is not None
@@ -731,9 +1053,85 @@ class NativePandaRigidSide:
         else:
             self.viewer.set_camera(wp.vec3(0.36, -0.03, 0.33), -14.0, -120.0)
         if hasattr(self.viewer, "camera") and hasattr(self.viewer.camera, "fov"):
-            self.viewer.camera.fov = 82.0 if str(self.args.video_mode) == "presentation_lifted" else 68.0
+            self.viewer.camera.fov = 82.0 if _is_presentation_mode(self.args) else 68.0
+
+    def _pick_place_phase(self) -> tuple[str, float]:
+        if not self.pick_place_phase_frames:
+            return "opening", 0.0
+        cursor = 0
+        for name, count in self.pick_place_phase_frames.items():
+            end = cursor + int(count)
+            if self.frame_idx < end:
+                alpha = (self.frame_idx - cursor) / max(int(count) - 1, 1)
+                return name, float(np.clip(alpha, 0.0, 1.0))
+            cursor = end
+        return "tail", 1.0
+
+    def current_motion_phase(self) -> tuple[str, float]:
+        if _is_pick_place_mode(self.args):
+            return self._pick_place_phase()
+        if self.frame_idx < self.settle_frames:
+            return "opening", 0.0
+        if self.frame_idx < self.settle_frames + self.approach_frames:
+            alpha = (self.frame_idx - self.settle_frames) / max(self.approach_frames - 1, 1)
+            return "approach", float(np.clip(alpha, 0.0, 1.0))
+        if self.frame_idx < self.settle_frames + self.approach_frames + self.push_frames:
+            alpha = (self.frame_idx - self.settle_frames - self.approach_frames) / max(self.push_frames - 1, 1)
+            return "push", float(np.clip(alpha, 0.0, 1.0))
+        alpha = (self.frame_idx - self.settle_frames - self.approach_frames - self.push_frames) / max(
+            self.retract_frames - 1,
+            1,
+        )
+        return "retract", float(np.clip(alpha, 0.0, 1.0))
+
+    def _current_pick_place_target(self) -> np.ndarray:
+        if not self.pick_place_targets:
+            return self.pad_far_xyz.copy()
+        phase, alpha = self._pick_place_phase()
+        targets = self.pick_place_targets
+        if phase == "opening":
+            return targets["far"].copy()
+        if phase == "approach":
+            return _lerp_np(targets["far"], targets["above_grasp"], alpha)
+        if phase == "lower":
+            return _lerp_np(targets["above_grasp"], targets["grasp"], alpha)
+        if phase == "close":
+            return targets["grasp"].copy()
+        if phase == "lift":
+            return _lerp_np(targets["grasp"], targets["lifted"], alpha)
+        if phase == "transfer":
+            return _lerp_np(targets["lifted"], targets["carry"], alpha)
+        if phase == "place_lower":
+            return _lerp_np(targets["carry"], targets["place"], alpha)
+        if phase == "release":
+            return targets["place"].copy()
+        if phase == "retract":
+            if "retract_clear" in targets and float(targets["retract_clear"][2]) > float(targets["place"][2]):
+                if alpha < 0.5:
+                    return _lerp_np(targets["place"], targets["retract_clear"], alpha * 2.0)
+                return _lerp_np(targets["retract_clear"], targets["retract"], (alpha - 0.5) * 2.0)
+            return _lerp_np(targets["place"], targets["retract"], alpha)
+        return targets["retract"].copy()
+
+    def current_gripper_opening(self) -> float:
+        if not _is_pick_place_mode(self.args):
+            return float(self.gripper_opening)
+        phase, alpha = self._pick_place_phase()
+        open_q = float(self.gripper_opening_open)
+        closed_q = float(self.gripper_opening_closed)
+        if phase in {"opening", "approach", "lower", "retract", "tail"}:
+            return open_q
+        if phase == "close":
+            return float((1.0 - alpha) * open_q + alpha * closed_q)
+        if phase in {"lift", "transfer", "place_lower"}:
+            return closed_q
+        if phase == "release":
+            return float((1.0 - alpha) * closed_q + alpha * open_q)
+        return open_q
 
     def current_target_position(self) -> np.ndarray:
+        if _is_pick_place_mode(self.args):
+            return self._current_pick_place_target()
         if self.frame_idx < self.settle_frames:
             pad_xyz = self.pad_far_xyz
         elif self.frame_idx < self.settle_frames + self.approach_frames:
@@ -778,13 +1176,15 @@ class NativePandaRigidSide:
         return robot_total, finger, nonfinger
 
     def step(self, external_world_wrenches: dict[str, np.ndarray] | None = None) -> RigidStepMetrics:
+        motion_phase, motion_phase_alpha = self.current_motion_phase()
         target_position = self.current_target_position()
+        gripper_opening = float(self.current_gripper_opening())
         self.pos_obj.set_target_positions(wp.array([target_position], dtype=wp.vec3))
         self.rot_obj.set_target_rotations(wp.array([quat_to_vec4(self.target_rotation)], dtype=wp.vec4))
         self.ik_solver.step(self.joint_q_ik, self.joint_q_ik, iterations=self.ik_iters)
         self.control.joint_target_pos.zero_()
         wp.copy(self.control.joint_target_pos, self.joint_q_ik.flatten())
-        self.control.joint_target_pos[7:9].fill_(self.gripper_opening)
+        self.control.joint_target_pos[7:9].fill_(gripper_opening)
 
         external = external_world_wrenches or {}
         for _ in range(self.sim_substeps):
@@ -812,11 +1212,14 @@ class NativePandaRigidSide:
         metrics = RigidStepMetrics(
             frame=int(self.frame_idx),
             time_s=float(self.sim_time),
+            motion_phase=motion_phase,
+            motion_phase_alpha=float(motion_phase_alpha),
             target_xyz=target_position,
             actual_target_xyz=actual_target,
             target_error_m=target_error,
             actual_ee_xyz=actual_ee,
             ee_error_m=ee_error,
+            gripper_opening_m=gripper_opening,
             robot_table_contacts=robot_total,
             finger_table_contacts=finger_count,
             nonfinger_table_contacts=nonfinger_count,
@@ -829,6 +1232,13 @@ class NativePandaRigidSide:
         body_q = self.state_0.body_q.numpy().astype(np.float32, copy=False)
         return {
             side: _transform_point_np(body_q[body_idx], self.pad_center_locals[side])
+            for side, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx))
+        }
+
+    def grasp_contact_points_world(self) -> dict[str, np.ndarray]:
+        body_q = self.state_0.body_q.numpy().astype(np.float32, copy=False)
+        return {
+            side: _transform_point_np(body_q[body_idx], self.grasp_contact_locals.get(side, self.pad_center_locals[side]))
             for side, body_idx in (("left", self.left_finger_body_idx), ("right", self.right_finger_body_idx))
         }
 
@@ -874,6 +1284,11 @@ class SemiImplicitRopeSide:
         self._setup_render_metadata()
         self.frame_idx = 0
         self.last_world_wrench = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
+        self.grasp_assist_indices: np.ndarray | None = None
+        self.grasp_assist_offsets: np.ndarray | None = None
+        self.grasp_assist_indices_wp: wp.array | None = None
+        self.grasp_assist_offsets_wp: wp.array | None = None
+        self.grasp_metric_indices: np.ndarray | None = None
 
     def _build_rope_ir(self) -> None:
         raw_ir = load_ir(Path(self.args.ir))
@@ -900,21 +1315,21 @@ class SemiImplicitRopeSide:
                             + float(self.args.min_clearance_extra)
                         ),
                     )
-                    if str(self.args.video_mode) == "presentation_lifted"
+                    if _is_presentation_mode(self.args)
                     else float(self.rigid.prepush_x + 0.05)
                 ),
                 self.rigid.table_pos[1]
                 - self.rigid.table_half_extents[1]
                 + (
                     float(self.args.presentation_table_edge_inset_y)
-                    if str(self.args.video_mode) == "presentation_lifted"
+                    if _is_presentation_mode(self.args)
                     else float(self.args.table_edge_inset_y)
                 ),
                 center_z_for_table_clearance,
             ],
             dtype=np.float32,
         )
-        if str(self.args.video_mode) == "presentation_lifted":
+        if str(self.args.video_mode) == "presentation_lifted" and not _is_pick_place_mode(self.args):
             target_center[2] += float(self.args.presentation_lift_height)
         shift = target_center - center
         shifted = (x0 + shift).astype(np.float32, copy=False)
@@ -924,7 +1339,7 @@ class SemiImplicitRopeSide:
             hang = (table_edge_y - shifted[overhang_mask, 1]).astype(np.float32, copy=False)
             drop_factor = (
                 float(self.args.presentation_overhang_drop_factor)
-                if str(self.args.video_mode) == "presentation_lifted"
+                if _is_presentation_mode(self.args)
                 else float(self.args.overhang_drop_factor)
             )
             shifted[overhang_mask, 2] -= drop_factor * hang
@@ -1023,15 +1438,30 @@ class SemiImplicitRopeSide:
 
         for spec in self.rigid.contact_shape_specs:
             body_id = self.mirror_body_ids[spec.body_name]
-            mesh_copy = spec.mesh.copy()
-            shape_idx = builder.add_shape_mesh(
-                body=body_id,
-                mesh=mesh_copy,
-                xform=spec.local_xform,
-                scale=spec.scale,
-                cfg=shape_cfg,
-                label=f"mirror_{spec.body_name}_{spec.label}",
-            )
+            if spec.shape_type == newton.GeoType.MESH:
+                if spec.mesh is None:
+                    continue
+                mesh_copy = spec.mesh.copy()
+                shape_idx = builder.add_shape_mesh(
+                    body=body_id,
+                    mesh=mesh_copy,
+                    xform=spec.local_xform,
+                    scale=spec.scale,
+                    cfg=shape_cfg,
+                    label=f"mirror_{spec.body_name}_{spec.label}",
+                )
+            elif spec.shape_type == newton.GeoType.BOX:
+                shape_idx = builder.add_shape_box(
+                    body=body_id,
+                    xform=spec.local_xform,
+                    hx=float(spec.scale[0]),
+                    hy=float(spec.scale[1]),
+                    hz=float(spec.scale[2]),
+                    cfg=shape_cfg,
+                    label=f"mirror_{spec.body_name}_{spec.label}",
+                )
+            else:
+                continue
             self.side_shape_indices[spec.body_name].append(shape_idx)
             if spec.is_pad:
                 self.pad_shape_indices[spec.body_name].append(shape_idx)
@@ -1047,7 +1477,32 @@ class SemiImplicitRopeSide:
         self.state_in = self.model.state()
         self.state_out = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        requested_rigid_contact_max = max(0, int(self.args.rope_rigid_contact_max))
+        requested_soft_contact_max = max(0, int(self.args.rope_soft_contact_max))
+        default_soft_contact_max = int(self.model.shape_count) * int(self.model.particle_count)
+        if requested_rigid_contact_max > 0 or requested_soft_contact_max > 0:
+            pipeline_kwargs: dict[str, int] = {}
+            if requested_rigid_contact_max > 0:
+                pipeline_kwargs["rigid_contact_max"] = requested_rigid_contact_max
+            if requested_soft_contact_max > 0:
+                pipeline_kwargs["soft_contact_max"] = max(requested_soft_contact_max, default_soft_contact_max)
+            self.collision_pipeline = newton.CollisionPipeline(
+                self.model,
+                **pipeline_kwargs,
+            )
+            self.rope_rigid_contact_max_effective = int(self.collision_pipeline.rigid_contact_max)
+            self.rope_soft_contact_max_effective = int(self.collision_pipeline.soft_contact_max)
+            self.contacts = self.collision_pipeline.contacts()
+        else:
+            self.collision_pipeline = None
+            self.contacts = self.model.contacts()
+            default_pipeline = getattr(self.model, "_collision_pipeline", None)
+            self.rope_rigid_contact_max_effective = int(
+                getattr(default_pipeline, "rigid_contact_max", getattr(self.model, "rigid_contact_max", 0)) or 0
+            )
+            self.rope_soft_contact_max_effective = int(
+                getattr(default_pipeline, "soft_contact_max", default_soft_contact_max)
+            )
         self.solver = newton.solvers.SolverSemiImplicit(
             self.model,
             angular_damping=float(self.args.angular_damping),
@@ -1089,6 +1544,55 @@ class SemiImplicitRopeSide:
         stride = max(1, int(self.args.rope_spring_stride))
         self.render_edges = self.rope_spring_edges[::stride].astype(np.int32, copy=False)
 
+    def configure_grasp_region(self, grasp_center: np.ndarray | None) -> None:
+        if grasp_center is None:
+            return
+        points = np.asarray(self.rope_ir["x0"], dtype=np.float32)[: self.n_obj]
+        center = np.asarray(grasp_center, dtype=np.float32).reshape(3)
+        count = max(1, min(int(self.args.presentation_grasp_particle_count), int(points.shape[0])))
+        # Prefer a compact edge segment: rank mostly by xy distance so the selected
+        # particles are near the visible gripper window even if gravity has already
+        # started to sag the rope.
+        xy_dist = np.linalg.norm(points[:, :2] - center[None, :2], axis=1)
+        z_dist = np.abs(points[:, 2] - center[2])
+        score = xy_dist + 0.25 * z_dist
+        indices = np.argsort(score)[:count].astype(np.int32, copy=False)
+        self.grasp_metric_indices = indices
+        if not bool(self.args.presentation_grasp_assist):
+            return
+        offsets = (points[indices] - center[None, :]).astype(np.float32, copy=False)
+        self.grasp_assist_indices = indices
+        self.grasp_assist_offsets = offsets
+        self.grasp_assist_indices_wp = wp.array(indices, dtype=wp.int32, device=self.model.device)
+        self.grasp_assist_offsets_wp = wp.array(offsets, dtype=wp.vec3, device=self.model.device)
+
+    def _apply_grasp_assist(self, target_center: np.ndarray, strength: float) -> None:
+        if (
+            self.grasp_assist_indices_wp is None
+            or self.grasp_assist_offsets_wp is None
+            or self.state_in.particle_f is None
+            or float(strength) <= 0.0
+        ):
+            return
+        target = np.asarray(target_center, dtype=np.float32).reshape(3)
+        wp.launch(
+            _apply_grasp_assist_kernel,
+            dim=int(self.grasp_assist_indices_wp.shape[0]),
+            inputs=[
+                self.state_in.particle_q,
+                self.state_in.particle_qd,
+                self.grasp_assist_indices_wp,
+                self.grasp_assist_offsets_wp,
+                wp.vec3(float(target[0]), float(target[1]), float(target[2])),
+                float(self.args.presentation_grasp_assist_ke),
+                float(self.args.presentation_grasp_assist_kd),
+                float(self.args.presentation_grasp_assist_max_force),
+                float(strength),
+            ],
+            outputs=[self.state_in.particle_f],
+            device=self.model.device,
+        )
+
     def _sync_mirror_body(self, side: str, pose: dict[str, np.ndarray]) -> None:
         body_q = self.state_in.body_q.numpy()
         body_qd = self.state_in.body_qd.numpy()
@@ -1117,7 +1621,13 @@ class SemiImplicitRopeSide:
         for side in ("left", "right"):
             self._sync_mirror_body(side, mirror_state[side])
 
-    def step_frame(self, mirror_state: dict[str, dict[str, np.ndarray]]) -> dict[str, Any]:
+    def step_frame(
+        self,
+        mirror_state: dict[str, dict[str, np.ndarray]],
+        *,
+        grasp_assist_target: np.ndarray | None = None,
+        grasp_assist_strength: float = 0.0,
+    ) -> dict[str, Any]:
         self.sync_mirrors(mirror_state)
         contact_any = {"left": 0, "right": 0, "ground": 0, "table": 0}
         reaction_world = {"left": np.zeros(6, dtype=np.float32), "right": np.zeros(6, dtype=np.float32)}
@@ -1129,7 +1639,12 @@ class SemiImplicitRopeSide:
         )
         for _ in range(int(self.args.sim_substeps_rope)):
             self.state_in.clear_forces()
-            self.model.collide(self.state_in, self.contacts)
+            if grasp_assist_target is not None and float(grasp_assist_strength) > 0.0:
+                self._apply_grasp_assist(grasp_assist_target, float(grasp_assist_strength))
+            if self.collision_pipeline is None:
+                self.model.collide(self.state_in, self.contacts)
+            else:
+                self.collision_pipeline.collide(self.state_in, self.contacts)
             self.solver.step(self.state_in, self.state_out, self.control, self.contacts, sim_dt)
 
             soft_count = _parse_contact_count(self.contacts.soft_contact_count)
@@ -1225,13 +1740,22 @@ class SplitDemo:
             rope_line_center_x=float(self.rope.rope_center_target_x),
             rope_line_y=float(self.rope.rope_line_target_y),
         )
-        if str(self.args.video_mode) == "presentation_lifted":
+        if _is_presentation_mode(self.args):
             self.rigid.configure_presentation_for_rope(
                 rope_points=np.asarray(self.rope.rope_ir["x0"], dtype=np.float32),
                 rope_radius_m=float(np.mean(self.rope.physical_radius)),
             )
+            if _is_pick_place_mode(self.args):
+                self.rope.configure_grasp_region(self.rigid.presentation_contact_point)
         try:
-            apply_viewer_shape_colors(self.viewer, self.rigid.model)
+            apply_viewer_shape_colors(
+                self.viewer,
+                self.rigid.model,
+                extra_rules=[
+                    (lambda name: "rope_cradle" in name, (0.05, 0.68, 0.62)),
+                    (lambda name: "split_probe_table" in name, (0.58, 0.46, 0.34)),
+                ],
+            )
         except Exception:
             pass
 
@@ -1243,6 +1767,8 @@ class SplitDemo:
         self.first_contact_side: str | None = None
         self.first_contact_reaction_nonzero: int | None = None
         self.first_leading_pad_proximity_frame: int | None = None
+        self.first_grasp_assist_frame: int | None = None
+        self.grasp_assist_frames = 0
         self.baseline_com_x = None
         self.preview_frames: list[np.ndarray] = []
         self.first_30_frames: list[np.ndarray] = []
@@ -1250,22 +1776,35 @@ class SplitDemo:
         self.preview_indices = sorted(set(np.linspace(0, max(self.render_frame_count - 1, 0), 6, dtype=int).tolist()))
 
     def _record_start_mode(self) -> str:
-        return "visible_opening" if str(self.args.video_mode) == "presentation_lifted" else "post_settle"
+        return "visible_opening" if _is_presentation_mode(self.args) else "post_settle"
 
     def _effective_preroll_seconds(self) -> float:
-        return 0.0 if str(self.args.video_mode) == "presentation_lifted" else float(self.args.rope_preroll_seconds)
+        return 0.0 if _is_presentation_mode(self.args) else float(self.args.rope_preroll_seconds)
 
     def _resolve_render_frame_count(self) -> int:
         requested = max(0, int(self.args.num_frames))
-        if str(self.args.video_mode) == "presentation_lifted":
+        if _is_presentation_mode(self.args):
             full_cycle = int(self.rigid.total_frames + int(self.args.presentation_tail_frames))
             return max(requested, full_cycle)
         return requested
 
     def _current_mirror_state(self, control_frame: int) -> dict[str, dict[str, np.ndarray]]:
-        if str(self.args.video_mode) == "presentation_lifted":
+        if _is_presentation_mode(self.args):
             return self.rigid.mirror_body_state()
         return self.rigid.parked_mirror_state() if control_frame < self.rigid.settle_frames else self.rigid.mirror_body_state()
+
+    def _grasp_assist_strength(self, rigid_metrics: RigidStepMetrics) -> float:
+        if not (_is_pick_place_mode(self.args) and bool(self.args.presentation_grasp_assist)):
+            return 0.0
+        phase = str(rigid_metrics.motion_phase)
+        alpha = float(rigid_metrics.motion_phase_alpha)
+        if phase == "close":
+            return float(np.clip((alpha - 0.25) / 0.75, 0.0, 1.0))
+        if phase in {"lift", "transfer", "place_lower"}:
+            return 1.0
+        if phase == "release":
+            return float(1.0 - np.clip(alpha, 0.0, 1.0))
+        return 0.0
 
     def _advance_one_frame(
         self, pending_world_wrench: dict[str, np.ndarray]
@@ -1275,9 +1814,22 @@ class SplitDemo:
             external_world_wrenches=(pending_world_wrench if self.args.coupling_mode == "two_way" else None)
         )
         mirror_state = self._current_mirror_state(control_frame)
-        rope_metrics = self.rope.step_frame(mirror_state)
+        grasp_strength = self._grasp_assist_strength(rigid_metrics)
+        rope_metrics = self.rope.step_frame(
+            mirror_state,
+            grasp_assist_target=rigid_metrics.actual_target_xyz,
+            grasp_assist_strength=grasp_strength,
+        )
         rope_q = rope_metrics["particle_q"]
         rope_com = rope_q.mean(axis=0)
+        rope_max_z = float(np.max(rope_q[:, 2])) if rope_q.size else 0.0
+        if self.rope.grasp_metric_indices is not None and self.rope.grasp_metric_indices.size > 0:
+            grasp_q = rope_q[self.rope.grasp_metric_indices]
+            grasp_particle_com = grasp_q.mean(axis=0)
+            grasp_particle_max_z = float(np.max(grasp_q[:, 2]))
+        else:
+            grasp_particle_com = np.asarray([np.nan, np.nan, np.nan], dtype=np.float32)
+            grasp_particle_max_z = 0.0
         pad_centers = self.rigid.pad_centers_world()
         left_pad_center = np.asarray(pad_centers["left"], dtype=np.float32)
         right_pad_center = np.asarray(pad_centers["right"], dtype=np.float32)
@@ -1285,6 +1837,15 @@ class SplitDemo:
         right_pad_min_distance = float(np.min(np.linalg.norm(rope_q - right_pad_center[None, :], axis=1)))
         leading_pad_center = left_pad_center if self.leading_side == "left" else right_pad_center
         leading_pad_min_distance = left_pad_min_distance if self.leading_side == "left" else right_pad_min_distance
+        contact_points = self.rigid.grasp_contact_points_world()
+        left_contactor = np.asarray(contact_points["left"], dtype=np.float32)
+        right_contactor = np.asarray(contact_points["right"], dtype=np.float32)
+        left_contactor_min_distance = float(np.min(np.linalg.norm(rope_q - left_contactor[None, :], axis=1)))
+        right_contactor_min_distance = float(np.min(np.linalg.norm(rope_q - right_contactor[None, :], axis=1)))
+        leading_contactor = left_contactor if self.leading_side == "left" else right_contactor
+        leading_contactor_min_distance = (
+            left_contactor_min_distance if self.leading_side == "left" else right_contactor_min_distance
+        )
         pad_metrics = {
             "left_pad_center_xyz": left_pad_center,
             "right_pad_center_xyz": right_pad_center,
@@ -1292,6 +1853,16 @@ class SplitDemo:
             "left_pad_to_rope_min_distance_m": left_pad_min_distance,
             "right_pad_to_rope_min_distance_m": right_pad_min_distance,
             "leading_pad_to_rope_min_distance_m": float(leading_pad_min_distance),
+            "left_contactor_xyz": left_contactor,
+            "right_contactor_xyz": right_contactor,
+            "leading_contactor_xyz": leading_contactor,
+            "left_contactor_to_rope_min_distance_m": left_contactor_min_distance,
+            "right_contactor_to_rope_min_distance_m": right_contactor_min_distance,
+            "leading_contactor_to_rope_min_distance_m": float(leading_contactor_min_distance),
+            "grasp_assist_strength": float(grasp_strength),
+            "rope_max_z_m": rope_max_z,
+            "grasp_particle_com_xyz": grasp_particle_com,
+            "grasp_particle_max_z_m": grasp_particle_max_z,
         }
         if control_frame == self.rigid.settle_frames - 1 and self.baseline_com_x is None:
             self.baseline_com_x = float(rope_com[0])
@@ -1335,10 +1906,18 @@ class SplitDemo:
         ):
             self.first_leading_pad_proximity_frame = frame_idx
 
+        grasp_assist_strength = float(pad_metrics.get("grasp_assist_strength", 0.0))
+        if grasp_assist_strength > 0.0:
+            self.grasp_assist_frames += 1
+            if self.first_grasp_assist_frame is None:
+                self.first_grasp_assist_frame = frame_idx
+
         self.timeseries.append(
             {
                 "frame": int(frame_idx),
                 "time_s": float(rigid_metrics.time_s),
+                "motion_phase": str(rigid_metrics.motion_phase),
+                "motion_phase_alpha": float(rigid_metrics.motion_phase_alpha),
                 "target_x_m": float(rigid_metrics.target_xyz[0]),
                 "target_y_m": float(rigid_metrics.target_xyz[1]),
                 "target_z_m": float(rigid_metrics.target_xyz[2]),
@@ -1350,7 +1929,10 @@ class SplitDemo:
                 "actual_ee_y_m": float(rigid_metrics.actual_ee_xyz[1]),
                 "actual_ee_z_m": float(rigid_metrics.actual_ee_xyz[2]),
                 "ee_error_m": float(rigid_metrics.ee_error_m),
+                "gripper_opening_m": float(rigid_metrics.gripper_opening_m),
                 "robot_table_contact_frames": int(rigid_metrics.robot_table_contacts > 0),
+                "finger_table_contact_frames": int(rigid_metrics.finger_table_contacts > 0),
+                "nonfinger_table_contact_frames": int(rigid_metrics.nonfinger_table_contacts > 0),
                 "rope_table_contact_frames": int(contact_any["table"] > 0),
                 "rope_ground_contact_frames": int(contact_any["ground"] > 0),
                 "left_finger_rope_contacts": int(contact_any["left"]),
@@ -1367,9 +1949,33 @@ class SplitDemo:
                 "left_pad_to_rope_min_distance_m": float(pad_metrics["left_pad_to_rope_min_distance_m"]),
                 "right_pad_to_rope_min_distance_m": float(pad_metrics["right_pad_to_rope_min_distance_m"]),
                 "leading_pad_to_rope_min_distance_m": float(pad_metrics["leading_pad_to_rope_min_distance_m"]),
+                "left_contactor_x_m": float(pad_metrics["left_contactor_xyz"][0]),
+                "left_contactor_y_m": float(pad_metrics["left_contactor_xyz"][1]),
+                "left_contactor_z_m": float(pad_metrics["left_contactor_xyz"][2]),
+                "right_contactor_x_m": float(pad_metrics["right_contactor_xyz"][0]),
+                "right_contactor_y_m": float(pad_metrics["right_contactor_xyz"][1]),
+                "right_contactor_z_m": float(pad_metrics["right_contactor_xyz"][2]),
+                "leading_contactor_x_m": float(pad_metrics["leading_contactor_xyz"][0]),
+                "leading_contactor_y_m": float(pad_metrics["leading_contactor_xyz"][1]),
+                "leading_contactor_z_m": float(pad_metrics["leading_contactor_xyz"][2]),
+                "left_contactor_to_rope_min_distance_m": float(
+                    pad_metrics["left_contactor_to_rope_min_distance_m"]
+                ),
+                "right_contactor_to_rope_min_distance_m": float(
+                    pad_metrics["right_contactor_to_rope_min_distance_m"]
+                ),
+                "leading_contactor_to_rope_min_distance_m": float(
+                    pad_metrics["leading_contactor_to_rope_min_distance_m"]
+                ),
+                "grasp_assist_strength": grasp_assist_strength,
                 "rope_com_x_m": float(rope_com[0]),
                 "rope_com_y_m": float(rope_com[1]),
                 "rope_com_z_m": float(rope_com[2]),
+                "rope_max_z_m": float(pad_metrics["rope_max_z_m"]),
+                "grasp_particle_com_x_m": float(pad_metrics["grasp_particle_com_xyz"][0]),
+                "grasp_particle_com_y_m": float(pad_metrics["grasp_particle_com_xyz"][1]),
+                "grasp_particle_com_z_m": float(pad_metrics["grasp_particle_com_xyz"][2]),
+                "grasp_particle_max_z_m": float(pad_metrics["grasp_particle_max_z_m"]),
                 "rope_com_shift_x_m": float(rope_com_shift_x),
                 "max_ground_penetration_m": float(penetration["max_ground_penetration_m"]),
                 "max_table_penetration_m": float(penetration["max_table_penetration_m"]),
@@ -1501,16 +2107,107 @@ class SplitDemo:
     def _finalize(self, out_dir: Path, mp4_path: Path, gif_path: Path, sheet_path: Path, first_30_sheet_path: Path) -> dict[str, Any]:
         arr = self.timeseries
         robot_table_contact_frames = int(sum(int(row["robot_table_contact_frames"]) for row in arr))
+        finger_table_contact_frames = int(sum(int(row["finger_table_contact_frames"]) for row in arr))
+        nonfinger_table_contact_frames = int(sum(int(row["nonfinger_table_contact_frames"]) for row in arr))
         rope_table_contact_frames = int(sum(int(row["rope_table_contact_frames"]) for row in arr))
         rope_ground_contact_frames = int(sum(int(row["rope_ground_contact_frames"]) for row in arr))
+        left_finger_rope_contacts = int(sum(int(row["left_finger_rope_contacts"]) for row in arr))
+        right_finger_rope_contacts = int(sum(int(row["right_finger_rope_contacts"]) for row in arr))
         first_30 = arr[: min(30, len(arr))]
+        final_30 = arr[-min(30, len(arr)) :] if arr else []
         rope_table_contact_frames_first_30 = int(sum(int(row["rope_table_contact_frames"]) for row in first_30))
         rope_ground_contact_frames_first_30 = int(sum(int(row["rope_ground_contact_frames"]) for row in first_30))
         robot_table_contact_frames_first_30 = int(sum(int(row["robot_table_contact_frames"]) for row in first_30))
+        finger_table_contact_frames_first_30 = int(sum(int(row["finger_table_contact_frames"]) for row in first_30))
+        nonfinger_table_contact_frames_first_30 = int(sum(int(row["nonfinger_table_contact_frames"]) for row in first_30))
+        rope_ground_contact_frames_final_30 = int(sum(int(row["rope_ground_contact_frames"]) for row in final_30))
         rope_z_first_30 = np.asarray([row["rope_com_z_m"] for row in first_30], dtype=np.float32) if first_30 else np.zeros((0,), dtype=np.float32)
+        rope_z_all = np.asarray([row["rope_com_z_m"] for row in arr], dtype=np.float32) if arr else np.zeros((0,), dtype=np.float32)
+        rope_max_z_all = np.asarray([row["rope_max_z_m"] for row in arr], dtype=np.float32) if arr else np.zeros((0,), dtype=np.float32)
+        grasp_z_all = (
+            np.asarray([row["grasp_particle_com_z_m"] for row in arr], dtype=np.float32) if arr else np.zeros((0,), dtype=np.float32)
+        )
         max_rope_com_z_first_30 = float(np.max(rope_z_first_30)) if rope_z_first_30.size else 0.0
         max_abs_delta_rope_com_z_first_30 = (
             float(np.max(np.abs(np.diff(rope_z_first_30)))) if rope_z_first_30.size > 1 else 0.0
+        )
+        initial_rope_com_z_m = float(rope_z_all[0]) if rope_z_all.size else 0.0
+        max_rope_com_z_m = float(np.max(rope_z_all)) if rope_z_all.size else 0.0
+        final_rope_com_z_m = float(rope_z_all[-1]) if rope_z_all.size else 0.0
+        rope_lift_height_m = float(max_rope_com_z_m - initial_rope_com_z_m)
+        initial_rope_max_z_m = float(rope_max_z_all[0]) if rope_max_z_all.size else 0.0
+        max_rope_max_z_m = float(np.max(rope_max_z_all)) if rope_max_z_all.size else 0.0
+        rope_max_z_lift_height_m = float(max_rope_max_z_m - initial_rope_max_z_m)
+        finite_grasp_z = grasp_z_all[np.isfinite(grasp_z_all)] if grasp_z_all.size else np.zeros((0,), dtype=np.float32)
+        initial_grasp_particle_com_z_m = float(finite_grasp_z[0]) if finite_grasp_z.size else 0.0
+        max_grasp_particle_com_z_m = float(np.max(finite_grasp_z)) if finite_grasp_z.size else 0.0
+        grasp_particle_lift_height_m = float(max_grasp_particle_com_z_m - initial_grasp_particle_com_z_m)
+        if arr and self.first_finger_contact_frame is not None:
+            grasp_after_contact = np.asarray(
+                [
+                    row["grasp_particle_com_z_m"]
+                    for row in arr
+                    if int(row["frame"]) >= int(self.first_finger_contact_frame)
+                    and np.isfinite(float(row["grasp_particle_com_z_m"]))
+                ],
+                dtype=np.float32,
+            )
+        else:
+            grasp_after_contact = np.zeros((0,), dtype=np.float32)
+        if arr and self.first_finger_contact_frame is not None:
+            pre_contact_rows = [row for row in arr if int(row["frame"]) < int(self.first_finger_contact_frame)]
+        else:
+            pre_contact_rows = arr
+        pre_contact_grasp_z = (
+            np.asarray(
+                [
+                    row["grasp_particle_com_z_m"]
+                    for row in pre_contact_rows
+                    if np.isfinite(float(row["grasp_particle_com_z_m"]))
+                ],
+                dtype=np.float32,
+            )
+            if pre_contact_rows
+            else np.zeros((0,), dtype=np.float32)
+        )
+        pre_contact_grasp_drop_m = (
+            float(initial_grasp_particle_com_z_m - np.min(pre_contact_grasp_z)) if pre_contact_grasp_z.size else 0.0
+        )
+        pre_contact_ground_contact_frames = int(
+            sum(int(row["rope_ground_contact_frames"]) for row in pre_contact_rows)
+        )
+        first_contact_grasp_particle_com_z_m = float(grasp_after_contact[0]) if grasp_after_contact.size else 0.0
+        min_grasp_particle_com_z_after_contact_m = float(np.min(grasp_after_contact)) if grasp_after_contact.size else 0.0
+        max_grasp_particle_com_z_after_contact_m = float(np.max(grasp_after_contact)) if grasp_after_contact.size else 0.0
+        grasp_particle_lift_after_contact_m = float(
+            max_grasp_particle_com_z_after_contact_m - first_contact_grasp_particle_com_z_m
+        )
+        grasp_particle_lift_from_post_contact_min_m = float(
+            max_grasp_particle_com_z_after_contact_m - min_grasp_particle_com_z_after_contact_m
+        )
+        lift_transfer_grasp_after_contact = (
+            np.asarray(
+                [
+                    row["grasp_particle_com_z_m"]
+                    for row in arr
+                    if str(row["motion_phase"]) in {"lift", "transfer"}
+                    and self.first_finger_contact_frame is not None
+                    and int(row["frame"]) >= int(self.first_finger_contact_frame)
+                    and np.isfinite(float(row["grasp_particle_com_z_m"]))
+                ],
+                dtype=np.float32,
+            )
+            if arr
+            else np.zeros((0,), dtype=np.float32)
+        )
+        min_grasp_particle_com_z_during_lift_transfer_m = (
+            float(np.min(lift_transfer_grasp_after_contact)) if lift_transfer_grasp_after_contact.size else 0.0
+        )
+        max_grasp_particle_com_z_during_lift_transfer_m = (
+            float(np.max(lift_transfer_grasp_after_contact)) if lift_transfer_grasp_after_contact.size else 0.0
+        )
+        grasp_particle_lift_during_lift_transfer_m = float(
+            max_grasp_particle_com_z_during_lift_transfer_m - first_contact_grasp_particle_com_z_m
         )
         max_ground_penetration_m = float(max(float(row["max_ground_penetration_m"]) for row in arr)) if arr else 0.0
         max_table_penetration_m = float(max(float(row["max_table_penetration_m"]) for row in arr)) if arr else 0.0
@@ -1520,6 +2217,55 @@ class SplitDemo:
         final_support_penetration_p99_m = float(arr[-1]["p99_support_penetration_m"]) if arr else 0.0
         min_leading_pad_to_rope_distance_m = (
             float(min(float(row["leading_pad_to_rope_min_distance_m"]) for row in arr)) if arr else 0.0
+        )
+        min_leading_contactor_to_rope_distance_m = (
+            float(min(float(row["leading_contactor_to_rope_min_distance_m"]) for row in arr)) if arr else 0.0
+        )
+        min_gripper_opening_m = float(min(float(row["gripper_opening_m"]) for row in arr)) if arr else 0.0
+        max_gripper_opening_m = float(max(float(row["gripper_opening_m"]) for row in arr)) if arr else 0.0
+        lift_window = [row for row in arr if str(row["motion_phase"]) in {"lift", "transfer"}]
+        lift_window_left_finger_rope_contact_frames = int(
+            sum(1 for row in lift_window if int(row["left_finger_rope_contacts"]) > 0)
+        )
+        lift_window_right_finger_rope_contact_frames = int(
+            sum(1 for row in lift_window if int(row["right_finger_rope_contacts"]) > 0)
+        )
+        lift_window_left_finger_rope_contacts = int(
+            sum(int(row["left_finger_rope_contacts"]) for row in lift_window)
+        )
+        lift_window_right_finger_rope_contacts = int(
+            sum(int(row["right_finger_rope_contacts"]) for row in lift_window)
+        )
+        lift_window_both_finger_rope_contact_frames = int(
+            sum(
+                1
+                for row in lift_window
+                if int(row["left_finger_rope_contacts"]) > 0 and int(row["right_finger_rope_contacts"]) > 0
+            )
+        )
+        lift_window_unilateral_finger_rope_contact_frames = int(
+            sum(
+                1
+                for row in lift_window
+                if (int(row["left_finger_rope_contacts"]) > 0)
+                != (int(row["right_finger_rope_contacts"]) > 0)
+            )
+        )
+        lift_window_contact_balance_ratio = (
+            float(
+                min(lift_window_left_finger_rope_contacts, lift_window_right_finger_rope_contacts)
+                / max(lift_window_left_finger_rope_contacts, lift_window_right_finger_rope_contacts)
+            )
+            if max(lift_window_left_finger_rope_contacts, lift_window_right_finger_rope_contacts) > 0
+            else 0.0
+        )
+        final_15 = arr[-min(15, len(arr)) :] if arr else []
+        final_finger_rope_contact_frames = int(
+            sum(
+                1
+                for row in final_15
+                if int(row["left_finger_rope_contacts"]) > 0 or int(row["right_finger_rope_contacts"]) > 0
+            )
         )
         rope_motion_after_contact = bool(
             self.first_finger_contact_frame is not None
@@ -1532,17 +2278,74 @@ class SplitDemo:
             self.first_contact_reaction_nonzero is not None
             or any(np.linalg.norm(v[:3]) > 1.0e-6 or np.linalg.norm(v[3:]) > 1.0e-6 for v in self.rope.last_world_wrench.values())
         )
+        strict_fail_reasons: list[str] = []
+        if bool(self.args.presentation_grasp_assist) or self.first_grasp_assist_frame is not None or self.grasp_assist_frames > 0:
+            strict_fail_reasons.append("grasp assist must be disabled and unused")
+        if bool(self.args.strict_require_native_panda_fingers) and str(self.args.presentation_gripper_geometry) != "panda_fingers":
+            strict_fail_reasons.append("final strict route must use native Panda finger pads without helper geometry")
+        if self.first_finger_contact_frame is None:
+            strict_fail_reasons.append("no finger-rope contact frame was detected")
+        if not rope_motion_after_contact:
+            strict_fail_reasons.append("rope motion after finger contact was not detected")
+        if pre_contact_grasp_drop_m > float(self.args.strict_max_precontact_grasp_drop):
+            strict_fail_reasons.append("local grasp segment dropped before finger contact")
+        if pre_contact_ground_contact_frames > 0:
+            strict_fail_reasons.append("rope touched the ground before finger contact")
+        if lift_window_both_finger_rope_contact_frames < int(self.args.strict_both_finger_contact_frames):
+            strict_fail_reasons.append("both fingers did not maintain contact during the lift/transfer window")
+        if lift_window_unilateral_finger_rope_contact_frames > int(self.args.strict_max_unilateral_lift_contact_frames):
+            strict_fail_reasons.append("lift/transfer contact was unilateral, which reads as side pickup")
+        if lift_window_contact_balance_ratio < float(self.args.strict_min_lift_contact_balance_ratio):
+            strict_fail_reasons.append("lift/transfer contact was too one-sided, which reads as side suction")
+        if grasp_particle_lift_during_lift_transfer_m < float(self.args.strict_grasp_lift_height):
+            strict_fail_reasons.append("local grasp segment did not lift enough during lift/transfer")
+        if rope_lift_height_m < float(self.args.strict_rope_lift_height):
+            strict_fail_reasons.append("whole-rope COM did not rise enough for visible carry")
+        if rope_max_z_lift_height_m < float(self.args.strict_rope_max_z_lift_height):
+            strict_fail_reasons.append("no visible rope point rose enough for carry")
+        if max_rope_max_z_m > float(self.args.strict_max_rope_height):
+            strict_fail_reasons.append("rope flew away above the strict max height")
+        if max_grasp_particle_com_z_during_lift_transfer_m < (
+            float(self.rigid.table_top_z) + float(self.args.strict_lift_transfer_clearance)
+        ):
+            strict_fail_reasons.append("local grasp segment was not carried visibly above the table")
+        if final_finger_rope_contact_frames > int(self.args.strict_final_finger_contact_max_frames):
+            strict_fail_reasons.append("finger/cradle contact remained after release")
+        if nonfinger_table_contact_frames != 0:
+            strict_fail_reasons.append("non-finger robot body touched the table")
+        if max_support_penetration_m > float(self.args.strict_max_support_penetration):
+            strict_fail_reasons.append("support penetration exceeded strict threshold")
+        if rope_ground_contact_frames_final_30 < int(self.args.strict_final_ground_contact_frames):
+            strict_fail_reasons.append("rope did not settle on the ground at the end")
+        if not rope_render_matches_physics:
+            strict_fail_reasons.append("rope render radius differs from physical radius")
+        strict_contact_only_pass = _is_pick_place_mode(self.args) and not strict_fail_reasons
 
         summary = {
             "demo": "robot_table_rope_split_mujoco_semiimplicit",
             "coupling_mode": str(self.args.coupling_mode),
             "rigid_frame_dt_s": float(self.rigid.frame_dt),
             "rigid_substep_dt_s": float(self.rigid.sim_dt),
+            "rigid_njmax": int(self.args.rigid_njmax),
+            "rigid_nconmax": int(self.args.rigid_nconmax),
+            "rigid_hydro_buffer_mult_iso": int(self.args.rigid_hydro_buffer_mult_iso),
+            "rigid_hydro_buffer_mult_contact": int(self.args.rigid_hydro_buffer_mult_contact),
+            "arm_joint_target_ke": float(self.args.arm_joint_target_ke),
+            "arm_joint_target_kd": float(self.args.arm_joint_target_kd),
+            "arm_joint_effort_limit": float(self.args.arm_joint_effort_limit),
+            "finger_joint_target_ke": float(self.args.finger_joint_target_ke),
+            "finger_joint_target_kd": float(self.args.finger_joint_target_kd),
+            "finger_joint_effort_limit": float(self.args.finger_joint_effort_limit),
+            "gripper_yaw_rad": float(self.args.gripper_yaw),
             "rope_substep_dt_s": float(
                 self.args.rope_sim_dt
                 if self.args.rope_sim_dt is not None
                 else (self.rigid.frame_dt / float(self.args.sim_substeps_rope))
             ),
+            "rope_rigid_contact_max_requested": int(self.args.rope_rigid_contact_max),
+            "rope_rigid_contact_max_effective": int(self.rope.rope_rigid_contact_max_effective),
+            "rope_soft_contact_max_requested": int(self.args.rope_soft_contact_max),
+            "rope_soft_contact_max_effective": int(self.rope.rope_soft_contact_max_effective),
             "scene_topology": str(self.args.scene_topology),
             "motion_pattern": str(self.args.motion_pattern),
             "rope_render_mode": str(self.args.rope_render_mode),
@@ -1556,13 +2359,39 @@ class SplitDemo:
             "first_finger_rope_contact_frame": self.first_finger_contact_frame,
             "first_rope_motion_frame": self.first_rope_motion_frame,
             "first_leading_pad_proximity_frame": self.first_leading_pad_proximity_frame,
+            "first_grasp_assist_frame": self.first_grasp_assist_frame,
+            "grasp_assist_enabled": bool(self.args.presentation_grasp_assist),
+            "grasp_assist_frames": int(self.grasp_assist_frames),
+            "grasp_assist_particle_count": (
+                0 if self.rope.grasp_assist_indices is None else int(self.rope.grasp_assist_indices.shape[0])
+            ),
+            "grasp_metric_particle_count": (
+                0 if self.rope.grasp_metric_indices is None else int(self.rope.grasp_metric_indices.shape[0])
+            ),
+            "strict_contact_only_pass": bool(strict_contact_only_pass),
+            "strict_contact_only_fail_reasons": strict_fail_reasons,
             "rope_motion_after_contact": rope_motion_after_contact,
             "robot_table_contact_frames": robot_table_contact_frames,
+            "finger_table_contact_frames": finger_table_contact_frames,
+            "nonfinger_table_contact_frames": nonfinger_table_contact_frames,
+            "strict_table_contact_policy": "edge-pick allows finger/cradle table contact but fails non-finger robot-table contact",
             "rope_table_contact_frames": rope_table_contact_frames,
             "rope_ground_contact_frames": rope_ground_contact_frames,
+            "left_finger_rope_contacts": left_finger_rope_contacts,
+            "right_finger_rope_contacts": right_finger_rope_contacts,
             "robot_table_contact_frames_first_30": robot_table_contact_frames_first_30,
+            "finger_table_contact_frames_first_30": finger_table_contact_frames_first_30,
+            "nonfinger_table_contact_frames_first_30": nonfinger_table_contact_frames_first_30,
             "rope_table_contact_frames_first_30": rope_table_contact_frames_first_30,
             "rope_ground_contact_frames_first_30": rope_ground_contact_frames_first_30,
+            "rope_ground_contact_frames_final_30": rope_ground_contact_frames_final_30,
+            "lift_window_left_finger_rope_contact_frames": lift_window_left_finger_rope_contact_frames,
+            "lift_window_right_finger_rope_contact_frames": lift_window_right_finger_rope_contact_frames,
+            "lift_window_left_finger_rope_contacts": lift_window_left_finger_rope_contacts,
+            "lift_window_right_finger_rope_contacts": lift_window_right_finger_rope_contacts,
+            "lift_window_both_finger_rope_contact_frames": lift_window_both_finger_rope_contact_frames,
+            "lift_window_unilateral_finger_rope_contact_frames": lift_window_unilateral_finger_rope_contact_frames,
+            "lift_window_contact_balance_ratio": float(lift_window_contact_balance_ratio),
             "rope_original_total_object_mass_kg": float(self.rope.rope_ir.get("original_total_object_mass", 0.0)),
             "rope_current_total_object_mass_kg": float(self.rope.rope_ir.get("current_total_object_mass", 0.0)),
             "rope_weight_scale": float(self.rope.rope_ir.get("weight_scale", 1.0)),
@@ -1575,14 +2404,66 @@ class SplitDemo:
             "ground_shape_contact_damping_multiplier": float(self.args.ground_shape_contact_damping_multiplier),
             "table_shape_contact_scale": float(self.args.table_shape_contact_scale),
             "table_shape_contact_damping_multiplier": float(self.args.table_shape_contact_damping_multiplier),
+            "effective_table_shape_contact_scale": float(_effective_table_shape_contact_scale(self.args)),
+            "effective_table_shape_contact_damping_multiplier": float(
+                _effective_table_shape_contact_damping_multiplier(self.args)
+            ),
             "finger_shape_contact_scale": float(self.args.finger_shape_contact_scale),
             "finger_shape_contact_damping_multiplier": float(self.args.finger_shape_contact_damping_multiplier),
+            "finger_shape_friction_multiplier": float(self.args.finger_shape_friction_multiplier),
+            "presentation_gripper_geometry": str(self.rigid.presentation_gripper_geometry),
+            "presentation_gripper_geometry_shape_count": int(len(self.rigid.gripper_geometry_shape_indices)),
+            "presentation_aux_panda_pad_geometry_enabled": bool(_uses_aux_panda_pad_geometry(self.args)),
+            "presentation_native_panda_finger_grasp_local_m": [
+                float(self.args.presentation_panda_finger_grasp_local_x),
+                float(self.args.presentation_panda_finger_grasp_local_y),
+                float(self.args.presentation_panda_finger_grasp_local_z),
+            ],
+            "presentation_cradle_lip_length_m": float(self.args.presentation_cradle_lip_length),
+            "presentation_cradle_lip_depth_m": float(self.args.presentation_cradle_lip_depth),
+            "presentation_cradle_lip_thickness_m": float(self.args.presentation_cradle_lip_thickness),
+            "presentation_cradle_lip_local_z_m": float(self.args.presentation_cradle_lip_local_z),
+            "presentation_cradle_wall_height_m": float(self.args.presentation_cradle_wall_height),
+            "presentation_cradle_wall_thickness_m": float(self.args.presentation_cradle_wall_thickness),
+            "presentation_cradle_grasp_z_clearance_m": float(self.args.presentation_cradle_grasp_z_clearance),
+            "presentation_grasp_opening_m": float(self.args.presentation_grasp_opening),
+            "presentation_grasp_closed_opening_m": float(self.args.presentation_grasp_closed_opening),
+            "presentation_release_seconds": float(self.args.presentation_release_seconds),
+            "presentation_place_y_offset_m": float(self.args.presentation_place_y_offset),
+            "presentation_retract_x_offset_m": float(self.args.presentation_retract_x_offset),
+            "presentation_retract_y_offset_m": float(self.args.presentation_retract_y_offset),
+            "presentation_retract_z_offset_m": float(self.args.presentation_retract_z_offset),
             "table_edge_inset_y": float(self.args.table_edge_inset_y),
             "overhang_drop_factor": float(self.args.overhang_drop_factor),
             "min_clearance_extra": float(self.args.min_clearance_extra),
             "presentation_table_edge_inset_y": float(self.args.presentation_table_edge_inset_y),
+            "presentation_edge_grasp_outset_y_m": float(self.args.presentation_edge_grasp_outset_y),
             "max_rope_com_z_first_30": float(max_rope_com_z_first_30),
             "max_abs_delta_rope_com_z_first_30": float(max_abs_delta_rope_com_z_first_30),
+            "initial_rope_com_z_m": float(initial_rope_com_z_m),
+            "max_rope_com_z_m": float(max_rope_com_z_m),
+            "final_rope_com_z_m": float(final_rope_com_z_m),
+            "rope_lift_height_m": float(rope_lift_height_m),
+            "initial_rope_max_z_m": float(initial_rope_max_z_m),
+            "max_rope_max_z_m": float(max_rope_max_z_m),
+            "rope_max_z_lift_height_m": float(rope_max_z_lift_height_m),
+            "initial_grasp_particle_com_z_m": float(initial_grasp_particle_com_z_m),
+            "max_grasp_particle_com_z_m": float(max_grasp_particle_com_z_m),
+            "grasp_particle_lift_height_m": float(grasp_particle_lift_height_m),
+            "pre_contact_grasp_particle_drop_m": float(pre_contact_grasp_drop_m),
+            "pre_contact_ground_contact_frames": int(pre_contact_ground_contact_frames),
+            "first_contact_grasp_particle_com_z_m": float(first_contact_grasp_particle_com_z_m),
+            "min_grasp_particle_com_z_after_contact_m": float(min_grasp_particle_com_z_after_contact_m),
+            "max_grasp_particle_com_z_after_contact_m": float(max_grasp_particle_com_z_after_contact_m),
+            "grasp_particle_lift_after_contact_m": float(grasp_particle_lift_after_contact_m),
+            "grasp_particle_lift_from_post_contact_min_m": float(grasp_particle_lift_from_post_contact_min_m),
+            "min_grasp_particle_com_z_during_lift_transfer_m": float(
+                min_grasp_particle_com_z_during_lift_transfer_m
+            ),
+            "max_grasp_particle_com_z_during_lift_transfer_m": float(
+                max_grasp_particle_com_z_during_lift_transfer_m
+            ),
+            "grasp_particle_lift_during_lift_transfer_m": float(grasp_particle_lift_during_lift_transfer_m),
             "max_ground_penetration_m": float(max_ground_penetration_m),
             "max_table_penetration_m": float(max_table_penetration_m),
             "max_support_penetration_m": float(max_support_penetration_m),
@@ -1590,6 +2471,23 @@ class SplitDemo:
             "final_table_penetration_p99_m": float(final_table_penetration_p99_m),
             "final_support_penetration_p99_m": float(final_support_penetration_p99_m),
             "min_leading_pad_to_rope_distance_m": float(min_leading_pad_to_rope_distance_m),
+            "min_leading_contactor_to_rope_distance_m": float(min_leading_contactor_to_rope_distance_m),
+            "min_gripper_opening_m": float(min_gripper_opening_m),
+            "max_gripper_opening_m": float(max_gripper_opening_m),
+            "final_finger_rope_contact_frames": int(final_finger_rope_contact_frames),
+            "strict_grasp_lift_height_m": float(self.args.strict_grasp_lift_height),
+            "strict_rope_lift_height_m": float(self.args.strict_rope_lift_height),
+            "strict_rope_max_z_lift_height_m": float(self.args.strict_rope_max_z_lift_height),
+            "strict_max_rope_height_m": float(self.args.strict_max_rope_height),
+            "strict_both_finger_contact_frames": int(self.args.strict_both_finger_contact_frames),
+            "strict_require_native_panda_fingers": bool(self.args.strict_require_native_panda_fingers),
+            "strict_min_lift_contact_balance_ratio": float(self.args.strict_min_lift_contact_balance_ratio),
+            "strict_max_unilateral_lift_contact_frames": int(self.args.strict_max_unilateral_lift_contact_frames),
+            "strict_max_support_penetration_m": float(self.args.strict_max_support_penetration),
+            "strict_final_ground_contact_frames": int(self.args.strict_final_ground_contact_frames),
+            "strict_max_precontact_grasp_drop_m": float(self.args.strict_max_precontact_grasp_drop),
+            "strict_lift_transfer_clearance_m": float(self.args.strict_lift_transfer_clearance),
+            "strict_final_finger_contact_max_frames": int(self.args.strict_final_finger_contact_max_frames),
             "presentation_contact_target_x_m": (
                 None if self.rigid.presentation_contact_point is None else float(self.rigid.presentation_contact_point[0])
             ),
@@ -1599,6 +2497,9 @@ class SplitDemo:
             "presentation_contact_target_z_m": (
                 None if self.rigid.presentation_contact_point is None else float(self.rigid.presentation_contact_point[2])
             ),
+            "presentation_grasp_x_offset_m": float(self.args.presentation_grasp_x_offset),
+            "presentation_grasp_y_offset_m": float(self.args.presentation_grasp_y_offset),
+            "presentation_grasp_z_offset_m": float(self.args.presentation_grasp_z_offset),
             "rope_physical_radius_m": float(np.mean(self.rope.physical_radius)),
             "rope_render_radius_m": float(np.mean(self.rope.render_radius)),
             "rope_render_matches_physics": rope_render_matches_physics,
@@ -1626,7 +2527,15 @@ class SplitDemo:
                 [[row["actual_target_x_m"], row["actual_target_y_m"], row["actual_target_z_m"]] for row in arr], dtype=np.float32
             ),
             actual_ee_xyz=np.asarray([[row["actual_ee_x_m"], row["actual_ee_y_m"], row["actual_ee_z_m"]] for row in arr], dtype=np.float32),
+            gripper_opening=np.asarray([row["gripper_opening_m"] for row in arr], dtype=np.float32),
+            grasp_assist_strength=np.asarray([row["grasp_assist_strength"] for row in arr], dtype=np.float32),
             rope_com_xyz=np.asarray([[row["rope_com_x_m"], row["rope_com_y_m"], row["rope_com_z_m"]] for row in arr], dtype=np.float32),
+            rope_max_z=np.asarray([row["rope_max_z_m"] for row in arr], dtype=np.float32),
+            grasp_particle_com_xyz=np.asarray(
+                [[row["grasp_particle_com_x_m"], row["grasp_particle_com_y_m"], row["grasp_particle_com_z_m"]] for row in arr],
+                dtype=np.float32,
+            ),
+            grasp_particle_max_z=np.asarray([row["grasp_particle_max_z_m"] for row in arr], dtype=np.float32),
             rope_physical_radius=self.rope.physical_radius.astype(np.float32, copy=False),
             rope_render_radius=self.rope.render_radius.astype(np.float32, copy=False),
         )
@@ -1647,10 +2556,16 @@ class SplitDemo:
                     f"- First finger contact frame: `{self.first_finger_contact_frame}`",
                     f"- First rope motion frame: `{self.first_rope_motion_frame}`",
                     f"- Rope motion after contact: `{rope_motion_after_contact}`",
+                    f"- Strict contact-only pass: `{strict_contact_only_pass}`",
                     f"- Min leading-pad distance to rope: `{min_leading_pad_to_rope_distance_m:.6f}`",
+                    f"- Grasp assist enabled: `{bool(self.args.presentation_grasp_assist)}`",
+                    f"- Grasp-particle lift height (m): `{grasp_particle_lift_height_m:.6f}`",
+                    f"- Grasp-particle lift during lift/transfer (m): `{grasp_particle_lift_during_lift_transfer_m:.6f}`",
                     f"- Rope render matches physics: `{rope_render_matches_physics}`",
                     f"- Record start mode: `{self._record_start_mode()}`",
                     f"- Rope pre-roll seconds: `{self._effective_preroll_seconds():.3f}`",
+                    f"- Rope rigid-contact max effective: `{int(self.rope.rope_rigid_contact_max_effective)}`",
+                    f"- Rope soft-contact max effective: `{int(self.rope.rope_soft_contact_max_effective)}`",
                     f"- Presentation table-edge inset y (m): `{self.args.presentation_table_edge_inset_y:.3f}`",
                     "",
                     "Artifacts:",
@@ -2009,27 +2924,96 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--coupling-mode", choices=["one_way", "two_way"], default="one_way")
     parser.add_argument("--scene-topology", choices=["table_edge_drape"], default="table_edge_drape")
-    parser.add_argument("--motion-pattern", choices=["side_finger_push"], default="side_finger_push")
+    parser.add_argument("--motion-pattern", choices=["side_finger_push", "grasp_lift_place"], default="side_finger_push")
     parser.add_argument("--rope-render-mode", choices=["physical_only"], default="physical_only")
-    parser.add_argument("--video-mode", choices=["support_default", "presentation_lifted"], default="support_default")
+    parser.add_argument(
+        "--video-mode",
+        choices=["support_default", "presentation_lifted", "presentation_pick_place"],
+        default="support_default",
+    )
     parser.add_argument("--finger-contact-set", choices=["fingers_plus_pads"], default="fingers_plus_pads")
     parser.add_argument("--video-fps", type=int, default=30)
     parser.add_argument("--num-frames", type=int, default=170)
     parser.add_argument("--sim-substeps-rigid", type=int, default=10)
+    parser.add_argument("--rigid-njmax", type=int, default=2048)
+    parser.add_argument("--rigid-nconmax", type=int, default=2048)
+    parser.add_argument("--rigid-hydro-buffer-mult-iso", type=int, default=4)
+    parser.add_argument("--rigid-hydro-buffer-mult-contact", type=int, default=4)
+    parser.add_argument("--arm-joint-target-ke", type=float, default=650.0)
+    parser.add_argument("--arm-joint-target-kd", type=float, default=100.0)
+    parser.add_argument("--arm-joint-effort-limit", type=float, default=80.0)
+    parser.add_argument("--finger-joint-target-ke", type=float, default=650.0)
+    parser.add_argument("--finger-joint-target-kd", type=float, default=100.0)
+    parser.add_argument("--finger-joint-effort-limit", type=float, default=20.0)
     parser.add_argument("--sim-substeps-rope", type=int, default=667)
     parser.add_argument("--calibration-sim-substeps-rope", type=int, default=32)
     parser.add_argument("--rope-sim-dt", type=float, default=None)
+    parser.add_argument(
+        "--rope-rigid-contact-max",
+        type=int,
+        default=0,
+        help="Override the rope-side rigid contact buffer capacity. 0 keeps Newton's default estimate.",
+    )
+    parser.add_argument(
+        "--rope-soft-contact-max",
+        type=int,
+        default=0,
+        help="Override the rope-side soft-contact buffer capacity. 0 keeps Newton's default shape_count*particle_count.",
+    )
     parser.add_argument("--rope-preroll-seconds", type=float, default=2.0)
-    parser.add_argument("--presentation-lift-height", type=float, default=0.08)
-    parser.add_argument("--presentation-table-edge-inset-y", type=float, default=0.22)
+    parser.add_argument("--presentation-lift-height", type=float, default=0.0)
+    parser.add_argument("--presentation-table-edge-inset-y", type=float, default=0.04)
     parser.add_argument("--presentation-overhang-drop-factor", type=float, default=0.0)
-    parser.add_argument("--presentation-opening-seconds", type=float, default=0.1)
-    parser.add_argument("--presentation-approach-seconds", type=float, default=0.2)
+    parser.add_argument("--presentation-opening-seconds", type=float, default=0.05)
+    parser.add_argument("--presentation-approach-seconds", type=float, default=0.12)
     parser.add_argument("--presentation-retract-seconds", type=float, default=0.6)
     parser.add_argument("--presentation-push-distance", type=float, default=0.05)
     parser.add_argument("--presentation-push-speed-mps", type=float, default=0.02)
     parser.add_argument("--presentation-tail-frames", type=int, default=15)
     parser.add_argument("--presentation-proximity-threshold", type=float, default=0.015)
+    parser.add_argument("--presentation-grasp-lower-seconds", type=float, default=0.10)
+    parser.add_argument("--presentation-grasp-close-seconds", type=float, default=0.20)
+    parser.add_argument("--presentation-lift-seconds", type=float, default=0.8)
+    parser.add_argument("--presentation-transfer-seconds", type=float, default=1.0)
+    parser.add_argument("--presentation-place-lower-seconds", type=float, default=0.7)
+    parser.add_argument("--presentation-release-seconds", type=float, default=0.4)
+    parser.add_argument("--presentation-grasp-opening", type=float, default=0.04)
+    parser.add_argument("--presentation-grasp-closed-opening", type=float, default=0.025)
+    parser.add_argument("--presentation-grasp-assist", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--presentation-grasp-particle-count", type=int, default=24)
+    parser.add_argument("--presentation-grasp-assist-ke", type=float, default=10.0)
+    parser.add_argument("--presentation-grasp-assist-kd", type=float, default=0.1)
+    parser.add_argument("--presentation-grasp-assist-max-force", type=float, default=1.0)
+    parser.add_argument("--presentation-gripper-geometry", choices=["panda_fingers", "panda_pads", "rope_cradle"], default="panda_fingers")
+    parser.add_argument("--presentation-panda-finger-grasp-local-x", type=float, default=0.0)
+    parser.add_argument("--presentation-panda-finger-grasp-local-y", type=float, default=0.005)
+    parser.add_argument("--presentation-panda-finger-grasp-local-z", type=float, default=0.045)
+    parser.add_argument("--presentation-cradle-lip-length", type=float, default=0.045)
+    parser.add_argument("--presentation-cradle-lip-depth", type=float, default=0.020)
+    parser.add_argument("--presentation-cradle-lip-thickness", type=float, default=0.006)
+    parser.add_argument("--presentation-cradle-lip-local-z", type=float, default=0.055)
+    parser.add_argument("--presentation-cradle-wall-height", type=float, default=0.018)
+    parser.add_argument("--presentation-cradle-wall-thickness", type=float, default=0.005)
+    parser.add_argument("--presentation-cradle-grasp-z-clearance", type=float, default=0.010)
+    parser.add_argument("--presentation-grasp-x-offset", type=float, default=0.0)
+    parser.add_argument("--presentation-grasp-y-offset", type=float, default=0.0)
+    parser.add_argument("--presentation-grasp-z-offset", type=float, default=0.0)
+    parser.add_argument("--presentation-grasp-z-clearance", type=float, default=0.060)
+    parser.add_argument("--presentation-edge-grasp-outset-y", type=float, default=0.060)
+    parser.add_argument("--presentation-table-shape-contact-scale", type=float, default=0.2)
+    parser.add_argument("--presentation-table-shape-contact-damping-multiplier", type=float, default=64.0)
+    parser.add_argument("--presentation-carry-height", type=float, default=0.16)
+    parser.add_argument("--presentation-place-ground-clearance", type=float, default=0.018)
+    parser.add_argument("--presentation-place-x-offset", type=float, default=0.04)
+    parser.add_argument("--presentation-place-y-offset", type=float, default=0.12)
+    parser.add_argument("--presentation-pregrasp-y-standoff", type=float, default=0.035)
+    parser.add_argument("--presentation-pregrasp-z-offset", type=float, default=0.015)
+    parser.add_argument("--presentation-approach-x-offset", type=float, default=0.12)
+    parser.add_argument("--presentation-approach-y-offset", type=float, default=0.05)
+    parser.add_argument("--presentation-approach-z-offset", type=float, default=0.015)
+    parser.add_argument("--presentation-retract-x-offset", type=float, default=0.08)
+    parser.add_argument("--presentation-retract-y-offset", type=float, default=0.06)
+    parser.add_argument("--presentation-retract-z-offset", type=float, default=0.05)
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--gravity-mag", type=float, default=9.8)
@@ -2049,6 +3033,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table-shape-contact-damping-multiplier", type=float, default=64.0)
     parser.add_argument("--finger-shape-contact-scale", type=float, default=0.1)
     parser.add_argument("--finger-shape-contact-damping-multiplier", type=float, default=1.5)
+    parser.add_argument("--finger-shape-friction-multiplier", type=float, default=1.0)
     parser.add_argument("--table-edge-inset-y", type=float, default=0.17)
     parser.add_argument("--overhang-drop-factor", type=float, default=0.02)
     parser.add_argument("--min-clearance-extra", type=float, default=0.002)
@@ -2060,6 +3045,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rope-line-width", type=float, default=0.008)
     parser.add_argument("--rope-spring-stride", type=int, default=4)
     parser.add_argument("--rope-motion-threshold", type=float, default=0.001)
+    parser.add_argument("--strict-grasp-lift-height", type=float, default=0.02)
+    parser.add_argument("--strict-rope-lift-height", type=float, default=0.025)
+    parser.add_argument("--strict-rope-max-z-lift-height", type=float, default=0.025)
+    parser.add_argument("--strict-max-rope-height", type=float, default=1.0)
+    parser.add_argument("--strict-both-finger-contact-frames", type=int, default=10)
+    parser.add_argument("--strict-require-native-panda-fingers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--strict-min-lift-contact-balance-ratio", type=float, default=0.20)
+    parser.add_argument("--strict-max-unilateral-lift-contact-frames", type=int, default=0)
+    parser.add_argument("--strict-max-support-penetration", type=float, default=0.0025)
+    parser.add_argument("--strict-final-ground-contact-frames", type=int, default=20)
+    parser.add_argument("--strict-max-precontact-grasp-drop", type=float, default=0.035)
+    parser.add_argument("--strict-lift-transfer-clearance", type=float, default=0.04)
+    parser.add_argument("--strict-final-finger-contact-max-frames", type=int, default=0)
     return parser.parse_args()
 
 
